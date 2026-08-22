@@ -23,7 +23,7 @@ try:
     import pymeshio.pmx.reader
 except ImportError as exc:  # pragma: no cover - GUI startup message
     raise SystemExit(
-        "缺少 PMX 预览依赖。请先运行主工具中的“安装转换依赖”。\n" + str(exc)
+        "缺少 PMX 预览依赖。请先运行主工具中的“安装依赖”。\n" + str(exc)
     )
 
 try:

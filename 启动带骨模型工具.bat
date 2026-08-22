@@ -5,12 +5,12 @@ cd /d "%~dp0"
 
 set "PY_EXE="
 set "PY_ARGS="
-for /f "delims=" %%P in ('where py 2^>nul') do if not defined PY_EXE (
-    set "PY_EXE=%%P"
-    set "PY_ARGS=-3"
-)
+for /f "delims=" %%P in ('where python 2^>nul') do if not defined PY_EXE set "PY_EXE=%%P"
 if not defined PY_EXE (
-    for /f "delims=" %%P in ('where python 2^>nul') do if not defined PY_EXE set "PY_EXE=%%P"
+    for /f "delims=" %%P in ('where py 2^>nul') do if not defined PY_EXE (
+        set "PY_EXE=%%P"
+        set "PY_ARGS=-3"
+    )
 )
 
 if not defined PY_EXE (
