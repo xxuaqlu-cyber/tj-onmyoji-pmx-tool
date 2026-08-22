@@ -1,0 +1,20 @@
+# Game assets and generated data (never publish these)
+/yys/
+/unpacked/
+/rigged_models/
+*.apk
+
+# Local/runtime files
+__pycache__/
+*.py[cod]
+*.log
+/.agents/
+/nul
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+
