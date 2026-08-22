@@ -2,12 +2,14 @@
 /yys/
 /unpacked/
 /rigged_models/
+/backup/
 *.apk
 
 # Local/runtime files
 __pycache__/
 *.py[cod]
 *.log
+/.resource_pull_settings.json
 /.agents/
 /nul
 
@@ -16,5 +18,3 @@ __pycache__/
 .idea/
 .DS_Store
 Thumbs.db
-
-

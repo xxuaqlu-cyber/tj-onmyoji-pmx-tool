@@ -1,0 +1,8 @@
+pymeshio
+Pillow
+astc-encoder-py
+cryptography
+zstandard
+numpy
+moderngl
+
