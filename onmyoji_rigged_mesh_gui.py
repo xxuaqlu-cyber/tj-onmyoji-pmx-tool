@@ -53,7 +53,7 @@ PMX_OUTPUT_FORMAT_VERSION = 31
 # GUI、报告和预览器调整不得递增。
 MATERIAL_RESOLVER_VERSION = 41
 # 主体/附件组合发现规则版本；只影响“完整组合”，不抬高 PMX 文件格式版本。
-COMPOSITE_RESOLVER_VERSION = 5
+COMPOSITE_RESOLVER_VERSION = 6
 _RES_ASSET_PATHS_MEMORY_CACHE: dict[tuple[object, ...], list[str]] = {}
 _SCRIPT3_GIM_PATHS_MEMORY_CACHE: dict[tuple[object, ...], list[str]] = {}
 _FX_ASSET_PATHS_MEMORY_CACHE: dict[tuple[object, ...], list[str]] = {}
@@ -14951,6 +14951,9 @@ class RiggedMeshApp(tk.Tk):
                     )
                 )
                 existing_dirs: dict[str, list[Path]] = {}
+                existing_direct_composite_dirs: dict[
+                    frozenset[str], set[Path]
+                ] = {}
                 for category in ("带贴图", "纯色材质", "未匹配贴图"):
                     category_root = output_root / category
                     if not category_root.is_dir():
@@ -14963,6 +14966,24 @@ class RiggedMeshApp(tk.Tk):
                             existing_dirs.setdefault(
                                 match.group(1).lower(), []
                             ).append(child)
+                            build_path = child / ".build.json"
+                            if not build_path.is_file():
+                                continue
+                            try:
+                                build_payload = json.loads(
+                                    build_path.read_text(encoding="utf-8")
+                                )
+                                component_names = frozenset(
+                                    str(value).lower()
+                                    for value in build_payload.get("components", [])
+                                    if isinstance(value, str) and value
+                                )
+                            except (OSError, ValueError, TypeError):
+                                continue
+                            if len(component_names) > 1:
+                                existing_direct_composite_dirs.setdefault(
+                                    component_names, set()
+                                ).add(child)
 
                 report_rows: list[list[object]] = []
                 ok = failed = textured = reused = 0
@@ -15190,6 +15211,29 @@ class RiggedMeshApp(tk.Tk):
                         f"增量复用 {composite_reused}，失败 {composite_failed}。",
                     )
                 )
+                # 独立 PMX 已在本轮前半段先恢复。现在清理规则升级后不再成立的
+                # 直接组合，防止旧的 LOD 叠加成品继续留在预览器和角色目录里。
+                desired_direct_component_sets = {
+                    frozenset(path.name.lower() for path in composite.mesh_paths)
+                    for composite in composite_models
+                    if composite.direct_merge
+                }
+                removed_stale_composites = 0
+                for component_set, old_dirs in existing_direct_composite_dirs.items():
+                    if component_set in desired_direct_component_sets:
+                        continue
+                    for stale in old_dirs:
+                        if stale.exists():
+                            shutil.rmtree(stale)
+                            removed_stale_composites += 1
+                if removed_stale_composites:
+                    self.events.put(
+                        (
+                            "log",
+                            "组合规则已更新：清理失效旧组合目录 "
+                            f"{removed_stale_composites} 个；独立模型已恢复。",
+                        )
+                    )
                 # 只有直接合并 PMX 已成功落盘后才移除其独立输出，避免组合失败
                 # 时丢掉可用模型。原始 Mesh/材质缓存不删，随时可重新构建。
                 replaced_names = {
