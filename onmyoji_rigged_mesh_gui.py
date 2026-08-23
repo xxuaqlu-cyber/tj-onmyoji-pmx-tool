@@ -53,7 +53,7 @@ PMX_OUTPUT_FORMAT_VERSION = 31
 # GUI、报告和预览器调整不得递增。
 MATERIAL_RESOLVER_VERSION = 41
 # 主体/附件组合发现规则版本；只影响“完整组合”，不抬高 PMX 文件格式版本。
-COMPOSITE_RESOLVER_VERSION = 4
+COMPOSITE_RESOLVER_VERSION = 5
 _RES_ASSET_PATHS_MEMORY_CACHE: dict[tuple[object, ...], list[str]] = {}
 _SCRIPT3_GIM_PATHS_MEMORY_CACHE: dict[tuple[object, ...], list[str]] = {}
 _FX_ASSET_PATHS_MEMORY_CACHE: dict[tuple[object, ...], list[str]] = {}
@@ -11789,6 +11789,18 @@ def build_composite_models(
             subset_bind_cache[path] = layout
         return layout
 
+    component_position_safety_cache: dict[tuple[Path, Path], bool] = {}
+
+    def cached_component_positions_safe(main_path: Path, child_path: Path) -> bool:
+        key = (main_path.resolve(), child_path.resolve())
+        safe = component_position_safety_cache.get(key)
+        if safe is None:
+            safe = _shared_texture_component_positions_safe(
+                key[0], [key[1]]
+            )
+            component_position_safety_cache[key] = safe
+        return safe
+
     default_rigged_signatures: set[tuple[Path, Path]] = set()
     for parent_hash, dependency_hashes in dependencies.items():
         parent_record = record_by_hash.get(parent_hash)
@@ -12036,9 +12048,7 @@ def build_composite_models(
                         )
                     ) > 1e-4:
                         continue
-                    if not _shared_texture_component_positions_safe(
-                        main_path, [child_path]
-                    ):
+                    if not cached_component_positions_safe(main_path, child_path):
                         continue
                 except Exception:
                     continue
@@ -12098,8 +12108,9 @@ def build_composite_models(
         if not children:
             continue
         component_paths = [main_path] + [item[0] for item in children]
-        if not _shared_texture_component_positions_safe(
-            main_path, component_paths[1:]
+        if any(
+            not cached_component_positions_safe(main_path, child_path)
+            for child_path in component_paths[1:]
         ):
             continue
         frozen = frozenset(component_paths)
@@ -12222,6 +12233,8 @@ def build_composite_models(
                     alignment_kind = "同骨架/父链/Bind一致"
                 else:
                     alignment_kind = "子骨架父链+Bind刚体对齐"
+                if not cached_component_positions_safe(main_path, child_path):
+                    continue
                 choices.append(
                     (
                         main_vertices,
@@ -12272,7 +12285,10 @@ def build_composite_models(
         children.sort(key=lambda item: str(item[0]).lower())
         main_package = children[0][4]
         component_paths = [main_path] + [item[0] for item in children]
-        if not _shared_texture_component_positions_safe(main_path, component_paths[1:]):
+        if any(
+            not cached_component_positions_safe(main_path, child_path)
+            for child_path in component_paths[1:]
+        ):
             continue
         frozen = frozenset(component_paths)
         if any(frozen == existing for existing in existing_component_sets):
@@ -12664,11 +12680,43 @@ def _mesh_position_bounds(
     )
 
 
+def _matches_full_body_alternative_bounds(
+    main_positions: list[tuple[float, float, float]],
+    child_positions: list[tuple[float, float, float]],
+) -> bool:
+    """识别同一完整模型的高低精度版本，避免把 LOD 当成角色附件叠加。"""
+    if len(main_positions) < 2_000 or len(child_positions) < 2_000:
+        return False
+    vertex_ratio = len(child_positions) / len(main_positions)
+    if not 0.20 <= vertex_ratio <= 1.05:
+        return False
+
+    main_min, main_max = _mesh_position_bounds(main_positions)
+    child_min, child_max = _mesh_position_bounds(child_positions)
+    main_extents = [
+        high - low for low, high in zip(main_min, main_max)
+    ]
+    main_diagonal = max(
+        math.sqrt(sum(value * value for value in main_extents)), 1e-6
+    )
+    # 真附件可能很大，但几乎不会同时复现主体 AABB 的六个边界。LOD/Show
+    # 精简版则常保留完全相同的身高和极值点，只减少中间表面细分。
+    for axis in range(3):
+        scale = max(main_extents[axis], main_diagonal * 0.10, 1e-6)
+        boundary_error = max(
+            abs(child_min[axis] - main_min[axis]),
+            abs(child_max[axis] - main_max[axis]),
+        ) / scale
+        if boundary_error > 0.015:
+            return False
+    return True
+
+
 def _shared_texture_component_positions_safe(
     main_path: Path,
     child_paths: list[Path],
 ) -> bool:
-    """拒绝 Bind 对齐后仍远离主体数个尺度或发生矩阵爆炸的组件。"""
+    """拒绝错位组件，以及与主体同边界的完整高低精度替代模型。"""
     try:
         main = parse_mesh(main_path)
         main_min, main_max = _mesh_position_bounds(main.positions)
@@ -12689,6 +12737,10 @@ def _shared_texture_component_positions_safe(
             child_min, child_max = _mesh_position_bounds(positions)
             values = (*child_min, *child_max)
             if any(not math.isfinite(value) for value in values):
+                return False
+            if _matches_full_body_alternative_bounds(
+                main.positions, positions
+            ):
                 return False
             separation = [
                 max(main_min[axis] - child_max[axis], child_min[axis] - main_max[axis], 0.0)
