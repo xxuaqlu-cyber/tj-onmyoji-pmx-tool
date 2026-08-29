@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import shlex
 import shutil
 import subprocess
 import threading
@@ -15,6 +16,9 @@ APP_DIR = Path(__file__).resolve().parent
 SETTINGS_PATH = APP_DIR / ".resource_pull_settings.json"
 DEFAULT_DEVICE = "127.0.0.1:7555"
 DEFAULT_REMOTE = "/sdcard/Android/data/com.netease.onmyoji.wyzymnqsd_cps"
+SYNC_MANIFEST_NAME = ".yys_sync_manifest.json"
+PULL_BATCH_FILES = 100
+PULL_BATCH_CHARS = 24_000
 
 
 def subprocess_flags() -> int:
@@ -47,6 +51,122 @@ def pull_destination(output_root: Path, remote: str) -> tuple[Path, str]:
     if not remote_root.startswith("/") or package_name in {"", ".", ".."}:
         raise ValueError("Android 源目录无效，无法确定本地包目录名。")
     return output_root / package_name, remote_root + "/."
+
+
+def parse_remote_manifest(output: str, remote: str) -> dict[str, dict[str, int]]:
+    """解析 Android stat 输出为相对路径 -> 大小/修改时间。"""
+    remote_root = remote.rstrip("/")
+    prefix = remote_root + "/"
+    result: dict[str, dict[str, int]] = {}
+    malformed = 0
+    for line in output.splitlines():
+        parts = line.rstrip("\r").split("|", 2)
+        if len(parts) != 3:
+            if line.strip():
+                malformed += 1
+            continue
+        size_text, mtime_text, remote_path = parts
+        if not remote_path.startswith(prefix):
+            malformed += 1
+            continue
+        relative = PurePosixPath(remote_path[len(prefix) :])
+        if relative.is_absolute() or not relative.parts or ".." in relative.parts:
+            malformed += 1
+            continue
+        try:
+            size = int(size_text)
+            mtime = int(mtime_text)
+        except ValueError:
+            malformed += 1
+            continue
+        result[relative.as_posix()] = {"size": size, "mtime": mtime}
+    if malformed:
+        raise RuntimeError(f"远端文件清单有 {malformed} 行无法解析。")
+    if not result:
+        raise RuntimeError("远端目录中没有读取到任何文件。")
+    return result
+
+
+def load_sync_manifest(path: Path) -> dict[str, dict[str, int]]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    result: dict[str, dict[str, int]] = {}
+    for relative, metadata in payload.items():
+        if not isinstance(relative, str) or not isinstance(metadata, dict):
+            continue
+        try:
+            result[relative] = {
+                "size": int(metadata["size"]),
+                "mtime": int(metadata["mtime"]),
+            }
+        except (KeyError, TypeError, ValueError):
+            continue
+    return result
+
+
+def save_sync_manifest(path: Path, manifest: dict[str, dict[str, int]]) -> None:
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+def local_path_for_remote(package_output: Path, relative: str) -> Path:
+    posix_path = PurePosixPath(relative)
+    if posix_path.is_absolute() or not posix_path.parts or ".." in posix_path.parts:
+        raise ValueError(f"不安全的远端相对路径：{relative}")
+    return package_output.joinpath(*posix_path.parts)
+
+
+def changed_remote_files(
+    package_output: Path,
+    remote_manifest: dict[str, dict[str, int]],
+    previous_manifest: dict[str, dict[str, int]],
+) -> list[str]:
+    changed: list[str] = []
+    for relative, metadata in remote_manifest.items():
+        local_path = local_path_for_remote(package_output, relative)
+        try:
+            local_size = local_path.stat().st_size if local_path.is_file() else -1
+        except OSError:
+            local_size = -1
+        if previous_manifest.get(relative) != metadata or local_size != metadata["size"]:
+            changed.append(relative)
+    return sorted(changed)
+
+
+def pull_batches(
+    relative_paths: list[str], *, remote_prefix: str = ""
+) -> list[list[str]]:
+    """同目录分批，保证多源 adb pull 不会丢失远端目录层级。"""
+    by_parent: dict[str, list[str]] = {}
+    for relative in relative_paths:
+        parent = PurePosixPath(relative).parent.as_posix()
+        by_parent.setdefault(parent, []).append(relative)
+    batches: list[list[str]] = []
+    for parent in sorted(by_parent):
+        current: list[str] = []
+        current_chars = 0
+        for relative in sorted(by_parent[parent]):
+            path_chars = len(remote_prefix) + len(relative) + 3
+            if current and (
+                len(current) >= PULL_BATCH_FILES
+                or current_chars + path_chars > PULL_BATCH_CHARS
+            ):
+                batches.append(current)
+                current = []
+                current_chars = 0
+            current.append(relative)
+            current_chars += path_chars
+        if current:
+            batches.append(current)
+    return batches
 
 
 class ResourcePullApp:
@@ -108,6 +228,7 @@ class ResourcePullApp:
 
         note = (
             "默认保存到本工具所在目录下的 yys；所有字段均可修改并会保存在本机。"
+            "增量模式只下载新增、变化或本地缺失的文件；完整模式会重新下载全部文件。"
             "拉取前请先在模拟器内完成游戏更新。"
         )
         ttk.Label(outer, text=note, foreground="#555555", wraplength=790).grid(
@@ -118,12 +239,18 @@ class ResourcePullApp:
         actions.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(0, 10))
         self.connect_button = ttk.Button(actions, text="连接并检测", command=self.connect_device)
         self.connect_button.pack(side="left")
-        self.pull_button = ttk.Button(actions, text="开始拉取完整资源", command=self.start_pull)
+        self.pull_button = ttk.Button(
+            actions, text="完整拉取全部资源", command=self.start_pull
+        )
         self.pull_button.pack(side="left", padx=8)
+        self.incremental_button = ttk.Button(
+            actions, text="增量拉取更新", command=self.start_incremental_pull
+        )
+        self.incremental_button.pack(side="left")
         self.cancel_button = ttk.Button(
             actions, text="停止", command=self.cancel, state="disabled"
         )
-        self.cancel_button.pack(side="left")
+        self.cancel_button.pack(side="left", padx=(8, 0))
         self.progress = ttk.Progressbar(actions, mode="indeterminate", length=180)
         self.progress.pack(side="right", padx=(10, 0))
 
@@ -194,6 +321,7 @@ class ResourcePullApp:
         button_state = "disabled" if value else "normal"
         self.connect_button.configure(state=button_state)
         self.pull_button.configure(state=button_state)
+        self.incremental_button.configure(state=button_state)
         self.cancel_button.configure(state="normal" if value else "disabled")
         if value:
             self.progress.start(12)
@@ -211,9 +339,15 @@ class ResourcePullApp:
         threading.Thread(target=target, daemon=True).start()
 
     def run_command(
-        self, command: list[str], *, cwd: Path | None = None
+        self,
+        command: list[str],
+        *,
+        cwd: Path | None = None,
+        log_command: bool = True,
+        log_output: bool = True,
     ) -> tuple[int, str]:
-        self.events.put(("log", "> " + subprocess.list2cmdline(command)))
+        if log_command:
+            self.events.put(("log", "> " + subprocess.list2cmdline(command)))
         process = subprocess.Popen(
             command,
             cwd=str(cwd) if cwd is not None else None,
@@ -229,7 +363,8 @@ class ResourcePullApp:
         assert process.stdout is not None
         for line in process.stdout:
             output.append(line)
-            self.events.put(("log", line))
+            if log_output:
+                self.events.put(("log", line))
         code = process.wait()
         self.current_process = None
         return code, "".join(output)
@@ -242,6 +377,27 @@ class ResourcePullApp:
         code, output = self.run_command([adb, "-s", device, "get-state"])
         if code != 0 or "device" not in output.lower():
             raise RuntimeError(output.strip() or f"设备 {device} 当前不可用。")
+
+    def read_remote_manifest(
+        self, adb: str, device: str, remote: str
+    ) -> dict[str, dict[str, int]]:
+        remote_root = remote.rstrip("/")
+        shell_command = (
+            f"find {shlex.quote(remote_root)} -type f -print0 | "
+            "xargs -0 -n 100 stat -c '%s|%Y|%n'"
+        )
+        self.events.put(("log", "正在读取远端文件大小和修改时间…"))
+        code, output = self.run_command(
+            [adb, "-s", device, "shell", shell_command],
+            log_output=False,
+        )
+        if self.cancel_requested:
+            raise InterruptedError("用户停止了拉取。")
+        if code != 0:
+            raise RuntimeError(output.strip() or "读取远端文件清单失败。")
+        manifest = parse_remote_manifest(output, remote_root)
+        self.events.put(("log", f"远端文件清单：{len(manifest)} 个文件。"))
+        return manifest
 
     def refresh_devices(self) -> None:
         def worker() -> None:
@@ -296,9 +452,9 @@ class ResourcePullApp:
             messagebox.showerror("源目录无效", str(exc))
             return
         if not messagebox.askokcancel(
-            "开始拉取",
+            "完整拉取全部资源",
             f"将从设备 {device} 拉取：\n{remote}\n\n保存到：\n{package_output}\n\n"
-            "目录已有文件会由 ADB 增量更新，过程可能耗时较长。",
+            "此模式会重新下载全部远端文件，过程可能耗时较长。",
         ):
             return
 
@@ -308,11 +464,21 @@ class ResourcePullApp:
                 output.mkdir(parents=True, exist_ok=True)
                 package_output.mkdir(parents=True, exist_ok=True)
                 self.ensure_device(adb, device)
+                remote_manifest: dict[str, dict[str, int]] | None = None
+                try:
+                    remote_manifest = self.read_remote_manifest(adb, device, remote)
+                except Exception as exc:
+                    self.events.put(
+                        ("log", f"警告：无法建立增量清单，本次仍继续完整拉取：{exc}")
+                    )
+                if self.cancel_requested:
+                    self.events.put(("done", "拉取已停止。"))
+                    return
                 # MuMu 附带的 ADB 在包含中文的绝对 Windows 目标路径下，可能无法
                 # 递归创建子目录。让系统先进入已创建的包目录，再将纯 ASCII 的
                 # "." 交给 ADB，既避开路径编码问题，也保证父目录一定存在。
                 code, text = self.run_command(
-                    [adb, "-s", device, "pull", remote_contents, "."],
+                    [adb, "-s", device, "pull", "-a", remote_contents, "."],
                     cwd=package_output,
                 )
                 if self.cancel_requested:
@@ -320,11 +486,132 @@ class ResourcePullApp:
                 elif code != 0:
                     raise RuntimeError(text.strip() or f"ADB 拉取失败，退出码 {code}。")
                 else:
+                    if remote_manifest is not None:
+                        save_sync_manifest(
+                            package_output / SYNC_MANIFEST_NAME, remote_manifest
+                        )
                     self.events.put(("done", f"资源拉取完成：{package_output}"))
             except Exception as exc:
                 self.events.put(("error", str(exc)))
 
         self.start_worker(worker, "正在拉取完整游戏资源…")
+
+    def start_incremental_pull(self) -> None:
+        try:
+            output = Path(
+                os.path.expandvars(self.output_var.get().strip())
+            ).expanduser().resolve()
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("目录无效", str(exc))
+            return
+        remote = self.remote_var.get().strip()
+        device = self.device_var.get().strip()
+        if not device or not remote:
+            messagebox.showerror("信息不完整", "请填写设备地址和 Android 源目录。")
+            return
+        try:
+            package_output, _ = pull_destination(output, remote)
+        except ValueError as exc:
+            messagebox.showerror("源目录无效", str(exc))
+            return
+        if not messagebox.askokcancel(
+            "增量拉取更新",
+            f"将检查设备 {device}：\n{remote}\n\n更新到：\n{package_output}\n\n"
+            "只下载新增、变化、本地缺失或大小不符的文件。"
+            "远端已删除的文件会在本地保留。",
+        ):
+            return
+
+        def worker() -> None:
+            try:
+                adb = self.resolve_adb()
+                output.mkdir(parents=True, exist_ok=True)
+                package_output.mkdir(parents=True, exist_ok=True)
+                self.ensure_device(adb, device)
+                remote_manifest = self.read_remote_manifest(adb, device, remote)
+                manifest_path = package_output / SYNC_MANIFEST_NAME
+                previous_manifest = load_sync_manifest(manifest_path)
+                changed = changed_remote_files(
+                    package_output, remote_manifest, previous_manifest
+                )
+                removed_remote = len(set(previous_manifest) - set(remote_manifest))
+                unchanged = len(remote_manifest) - len(changed)
+                self.events.put(
+                    (
+                        "log",
+                        f"增量比较完成：需下载 {len(changed)}，"
+                        f"未变化 {unchanged}，远端已删除 {removed_remote}（本地保留）。",
+                    )
+                )
+                if self.cancel_requested:
+                    self.events.put(("done", "增量拉取已停止。"))
+                    return
+                if not changed:
+                    save_sync_manifest(manifest_path, remote_manifest)
+                    self.events.put(("done", "检查完成：本地资源已是最新。"))
+                    return
+
+                remote_root = remote.rstrip("/")
+                batches = pull_batches(changed, remote_prefix=remote_root + "/")
+                for number, batch in enumerate(batches, 1):
+                    if self.cancel_requested:
+                        self.events.put(("done", "增量拉取已停止。"))
+                        return
+                    parent = PurePosixPath(batch[0]).parent.as_posix()
+                    local_parent = (
+                        package_output
+                        if parent in {"", "."}
+                        else local_path_for_remote(package_output, parent)
+                    )
+                    local_parent.mkdir(parents=True, exist_ok=True)
+                    remote_paths = [f"{remote_root}/{relative}" for relative in batch]
+                    self.events.put(
+                        (
+                            "status",
+                            f"增量下载 {number}/{len(batches)}；"
+                            f"本批 {len(batch)} 个文件",
+                        )
+                    )
+                    self.events.put(
+                        (
+                            "log",
+                            f"下载批次 {number}/{len(batches)}："
+                            f"{parent}（{len(batch)} 个文件）",
+                        )
+                    )
+                    code, text = self.run_command(
+                        [adb, "-s", device, "pull", "-a", *remote_paths, "."],
+                        cwd=local_parent,
+                        log_command=False,
+                        log_output=False,
+                    )
+                    if self.cancel_requested:
+                        self.events.put(("done", "增量拉取已停止。"))
+                        return
+                    if code != 0:
+                        raise RuntimeError(
+                            text.strip() or f"ADB 增量拉取失败，退出码 {code}。"
+                        )
+                    summary = next(
+                        (line.strip() for line in reversed(text.splitlines()) if line.strip()),
+                        "本批下载完成。",
+                    )
+                    self.events.put(("log", summary))
+
+                save_sync_manifest(manifest_path, remote_manifest)
+                self.events.put(
+                    (
+                        "done",
+                        f"增量更新完成：下载 {len(changed)} 个文件；"
+                        f"未变化 {unchanged} 个。",
+                    )
+                )
+            except InterruptedError:
+                self.events.put(("done", "增量拉取已停止。"))
+            except Exception as exc:
+                self.events.put(("error", str(exc)))
+
+        self.start_worker(worker, "正在检查增量更新…")
 
     def cancel(self) -> None:
         self.cancel_requested = True
