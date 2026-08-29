@@ -7,7 +7,7 @@ import shutil
 import subprocess
 import threading
 import tkinter as tk
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from tkinter import filedialog, messagebox, ttk
 
 
@@ -38,6 +38,15 @@ def load_settings() -> dict[str, str]:
             if isinstance(value, str) and value.strip():
                 defaults[key] = value.strip()
     return defaults
+
+
+def pull_destination(output_root: Path, remote: str) -> tuple[Path, str]:
+    """返回本地包目录和用于拉取其内容的 Android 路径。"""
+    remote_root = remote.rstrip("/")
+    package_name = PurePosixPath(remote_root).name
+    if not remote_root.startswith("/") or package_name in {"", ".", ".."}:
+        raise ValueError("Android 源目录无效，无法确定本地包目录名。")
+    return output_root / package_name, remote_root + "/."
 
 
 class ResourcePullApp:
@@ -201,10 +210,13 @@ class ResourcePullApp:
         self.set_busy(True, status)
         threading.Thread(target=target, daemon=True).start()
 
-    def run_command(self, command: list[str]) -> tuple[int, str]:
+    def run_command(
+        self, command: list[str], *, cwd: Path | None = None
+    ) -> tuple[int, str]:
         self.events.put(("log", "> " + subprocess.list2cmdline(command)))
         process = subprocess.Popen(
             command,
+            cwd=str(cwd) if cwd is not None else None,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -278,9 +290,14 @@ class ResourcePullApp:
         if not remote.startswith("/"):
             messagebox.showerror("源目录无效", "Android 源目录应以 / 开头。")
             return
+        try:
+            package_output, remote_contents = pull_destination(output, remote)
+        except ValueError as exc:
+            messagebox.showerror("源目录无效", str(exc))
+            return
         if not messagebox.askokcancel(
             "开始拉取",
-            f"将从设备 {device} 拉取：\n{remote}\n\n保存到：\n{output}\n\n"
+            f"将从设备 {device} 拉取：\n{remote}\n\n保存到：\n{package_output}\n\n"
             "目录已有文件会由 ADB 增量更新，过程可能耗时较长。",
         ):
             return
@@ -289,14 +306,21 @@ class ResourcePullApp:
             try:
                 adb = self.resolve_adb()
                 output.mkdir(parents=True, exist_ok=True)
+                package_output.mkdir(parents=True, exist_ok=True)
                 self.ensure_device(adb, device)
-                code, text = self.run_command([adb, "-s", device, "pull", remote, str(output)])
+                # MuMu 附带的 ADB 在包含中文的绝对 Windows 目标路径下，可能无法
+                # 递归创建子目录。让系统先进入已创建的包目录，再将纯 ASCII 的
+                # "." 交给 ADB，既避开路径编码问题，也保证父目录一定存在。
+                code, text = self.run_command(
+                    [adb, "-s", device, "pull", remote_contents, "."],
+                    cwd=package_output,
+                )
                 if self.cancel_requested:
                     self.events.put(("done", "拉取已停止。"))
                 elif code != 0:
                     raise RuntimeError(text.strip() or f"ADB 拉取失败，退出码 {code}。")
                 else:
-                    self.events.put(("done", f"资源拉取完成：{output}"))
+                    self.events.put(("done", f"资源拉取完成：{package_output}"))
             except Exception as exc:
                 self.events.put(("error", str(exc)))
 
