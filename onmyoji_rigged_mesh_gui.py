@@ -48,7 +48,7 @@ from tkinter import filedialog, messagebox, ttk
 APP_TITLE = "阴阳师 PMX 一键解包工具"
 # 这里只表示 PMX 文件本身的输出兼容版本。材质匹配规则、报告格式或 GUI
 # 调整不应修改它，否则所有 .build.json 会同时失效并触发一次全量重写。
-PMX_OUTPUT_FORMAT_VERSION = 31
+PMX_OUTPUT_FORMAT_VERSION = 32
 # 材质 resolver 的输入/规则兼容版本。只在匹配逻辑会改变最终材质包时递增；
 # GUI、报告和预览器调整不得递增。
 MATERIAL_RESOLVER_VERSION = 41
@@ -222,6 +222,25 @@ class ParsedMesh:
     uvs: list[tuple[float, float]]
     joints: list[tuple[int, int, int, int]]
     weights: list[tuple[float, float, float, float]]
+
+
+@dataclass(slots=True, frozen=True)
+class SkeletonHierarchy:
+    source: Path
+    name: str
+    bone_names: tuple[str, ...]
+    bone_keys: tuple[str, ...]
+    bone_parents: tuple[int, ...]
+
+
+@dataclass(slots=True)
+class SkeletonHierarchyIndex:
+    layouts: tuple[SkeletonHierarchy, ...]
+    by_bone: dict[str, frozenset[int]]
+
+
+_SKELETON_HIERARCHY_CACHE: dict[Path, SkeletonHierarchyIndex] = {}
+_SKELETON_HIERARCHY_CACHE_LOCK = threading.Lock()
 
 
 @dataclass(slots=True)
@@ -524,18 +543,11 @@ def read_mesh_submesh_count(path: Path) -> int:
                 raise MeshFormatError(f"{path.name}: 子网格数量异常")
 
 
-def read_skeleton_name_and_bones(
-    path: Path,
-) -> tuple[str, frozenset[str]] | None:
-    """读取 NeoX Skeleton 的 NAME 字符串表：首项为骨架名，后续为骨骼名。"""
+def _read_skeleton_name_table(data: bytes) -> list[str] | None:
     try:
-        data = path.read_bytes()
-    except OSError:
-        return None
-    marker = data.find(b"NAME")
-    if marker < 0 or marker + 12 > len(data):
-        return None
-    try:
+        marker = data.find(b"NAME")
+        if marker < 0 or marker + 12 > len(data):
+            return None
         _, count = struct.unpack_from("<II", data, marker + 4)
     except struct.error:
         return None
@@ -557,6 +569,113 @@ def read_skeleton_name_and_bones(
         except UnicodeDecodeError:
             value = raw.decode("gb18030", errors="replace")
         values.append(value.strip().replace(" ", "_"))
+    return values
+
+
+def _valid_skeleton_parent_table(parents: tuple[int, ...]) -> bool:
+    """验证 Skeleton 父表是有根无环森林。"""
+    count = len(parents)
+    if not parents or not any(parent < 0 for parent in parents):
+        return False
+    if any(
+        parent >= count or parent < -1 or parent == index
+        for index, parent in enumerate(parents)
+    ):
+        return False
+
+    states = [0] * count
+
+    def visit(index: int) -> bool:
+        if states[index] == 2:
+            return True
+        if states[index] == 1:
+            return False
+        states[index] = 1
+        parent = parents[index]
+        if parent >= 0 and not visit(parent):
+            return False
+        states[index] = 2
+        return True
+
+    return all(visit(index) for index in range(count))
+
+
+def read_skeleton_hierarchy(path: Path) -> SkeletonHierarchy | None:
+    """读取 NeoX Skeleton 中的完整父链。
+
+    Skeleton 是动画骨架的权威数据；Mesh 中的父表有时是为蒙皮
+    精简过的版本。NeoX 序列化会在名称数组与 uint16 父表之间
+    产生少量可变填充，所以用“索引合法、有根、无环”定位唯一父表。
+    """
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None
+    if not data.startswith(b"SKELETON"):
+        return None
+    values = _read_skeleton_name_table(data)
+    if values is None or len(values) < 2:
+        return None
+    data_marker = data.find(b"DATA")
+    name_marker = data.find(b"NAME")
+    if data_marker < 0 or name_marker < 0:
+        return None
+
+    bone_names = tuple(values[1:])
+    bone_count = len(bone_names)
+    expected_parent_offset = data_marker + 16 + bone_count * 4
+    candidates: dict[tuple[int, ...], tuple[int, int, int]] = {}
+    for delta in range(-16, 18, 2):
+        position = expected_parent_offset + delta
+        if position < data_marker + 8 or position + bone_count * 2 > name_marker:
+            continue
+        try:
+            raw = struct.unpack_from(f"<{bone_count}H", data, position)
+        except struct.error:
+            continue
+        parents = tuple(-1 if value == 0xFFFF else value for value in raw)
+        if not _valid_skeleton_parent_table(parents):
+            continue
+        root_count = sum(parent < 0 for parent in parents)
+        forward_edges = sum(
+            parent >= index
+            for index, parent in enumerate(parents)
+            if parent >= 0
+        )
+        candidates[parents] = (
+            1 if root_count == 1 else 0,
+            -forward_edges,
+            -abs(delta),
+        )
+    if not candidates:
+        return None
+    ranked = sorted(candidates.items(), key=lambda item: item[1], reverse=True)
+    if len(ranked) > 1 and ranked[0][1] == ranked[1][1]:
+        return None
+    parents = ranked[0][0]
+    bone_keys = tuple(_normalized_bone_key(name) for name in bone_names)
+    if len(set(bone_keys)) != len(bone_keys):
+        return None
+    return SkeletonHierarchy(
+        source=path,
+        name=values[0].strip(),
+        bone_names=bone_names,
+        bone_keys=bone_keys,
+        bone_parents=parents,
+    )
+
+
+def read_skeleton_name_and_bones(
+    path: Path,
+) -> tuple[str, frozenset[str]] | None:
+    """读取 NeoX Skeleton 的骨架名和骨名集合。"""
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None
+    values = _read_skeleton_name_table(data)
+    if values is None or len(values) < 2:
+        return None
     name = values[0].strip()
     bones = frozenset(value for value in values[1:] if value)
     if not name or not bones:
@@ -12403,6 +12522,121 @@ def _normalized_bone_key(value: str) -> str:
     return re.sub(r"[\s_]+", "_", value.strip().lower())
 
 
+def _locate_skeleton_folder(mesh_path: Path) -> Path | None:
+    """从 model/extra_rigged/hot_update_model 等来源定位同批 model 骨架。"""
+    resolved = mesh_path.resolve()
+    for ancestor in resolved.parents:
+        if ancestor.name.lower() == "model":
+            return ancestor
+    for ancestor in resolved.parents:
+        candidate = ancestor / "model"
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
+def _build_skeleton_hierarchy_index(folder: Path) -> SkeletonHierarchyIndex:
+    layouts: list[SkeletonHierarchy] = []
+    by_bone: dict[str, set[int]] = defaultdict(set)
+    for path in folder.rglob("*.skeleton"):
+        layout = read_skeleton_hierarchy(path)
+        if layout is None:
+            continue
+        index = len(layouts)
+        layouts.append(layout)
+        for key in set(layout.bone_keys):
+            by_bone[key].add(index)
+    return SkeletonHierarchyIndex(
+        layouts=tuple(layouts),
+        by_bone={key: frozenset(indices) for key, indices in by_bone.items()},
+    )
+
+
+def _get_skeleton_hierarchy_index(folder: Path) -> SkeletonHierarchyIndex:
+    folder = folder.resolve()
+    with _SKELETON_HIERARCHY_CACHE_LOCK:
+        cached = _SKELETON_HIERARCHY_CACHE.get(folder)
+        if cached is not None:
+            return cached
+        index = _build_skeleton_hierarchy_index(folder)
+        _SKELETON_HIERARCHY_CACHE[folder] = index
+        return index
+
+
+def _project_skeleton_parents(
+    mesh_bone_keys: tuple[str, ...],
+    skeleton: SkeletonHierarchy,
+) -> tuple[int, ...] | None:
+    """投影到 Mesh 现有骨骼，跳过 Skeleton 中未参与蒙皮的中间骨。"""
+    mesh_indices = {key: index for index, key in enumerate(mesh_bone_keys)}
+    skeleton_indices = {
+        key: index for index, key in enumerate(skeleton.bone_keys)
+    }
+    if any(key not in skeleton_indices for key in mesh_bone_keys):
+        return None
+
+    projected: list[int] = []
+    for key in mesh_bone_keys:
+        parent = skeleton.bone_parents[skeleton_indices[key]]
+        while parent >= 0 and skeleton.bone_keys[parent] not in mesh_indices:
+            parent = skeleton.bone_parents[parent]
+        projected.append(
+            mesh_indices[skeleton.bone_keys[parent]] if parent >= 0 else -1
+        )
+    result = tuple(projected)
+    return result if _valid_skeleton_parent_table(result) else None
+
+
+def restore_mesh_hierarchy_from_skeleton(
+    mesh: ParsedMesh,
+    mesh_path: Path,
+) -> bool:
+    """在唯一可证时，用独立 Skeleton 恢复 Mesh 中被压平的父链。"""
+    if mesh.bone_names == ["__static_root__"] or not mesh.bone_names:
+        return False
+    mesh_keys = tuple(_normalized_bone_key(name) for name in mesh.bone_names)
+    if len(set(mesh_keys)) != len(mesh_keys):
+        return False
+    folder = _locate_skeleton_folder(mesh_path)
+    if folder is None:
+        return False
+    index = _get_skeleton_hierarchy_index(folder)
+    candidate_sets = [index.by_bone.get(key) for key in mesh_keys]
+    if any(not candidates for candidates in candidate_sets):
+        return False
+    smallest = min(candidate_sets, key=lambda candidates: len(candidates or ()))
+    candidate_ids = set(smallest or ())
+    for candidates in candidate_sets:
+        candidate_ids.intersection_update(candidates or ())
+        if not candidate_ids:
+            return False
+
+    projections = {
+        projected
+        for candidate_id in candidate_ids
+        if (
+            projected := _project_skeleton_parents(
+                mesh_keys, index.layouts[candidate_id]
+            )
+        ) is not None
+    }
+    # 通用骨名可能落入多个角色 Skeleton；所有候选必须对
+    # 父链给出同一答案，否则宁可保留 Mesh 原表。
+    if len(projections) != 1:
+        return False
+    parents = next(iter(projections))
+    if parents == tuple(mesh.bone_parents):
+        return False
+    mesh.bone_parents = list(parents)
+    return True
+
+
+def parse_mesh_for_pmx(path: Path) -> ParsedMesh:
+    mesh = parse_mesh(path)
+    restore_mesh_hierarchy_from_skeleton(mesh, path)
+    return mesh
+
+
 def _matrix4_multiply(
     left: tuple[float, ...], right: tuple[float, ...]
 ) -> tuple[float, ...]:
@@ -13511,7 +13745,7 @@ def export_mesh_variant(
             "",
         )
 
-    mesh = parse_mesh(mesh_path)
+    mesh = parse_mesh_for_pmx(mesh_path)
     texture_files: dict[str, Path] = {}
     texture_error = ""
     if trusted_package and package:
@@ -13894,7 +14128,7 @@ def save_composite_pmx(
         return reusable[0], True
 
     # 骨骼管线升级时保留组合模型已有贴图，只重写 PMX。
-    meshes = [parse_mesh(path) for path in composite.mesh_paths]
+    meshes = [parse_mesh_for_pmx(path) for path in composite.mesh_paths]
     merged = merge_parsed_meshes(
         meshes,
         composite.static_bone_names,
@@ -14542,7 +14776,7 @@ class RiggedMeshApp(tk.Tk):
                                 pmx_path, model_output, _ = reusable
                                 was_reused = True
                         if not was_reused:
-                            mesh = parse_mesh(row.path)
+                            mesh = parse_mesh_for_pmx(row.path)
                             save_pmx(mesh, pmx_path, model_name)
                             meta_path = model_output / ".build.json"
                             meta_path.write_text(
@@ -15596,7 +15830,7 @@ class RiggedMeshApp(tk.Tk):
                 out_dir.mkdir(parents=True, exist_ok=True)
                 for index, row in enumerate(rows, 1):
                     try:
-                        mesh = parse_mesh(row.path)
+                        mesh = parse_mesh_for_pmx(row.path)
                         output = out_dir / f"{row.path.stem}.pmx"
                         save_pmx(mesh, output, row.path.stem)
                         ok += 1
@@ -15717,13 +15951,36 @@ def self_test(folder: Path) -> int:
         )
         if first is not None:
             try:
-                mesh = parse_mesh(first.path)
+                import pymeshio.pmx.reader
+
+                mesh = parse_mesh_for_pmx(first.path)
                 with tempfile.TemporaryDirectory(prefix="onmyoji_pmx_test_") as temp:
                     target = Path(temp) / "test.pmx"
                     save_pmx(mesh, target, "self_test")
                     header = target.read_bytes()[:4]
                     if header != b"PMX ":
                         raise RuntimeError(f"PMX 头错误：{header!r}")
+                    written = pymeshio.pmx.reader.read_from_file(str(target))
+                    order, parents = _order_bones_parent_first(mesh.bone_parents)
+                    old_to_new = {
+                        old_index: new_index
+                        for new_index, old_index in enumerate(order)
+                    }
+                    if len(written.bones) != len(order):
+                        raise RuntimeError("PMX 骨骼数与源 Mesh 不一致")
+                    for new_index, old_index in enumerate(order):
+                        expected_parent = (
+                            old_to_new[parents[old_index]]
+                            if parents[old_index] >= 0 else -1
+                        )
+                        bone = written.bones[new_index]
+                        if (
+                            bone.name != mesh.bone_names[old_index]
+                            or bone.parent_index != expected_parent
+                        ):
+                            raise RuntimeError(
+                                f"PMX 骨骼父链读回不一致：{bone.name}"
+                            )
                     print(f"PMX_OK size={target.stat().st_size}")
             except Exception as exc:
                 failures.append(f"PMX writer: {type(exc).__name__}: {exc}")
