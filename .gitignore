@@ -3,6 +3,7 @@
 /unpacked/
 /rigged_models/
 /backup/
+/tj-tool-lite/
 *.apk
 
 # Local/runtime files
