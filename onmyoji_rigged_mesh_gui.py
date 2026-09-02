@@ -1757,7 +1757,10 @@ def sync_supplemental_rigged_resources(
     output_root = model_folder.parent / "extra_rigged"
     output_root.mkdir(parents=True, exist_ok=True)
     if archive_groups is None:
-        archive_groups = wpk.discover_groups(source_root)
+        archive_groups = wpk.discover_groups(
+            source_root,
+            stems=SUPPLEMENTAL_RIGGED_GROUPS,
+        )
     groups = {
         group.stem: group for group in archive_groups
         if group.stem in SUPPLEMENTAL_RIGGED_GROUPS
@@ -1940,7 +1943,10 @@ def sync_supplemental_material_resources(
     )
 
     if archive_groups is None:
-        archive_groups = wpk.discover_groups(source_root)
+        archive_groups = wpk.discover_groups(
+            source_root,
+            stems=SUPPLEMENTAL_RIGGED_GROUPS,
+        )
     groups = {group.stem: group for group in archive_groups}
     try:
         references = set(load_res_asset_paths(thd_dir, model_folder))
@@ -6149,6 +6155,7 @@ def build_material_packages(
     model_folder: Path,
     progress: Callable[[int, int], None] | None = None,
     thd_dir: Path | None = None,
+    stage_progress: Callable[[str, int, int], None] | None = None,
 ) -> tuple[
     list[MaterialPackage],
     dict[Path, MaterialPackage],
@@ -6161,6 +6168,42 @@ def build_material_packages(
     精确 KTX，不再依赖同段纹理顺序；多子网格、多材质及共享纹理
     均按原始声明保留。
     """
+    stage_names = (
+        "读取 THD 索引",
+        "分析 THD 精确依赖",
+        "补全历史索引关系",
+        "补全 APK 基础材质",
+        "匹配 GIM 明文路径",
+        "匹配 script3 路径",
+        "匹配 res 资源路径",
+        "匹配 GIM 别名",
+        "匹配派生 GIM",
+        "匹配透明模型",
+        "匹配庭院模型",
+        "匹配编号合并模型",
+        "匹配 GIM 子集",
+        "匹配嵌套 GIM",
+        "匹配单材质直连纹理",
+        "匹配同目录唯一纹理",
+        "匹配逻辑资源族",
+        "匹配额外资源族",
+        "匹配骨架路径",
+        "匹配孤立模型 UV",
+        "匹配主角模式共识",
+        "匹配同族渲染目标",
+        "整理逻辑材质变体",
+        "整理 THP 父节点变体",
+        "建立最终材质索引",
+    )
+    stage_number = 0
+
+    def begin_stage(label: str) -> None:
+        nonlocal stage_number
+        stage_number += 1
+        if stage_progress:
+            stage_progress(label, stage_number, len(stage_names))
+
+    begin_stage(stage_names[0])
     model_folder = model_folder.resolve()
     by_md5, md5_by_path = _manifest_hash_maps(model_folder)
     fallback_packages, fallback_by_mesh = _build_manual_verified_packages(
@@ -6249,6 +6292,7 @@ def build_material_packages(
     by_mesh: dict[Path, MaterialPackage] = {}
     total = len(gim_paths)
 
+    begin_stage(stage_names[1])
     for number, gim_path in enumerate(gim_paths, 1):
         gim_digest = md5_by_path.get(gim_path)
         parent = next(
@@ -6708,6 +6752,7 @@ def build_material_packages(
     # files remain in the local WPK cache.  Reuse the preceding official online
     # indexes (and APK baseline) only when the full GIM/material/main-texture
     # chain is still structurally exact.
+    begin_stage(stage_names[2])
     historical_packages, historical_by_mesh = (
         _build_historical_exact_parent_packages(
             model_folder,
@@ -6732,6 +6777,7 @@ def build_material_packages(
 
     # 热更新后的 model.thp 会删掉一些仍留在当前 WPK 的基础角色依赖。
     # APK 自带的基础 THX/THP 是同一套官方资源关系，可安全补这些缺口。
+    begin_stage(stage_names[3])
     apk_packages, apk_by_mesh = _build_cached_apk_material_packages(
         model_folder,
         by_md5,
@@ -6746,6 +6792,7 @@ def build_material_packages(
     # THP 中的 Mesh 内容 MD5 可能滞后于热更新，但 GIM XML 常仍明文保存
     # Mesh="model/.../*.mesh"。用这条逻辑路径回查当前 THX，可恢复版本错位漏配。
     apk_thd_dir = model_folder.parent / "apk_model_parents" / "thd"
+    begin_stage(stage_names[4])
     gim_path_packages, gim_path_by_mesh = _build_explicit_gim_path_packages(
         model_folder,
         by_md5,
@@ -6763,6 +6810,7 @@ def build_material_packages(
 
     # script3 内保存了客户端实际使用的大量 GIM 逻辑路径。它能补出
     # “THX 中有 Mesh，但 THP 已不再直接列出该 Mesh”的热更新/旧资源。
+    begin_stage(stage_names[5])
     script_packages, script_by_mesh = _build_script3_path_packages(
         model_folder,
         by_md5,
@@ -6782,6 +6830,7 @@ def build_material_packages(
     # res 的资源清单比 script3 更完整，包含大量 kind=1 派生 Mesh 的明文路径。
     # 这里仍只启用最保守的“同 stem GIM 实体 + 官方 THP 唯一材质组”规则；
     # tingyuan/touming/shihua/jq 等缺失 GIM 的派生格式由后续专门规则处理。
+    begin_stage(stage_names[6])
     res_asset_paths = load_res_asset_paths(thd_dir, model_folder)
     res_gim_references = sorted({
         reference[:-5] + ".gim"
@@ -6809,6 +6858,7 @@ def build_material_packages(
     # kind=15 别名 GIM 常只保留 Mesh/子网格语义，真正 MaterialGroup 会挂在
     # 同目录的另一条官方 GIM 关系上。这里直接复用已加载的 res 清单，避免
     # 为这一层规则再次读取大型资源路径表。
+    begin_stage(stage_names[7])
     alias_packages, alias_by_mesh = _build_gim_alias_name_material_packages(
         model_folder,
         by_md5,
@@ -6825,6 +6875,7 @@ def build_material_packages(
     # 少量 kind=1 派生 GIM 自身实体已裁掉，但 THP 仍直接保存
     # “子 GIM + 同子网格数源 Mesh + MaterialGroup”。这种代理依赖关系
     # 仍是官方结构证据，可用于恢复派生高模的材质布局。
+    begin_stage(stage_names[8])
     proxy_packages, proxy_by_mesh = _build_res_proxy_gim_packages(
         model_folder,
         by_md5,
@@ -6839,6 +6890,7 @@ def build_material_packages(
     # `_show_touming` 不能按名字直接继承普通 Show。只有目标目录没有专属纹理、
     # 去掉 `_touming` 后的原版 Show 路径能被 THX 精确解析，且表面几何完全一致
     # 时才复用原版材质；蒙皮差异不影响 UV/子网格材质绑定。
+    begin_stage(stage_names[9])
     touming_packages, touming_by_mesh = _build_res_touming_packages(
         model_folder,
         by_md5,
@@ -6853,6 +6905,7 @@ def build_material_packages(
 
     # `_tingyuan` 只接受 Show 父 GIM 直接依赖 Mesh 的逐子网格无损合并。
     # 每个目标子网格都必须唯一落到一个已有强证据源材质，否则整个目标跳过。
+    begin_stage(stage_names[10])
     tingyuan_packages, tingyuan_by_mesh = _build_res_tingyuan_packages(
         model_folder,
         by_md5,
@@ -6867,6 +6920,7 @@ def build_material_packages(
     # 某些派生资源把 foo1/foo2/foo3 三个单子网格 Mesh 合成 foo.mesh，
     # 但 foo.gim 的 XML 已裁掉。只有编号源 Mesh 的表面指纹完整覆盖目标、
     # 源材质签名完全一致，且目标 GIM 自身 THP 仍精确依赖该主贴图时才绑定。
+    begin_stage(stage_names[11])
     numbered_packages, numbered_by_mesh = _build_res_numbered_merge_packages(
         model_folder,
         by_md5,
@@ -6880,6 +6934,7 @@ def build_material_packages(
 
     # 某些 `_01` 派生 GIM 只是标准父 GIM 的前缀子集，且自己的目录没有
     # 任何专属纹理。只有子网格名+MtlIdx 逐项等于父 GIM 前缀时才继承父材质。
+    begin_stage(stage_names[12])
     subset_packages, subset_by_mesh = _build_res_gim_subset_packages(
         model_folder,
         by_md5,
@@ -6893,6 +6948,7 @@ def build_material_packages(
 
     # 对仍未绑定的大 Mesh，再尝试“唯一 Skeleton 名 → 同名逻辑路径”。
     # Skeleton 只用于生成候选路径，最终仍要求当前 THX 的 Mesh/GIM 哈希闭环。
+    begin_stage(stage_names[13])
     nested_packages, nested_by_mesh = _build_nested_gim_material_packages(
         model_folder,
         by_md5,
@@ -6904,6 +6960,7 @@ def build_material_packages(
             packages.append(package)
             by_mesh[mesh_path] = package
 
+    begin_stage(stage_names[14])
     direct_packages, direct_by_mesh = _build_single_submesh_direct_texture_packages(
         model_folder,
         by_md5,
@@ -6918,6 +6975,7 @@ def build_material_packages(
     # Generic single-slot fallback: exact current logical Mesh identity plus one
     # same-stem, non-auxiliary image in the same logical directory. This replaces
     # per-character MD5 entries and remains valid when future resources are added.
+    begin_stage(stage_names[15])
     unique_image_packages, unique_image_by_mesh = (
         _build_unique_logical_single_image_packages(
             model_folder,
@@ -6932,6 +6990,7 @@ def build_material_packages(
             packages.append(package)
             by_mesh[mesh_path] = package
 
+    begin_stage(stage_names[16])
     all_asset_paths = list(dict.fromkeys(
         res_asset_paths
         + load_script3_gim_paths(thd_dir, model_folder)
@@ -6951,6 +7010,7 @@ def build_material_packages(
         if mesh_path not in by_mesh:
             by_mesh[mesh_path] = package
 
+    begin_stage(stage_names[17])
     supplemental_packages, supplemental_by_mesh = (
         _build_supplemental_logical_material_packages(
             model_folder,
@@ -6965,6 +7025,7 @@ def build_material_packages(
             packages.append(package)
             by_mesh[mesh_path] = package
 
+    begin_stage(stage_names[18])
     skeleton_packages, skeleton_by_mesh = _build_skeleton_path_packages(
         model_folder,
         by_md5,
@@ -6981,6 +7042,7 @@ def build_material_packages(
     # GIM/THP parent。只对 >100KB 的重要 orphan Mesh 启用强结构兜底：
     # 目标目录唯一材质组 + 官方源 GIM MtlIdx + >=90% UV 三角形一一同源。
     # UV 只恢复材质索引顺序，贴图始终来自目标 logical directory。
+    begin_stage(stage_names[19])
     orphan_packages, orphan_by_mesh = _build_orphan_path_uv_material_packages(
         model_folder,
         by_md5,
@@ -6995,6 +7057,7 @@ def build_material_packages(
     # 主角 base/bat/tansuo/tingyuan 是稳定的业务模式资源族，但不同模式并非
     # 永远共用贴图。只在目标模式缺失官方材质、且至少两个其它官方模式通过
     # >=90% UV 一一映射后对完整材质定义达成一致时，才把共识材质恢复给目标。
+    begin_stage(stage_names[20])
     zhujue_mode_packages, zhujue_mode_by_mesh = (
         _build_zhujue_mode_consensus_packages(
             model_folder,
@@ -7011,6 +7074,7 @@ def build_material_packages(
     # 完全相同几何本身不能继承别的皮肤材质；但若同几何已绑定源材质的
     # 所有主贴图路径都明确落在目标 logical directory（允许 fx/model 前缀），
     # 则源材质实际上已经在引用目标资源族，可安全恢复被裁掉的 sibling GIM。
+    begin_stage(stage_names[21])
     family_dup_packages, family_dup_by_mesh = (
         _build_exact_render_target_family_packages(
             model_folder,
@@ -7034,6 +7098,7 @@ def build_material_packages(
     # 精确路径和 GIM 都存在、但同目录有多套官方 MaterialGroup 时，不再
     # 任意选择默认皮肤。所有通过 MtlIdx、纹理目录和实体检查的签名作为
     # 独立 PMX 变体保留，供批量预览器连续确认。
+    begin_stage(stage_names[22])
     exact_material_variants = _build_exact_logical_gim_material_variants(
         model_folder,
         by_md5,
@@ -7061,11 +7126,13 @@ def build_material_packages(
 
     # 同一 GIM 内容的多个 THP parent 可能分别挂不同颜色/皮肤材质。
     # 这类变体不一定出现在 res 明文 Mesh 路径表中，因此直接从父节点层补齐。
+    begin_stage(stage_names[23])
     thp_parent_variants = _build_thp_parent_variant_packages(
         model_folder,
         by_md5,
         thd_dir,
     )
+    begin_stage(stage_names[24])
     for package in thp_parent_variants:
         for mesh_path in package.mesh_paths:
             append_variant(mesh_path, package)
@@ -11599,6 +11666,7 @@ def build_composite_models(
     model_folder: Path,
     by_mesh: dict[Path, MaterialPackage],
     thd_dir: Path | None,
+    progress: Callable[[str, int, int], None] | None = None,
 ) -> list[CompositeModel]:
     """恢复同一上层 GIM 中、共享骨骼结构的主体与附件组合。"""
     if thd_dir is None:
@@ -11617,10 +11685,18 @@ def build_composite_models(
     namehash_seeds = read_thx_namehash_seeds(thd_dir / "model.thx")
     trusted = TRUSTED_MATERIAL_CONFIDENCE
 
+    def report(label: str, done: int, total: int) -> None:
+        if progress and (done % 100 == 0 or done == total):
+            progress(label, done, total)
+
     candidates: dict[
         frozenset[Path], tuple[str, list[Path]]
     ] = {}
-    for parent_hash, dependency_hashes in dependencies.items():
+    dependency_items = list(dependencies.items())
+    for dependency_number, (parent_hash, dependency_hashes) in enumerate(
+        dependency_items, 1
+    ):
+        report("收集主体与附件候选", dependency_number, len(dependency_items))
         ordered: list[Path] = []
         for dependency_hash in dependency_hashes:
             record = record_by_hash.get(dependency_hash)
@@ -11644,11 +11720,14 @@ def build_composite_models(
         label = extracted_resource_label(parent_path) if parent_path else "组合模型"
         candidates[frozenset(ordered)] = (label or "组合模型", ordered)
 
-    keys = list(candidates)
-    maximal = [
-        key for key in keys
-        if not any(key < other for other in keys)
-    ]
+    # 先处理组件更多的集合；只需和已保留的极大集合比较，不再让每个
+    # 候选和所有候选做一次平方级比较。
+    keys = sorted(candidates, key=len, reverse=True)
+    maximal: list[frozenset[Path]] = []
+    for key_number, key in enumerate(keys, 1):
+        if not any(key < other for other in maximal):
+            maximal.append(key)
+        report("去重组合候选", key_number, len(keys))
     bone_layout_cache: dict[Path, tuple[tuple[str, ...], tuple[int, ...], int]] = {}
 
     def cached_bone_layout(
@@ -11662,7 +11741,7 @@ def build_composite_models(
 
     seen_clusters: set[frozenset[Path]] = set()
     result: list[CompositeModel] = []
-    for key in maximal:
+    for maximal_number, key in enumerate(maximal, 1):
         label, ordered = candidates[key]
         clusters: dict[
             tuple[tuple[str, ...], tuple[int, ...]], list[Path]
@@ -11708,6 +11787,7 @@ def build_composite_models(
                     direct_merge=True,
                 )
             )
+        report("核对组合骨架", maximal_number, len(maximal))
 
     # Socket 静态挂件：基础主 PMX 不变，每种 Socket 道具额外生成一个组合变体。
     # 只接受能通过精确逻辑路径哈希解析到“静态 Mesh + 可信材质”的 BoundObject。
@@ -11742,7 +11822,10 @@ def build_composite_models(
         return None
 
     socket_composite_signatures: set[tuple[object, ...]] = set()
-    for parent_hash, dependency_hashes in dependencies.items():
+    for dependency_number, (parent_hash, dependency_hashes) in enumerate(
+        dependency_items, 1
+    ):
+        report("分析静态 Socket", dependency_number, len(dependency_items))
         parent_record = record_by_hash.get(parent_hash)
         parent_path = (
             by_md5.get(parent_record.content_md5)
@@ -11882,7 +11965,6 @@ def build_composite_models(
                     static_matrices=[None] + [item[3] for item in deduped],
                 )
             )
-
     # 默认显示的有骨模型空间组件：只处理 MustShow=true、无 BoneName、
     # 单位 MatrixToBone 的 Socket。它们不会直接改写基础 PMX，而是生成
     # “主体 + 默认组件”组合变体；换装/特效等可选状态仍保持独立。
@@ -11921,7 +12003,10 @@ def build_composite_models(
         return safe
 
     default_rigged_signatures: set[tuple[Path, Path]] = set()
-    for parent_hash, dependency_hashes in dependencies.items():
+    for dependency_number, (parent_hash, dependency_hashes) in enumerate(
+        dependency_items, 1
+    ):
+        report("分析默认显示组件", dependency_number, len(dependency_items))
         parent_record = record_by_hash.get(parent_hash)
         parent_path = (
             by_md5.get(parent_record.content_md5)
@@ -12073,7 +12158,9 @@ def build_composite_models(
     named_rig_members: dict[
         str, list[tuple[Path, MaterialPackage, str]]
     ] = {}
-    for mesh_path, package in by_mesh.items():
+    material_mesh_items = list(by_mesh.items())
+    for mesh_number, (mesh_path, package) in enumerate(material_mesh_items, 1):
+        report("整理命名组件", mesh_number, len(material_mesh_items))
         if package.confidence not in trusted:
             continue
         label = safe_model_name(package, mesh_path)
@@ -12105,7 +12192,11 @@ def build_composite_models(
             dict[str, list[tuple[Path, MaterialPackage, str]]],
         ],
     ] = {}
-    for child_label_key, child_members in named_rig_members.items():
+    named_rig_items = list(named_rig_members.items())
+    for named_number, (child_label_key, child_members) in enumerate(
+        named_rig_items, 1
+    ):
+        report("匹配命名挂件", named_number, len(named_rig_items))
         match = named_guajian_pattern.match(child_label_key)
         if match is None:
             continue
@@ -12268,7 +12359,8 @@ def build_composite_models(
     # 唯一证明。静态件没有可推导的模型空间位置，因此仍只走上面的 Socket 路径。
     texture_members: dict[Path, dict[Path, MaterialPackage]] = {}
     texture_size_cache: dict[Path, int] = {}
-    for mesh_path, package in by_mesh.items():
+    for mesh_number, (mesh_path, package) in enumerate(material_mesh_items, 1):
+        report("整理共享贴图组件", mesh_number, len(material_mesh_items))
         if package.confidence not in trusted:
             continue
         for texture_path in package_primary_texture_sources(package):
@@ -12296,7 +12388,11 @@ def build_composite_models(
         re.IGNORECASE,
     )
 
-    for texture_path, members in texture_members.items():
+    texture_member_items = list(texture_members.items())
+    for texture_number, (texture_path, members) in enumerate(
+        texture_member_items, 1
+    ):
+        report("核对共享贴图位置", texture_number, len(texture_member_items))
         # 超大共享组通常是公共图集；即使骨架偶然同名也不应跨角色拼接。
         if len(members) < 2 or len(members) > 24:
             continue
@@ -12381,7 +12477,11 @@ def build_composite_models(
         Path,
         list[tuple[Path, MaterialPackage, set[Path], set[str], MaterialPackage]],
     ] = {}
-    for child_path, possible_mains in pair_evidence.items():
+    pair_evidence_items = list(pair_evidence.items())
+    for pair_number, (child_path, possible_mains) in enumerate(
+        pair_evidence_items, 1
+    ):
+        report("消除组件归属歧义", pair_number, len(pair_evidence_items))
         # 同一个小件若被不同主体唯一选中，说明共享图/骨架证据仍不唯一。
         if len(possible_mains) != 1:
             continue
@@ -12394,7 +12494,9 @@ def build_composite_models(
 
     shared_mains = set(shared_children_by_main)
     existing_component_sets = [frozenset(item.mesh_paths) for item in result]
-    for main_path, children in shared_children_by_main.items():
+    shared_main_items = list(shared_children_by_main.items())
+    for main_number, (main_path, children) in enumerate(shared_main_items, 1):
+        report("生成共享贴图组合", main_number, len(shared_main_items))
         # 不把一个同时被更大主体吸收的中间组件再当成独立主体。
         if main_path in pair_evidence:
             continue
@@ -13135,11 +13237,19 @@ def merge_parsed_meshes(
 
 
 class WpkModelReader:
-    def __init__(self, source_root: Path):
+    def __init__(
+        self,
+        source_root: Path,
+        progress: Callable[[str, int, int], None] | None = None,
+    ):
         import onmyoji_wpk_gui as wpk
 
         self.wpk = wpk
-        groups = wpk.discover_groups(source_root)
+        groups = wpk.discover_groups(
+            source_root,
+            progress=progress,
+            stems={"model"},
+        )
         self.group = next((item for item in groups if item.stem == "model"), None)
         if self.group is None:
             raise RuntimeError("没有发现 model.idx 对应的 WPK 分组")
@@ -14644,7 +14754,21 @@ class RiggedMeshApp(tk.Tk):
                 if source_root is not None:
                     import onmyoji_wpk_gui as wpk
 
-                    archive_groups = wpk.discover_groups(source_root)
+                    archive_groups = wpk.discover_groups(
+                        source_root,
+                        progress=lambda stem, done, total: (
+                            self.events.put(
+                                ("progress", done * 100 / total if total else 100)
+                            ),
+                            self.events.put(
+                                (
+                                    "status",
+                                    f"校验资源索引 {stem} {done}/{total}",
+                                )
+                            ),
+                        ),
+                        stems={"model", *SUPPLEMENTAL_RIGGED_GROUPS},
+                    )
                     group = next(
                         (item for item in archive_groups if item.stem == "model"),
                         None,
@@ -14714,13 +14838,42 @@ class RiggedMeshApp(tk.Tk):
                         hot_update_paths = list(cached_hot.rglob("*.mesh"))
 
                 self.events.put(("status", "正在扫描全部可用 Mesh"))
-                rows = scan_rigged_meshes(model_folder)
+
+                def white_scan_progress(label: str):
+                    return lambda done, total: (
+                        self.events.put(
+                            ("progress", done * 100 / total if total else 100)
+                        ),
+                        self.events.put(
+                            ("status", f"扫描{label} Mesh {done}/{total}")
+                        ),
+                    )
+
+                rows = scan_rigged_meshes(
+                    model_folder,
+                    white_scan_progress("model"),
+                )
                 if loose_folder is not None:
-                    rows.extend(scan_rigged_meshes(loose_folder))
+                    rows.extend(
+                        scan_rigged_meshes(
+                            loose_folder,
+                            white_scan_progress("热更新散文件"),
+                        )
+                    )
                 if hot_update_paths:
-                    rows.extend(scan_rigged_mesh_paths(hot_update_paths))
+                    rows.extend(
+                        scan_rigged_mesh_paths(
+                            hot_update_paths,
+                            white_scan_progress("热更新 ZIP"),
+                        )
+                    )
                 if supplemental_paths:
-                    rows.extend(scan_rigged_mesh_paths(supplemental_paths))
+                    rows.extend(
+                        scan_rigged_mesh_paths(
+                            supplemental_paths,
+                            white_scan_progress("额外资源包"),
+                        )
+                    )
                 unique_rows = {
                     str(row.path.resolve()).lower(): row for row in rows
                 }
@@ -14916,7 +15069,21 @@ class RiggedMeshApp(tk.Tk):
                 if source_root is not None:
                     import onmyoji_wpk_gui as wpk
 
-                    archive_groups = wpk.discover_groups(source_root)
+                    archive_groups = wpk.discover_groups(
+                        source_root,
+                        progress=lambda stem, done, total: (
+                            self.events.put(
+                                ("progress", done * 100 / total if total else 100)
+                            ),
+                            self.events.put(
+                                (
+                                    "status",
+                                    f"校验资源索引 {stem} {done}/{total}",
+                                )
+                            ),
+                        ),
+                        stems={"model", *SUPPLEMENTAL_RIGGED_GROUPS},
+                    )
                     group = next((
                         item for item in archive_groups if item.stem == "model"
                     ), None)
@@ -15038,6 +15205,7 @@ class RiggedMeshApp(tk.Tk):
                             ),
                         ),
                     )
+                    self.events.put(("status", "正在补齐额外资源包材质"))
                     sync_supplemental_material_resources(
                         source_root,
                         model_folder,
@@ -15079,13 +15247,43 @@ class RiggedMeshApp(tk.Tk):
                     )
 
                 self.events.put(("status", "正在扫描带骨模型"))
-                rows = scan_rigged_meshes(model_folder)
+
+                def report_mesh_scan(label: str):
+                    def callback(done: int, total: int) -> None:
+                        self.events.put(
+                            ("progress", done * 100 / total if total else 100)
+                        )
+                        self.events.put(
+                            ("status", f"扫描{label} Mesh {done}/{total}")
+                        )
+
+                    return callback
+
+                rows = scan_rigged_meshes(
+                    model_folder,
+                    report_mesh_scan("model"),
+                )
                 if loose_model_folder is not None:
-                    rows.extend(scan_rigged_meshes(loose_model_folder))
+                    rows.extend(
+                        scan_rigged_meshes(
+                            loose_model_folder,
+                            report_mesh_scan("热更新散文件"),
+                        )
+                    )
                 if hot_update_mesh_paths:
-                    rows.extend(scan_rigged_mesh_paths(hot_update_mesh_paths))
+                    rows.extend(
+                        scan_rigged_mesh_paths(
+                            hot_update_mesh_paths,
+                            report_mesh_scan("热更新 ZIP"),
+                        )
+                    )
                 if supplemental_mesh_paths:
-                    rows.extend(scan_rigged_mesh_paths(supplemental_mesh_paths))
+                    rows.extend(
+                        scan_rigged_mesh_paths(
+                            supplemental_mesh_paths,
+                            report_mesh_scan("额外资源包"),
+                        )
+                    )
                 if (
                     loose_model_folder is not None
                     or hot_update_mesh_paths
@@ -15103,13 +15301,42 @@ class RiggedMeshApp(tk.Tk):
                 self.events.put(("scan_done", rows))
 
                 self.events.put(("log", "正在分析材质 XML 与 KTX 资源分组……"))
+                material_stage = {"label": "", "number": 1, "total": 1}
+
+                def report_material_stage(label: str, number: int, total: int) -> None:
+                    material_stage.update(
+                        {"label": label, "number": number, "total": total}
+                    )
+                    self.events.put(("progress", (number - 1) * 100 / total))
+                    self.events.put(
+                        ("status", f"材质匹配 [{number}/{total}]：{label}")
+                    )
+
+                def report_thd_dependency(done: int, total: int) -> None:
+                    stage_number = int(material_stage["number"])
+                    stage_total = int(material_stage["total"])
+                    fraction = done / total if total else 1.0
+                    self.events.put(
+                        (
+                            "progress",
+                            ((stage_number - 1) + fraction) * 100 / stage_total,
+                        )
+                    )
+                    self.events.put(
+                        (
+                            "status",
+                            f"材质匹配 [{stage_number}/{stage_total}]："
+                            f"THD 精确依赖 {done}/{total}",
+                        )
+                    )
+
                 packages, by_mesh, variants_by_mesh = build_material_packages(
                     model_folder,
-                    lambda done, total: self.events.put(
-                        ("status", f"分析 THD 材质依赖 {done}/{total}")
-                    ),
+                    progress=report_thd_dependency,
                     thd_dir=thd_dir,
+                    stage_progress=report_material_stage,
                 )
+                self.events.put(("progress", 100))
                 verified_packages = sum(
                     1 for item in packages
                     if item.confidence in TRUSTED_MATERIAL_CONFIDENCE
@@ -15158,8 +15385,24 @@ class RiggedMeshApp(tk.Tk):
                     for path, package in by_mesh.items()
                     if len(variants_by_mesh.get(path.resolve(), [])) <= 1
                 }
+                self.events.put(("progress", 0))
+                self.events.put(("status", "正在分析主体与附件组合关系"))
+
+                def report_composite_analysis(
+                    label: str, done: int, total: int
+                ) -> None:
+                    self.events.put(
+                        ("progress", done * 100 / total if total else 100)
+                    )
+                    self.events.put(
+                        ("status", f"组合分析：{label} {done}/{total}")
+                    )
+
                 composite_models = build_composite_models(
-                    model_folder, composite_materials, thd_dir
+                    model_folder,
+                    composite_materials,
+                    thd_dir,
+                    progress=report_composite_analysis,
                 )
                 self.events.put(
                     (
@@ -15170,7 +15413,26 @@ class RiggedMeshApp(tk.Tk):
                 )
 
                 if source_root is not None:
-                    wpk_reader = WpkModelReader(source_root)
+                    self.events.put(("progress", 0))
+                    self.events.put(("status", "正在校验 model.idx / WPK 原包"))
+
+                    def report_wpk_validation(
+                        stem: str, done: int, total: int
+                    ) -> None:
+                        self.events.put(
+                            ("progress", done * 100 / total if total else 100)
+                        )
+                        self.events.put(
+                            (
+                                "status",
+                                f"校验 {stem}.idx / WPK {done}/{total}",
+                            )
+                        )
+
+                    wpk_reader = WpkModelReader(
+                        source_root,
+                        progress=report_wpk_validation,
+                    )
 
                 output_root = selected_output / "PMX输出"
                 output_root.mkdir(parents=True, exist_ok=True)
@@ -15188,15 +15450,48 @@ class RiggedMeshApp(tk.Tk):
                 existing_direct_composite_dirs: dict[
                     frozenset[str], set[Path]
                 ] = {}
-                for category in ("带贴图", "纯色材质", "未匹配贴图"):
+                output_categories = ("带贴图", "纯色材质", "未匹配贴图")
+                indexed_directory_count = 0
+                self.events.put(("progress", 0))
+                for category_number, category in enumerate(output_categories, 1):
                     category_root = output_root / category
                     if not category_root.is_dir():
+                        self.events.put(
+                            (
+                                "progress",
+                                category_number * 100 / len(output_categories),
+                            )
+                        )
                         continue
-                    for child in category_root.rglob("*"):
-                        if not child.is_dir():
-                            continue
-                        match = re.search(r"_([0-9a-fA-F]{8})$", child.name)
-                        if match:
+                    self.events.put(
+                        (
+                            "status",
+                            f"索引已有输出 [{category_number}/{len(output_categories)}]："
+                            f"{category}（已检查 {indexed_directory_count:,} 个目录）",
+                        )
+                    )
+                    # os.walk 已将目录名和文件名分开，避免旧实现对数万个普通
+                    # PMX/PNG 文件再次调用 is_dir()，网络盘和杀毒开启时尤为明显。
+                    for current_root, directory_names, _ in os.walk(category_root):
+                        directory_names.sort(key=str.lower)
+                        for directory_name in directory_names:
+                            indexed_directory_count += 1
+                            if indexed_directory_count % 250 == 0:
+                                self.events.put(
+                                    (
+                                        "status",
+                                        f"索引已有输出 "
+                                        f"[{category_number}/{len(output_categories)}]："
+                                        f"{category}（已检查 "
+                                        f"{indexed_directory_count:,} 个目录）",
+                                    )
+                                )
+                            child = Path(current_root) / directory_name
+                            match = re.search(
+                                r"_([0-9a-fA-F]{8})$", directory_name
+                            )
+                            if not match:
+                                continue
                             existing_dirs.setdefault(
                                 match.group(1).lower(), []
                             ).append(child)
@@ -15218,7 +15513,19 @@ class RiggedMeshApp(tk.Tk):
                                 existing_direct_composite_dirs.setdefault(
                                     component_names, set()
                                 ).add(child)
-
+                    self.events.put(
+                        (
+                            "progress",
+                            category_number * 100 / len(output_categories),
+                        )
+                    )
+                self.events.put(
+                    (
+                        "log",
+                        f"已有输出索引完成：检查目录 "
+                        f"{indexed_directory_count:,} 个。",
+                    )
+                )
                 report_rows: list[list[object]] = []
                 ok = failed = textured = reused = 0
                 for number, row in enumerate(rows, 1):
@@ -15692,7 +15999,18 @@ class RiggedMeshApp(tk.Tk):
                 import zstandard
                 import onmyoji_wpk_gui as wpk
 
-                groups = wpk.discover_groups(source_root)
+                groups = wpk.discover_groups(
+                    source_root,
+                    progress=lambda stem, done, total: (
+                        self.events.put(
+                            ("progress", done * 100 / total if total else 100)
+                        ),
+                        self.events.put(
+                            ("status", f"校验 {stem}.idx {done}/{total}")
+                        ),
+                    ),
+                    stems={"model"},
+                )
                 group = next((item for item in groups if item.stem == "model"), None)
                 if group is None:
                     raise RuntimeError("没有发现 model.idx 对应的 WPK 分组")

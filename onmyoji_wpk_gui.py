@@ -148,9 +148,17 @@ def parse_idx(idx_path: Path) -> tuple[bytes, list[IndexRecord]]:
     return marker, records
 
 
-def discover_groups(folder: Path) -> list[ArchiveGroup]:
+def discover_groups(
+    folder: Path,
+    progress: Callable[[str, int, int], None] | None = None,
+    stems: Iterable[str] | None = None,
+) -> list[ArchiveGroup]:
     groups: list[ArchiveGroup] = []
-    for idx_path in sorted(folder.glob("*.idx"), key=lambda p: p.name.lower()):
+    wanted_stems = {stem.lower() for stem in stems} if stems is not None else None
+    idx_paths = sorted(folder.glob("*.idx"), key=lambda p: p.name.lower())
+    if wanted_stems is not None:
+        idx_paths = [path for path in idx_paths if path.stem.lower() in wanted_stems]
+    for idx_path in idx_paths:
         marker, records = parse_idx(idx_path)
         stem = idx_path.stem
         package_pattern = re.compile(
@@ -167,15 +175,29 @@ def discover_groups(folder: Path) -> list[ArchiveGroup]:
         }
         missing = tuple(sorted(required_ids - packages.keys()))
 
+        # A package normally contains tens of thousands of records.  Calling
+        # Path.stat() once per record makes a model.idx refresh spend minutes
+        # asking Windows for the size of the same handful of WPK files.  Cache
+        # each package size once; the WPK files cannot change safely while an
+        # index is being processed anyway.
+        package_sizes = {
+            package_id: packages[package_id].stat().st_size
+            for package_id in required_ids
+            if package_id in packages
+        }
+
         invalid_ranges = 0
-        for record in records:
-            if not record_is_active(record):
-                continue
-            package_path = packages.get(record.package_id)
-            if package_path is None:
-                continue
-            if record.offset + record_read_size(record) > package_path.stat().st_size:
-                invalid_ranges += 1
+        total = len(records)
+        for number, record in enumerate(records, 1):
+            if record_is_active(record):
+                package_size = package_sizes.get(record.package_id)
+                if (
+                    package_size is not None
+                    and record.offset + record_read_size(record) > package_size
+                ):
+                    invalid_ranges += 1
+            if progress and (number % 2000 == 0 or number == total):
+                progress(stem, number, total)
 
         groups.append(
             ArchiveGroup(
