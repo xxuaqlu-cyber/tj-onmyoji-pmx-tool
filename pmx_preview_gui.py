@@ -42,12 +42,15 @@ REPORT_MODES = {
     "重点白模：单槽": "白模优先检查_单槽.csv",
     "全部大白模": "未匹配贴图_按源Mesh大小.csv",
 }
+RARITY_ORDER = ("UR", "SP", "SSR", "SR", "R", "N", "呱太", "其他资源", "未分类")
+RARITY_RANK = {rarity: index for index, rarity in enumerate(RARITY_ORDER)}
 
 
 @dataclass(slots=True)
 class PreviewItem:
     path: Path
     category: str
+    rarity: str = "未分类"
     role: str = "未分类"
     display_name: str = ""
     source_size: int = 0
@@ -83,6 +86,7 @@ def _category_for(path: Path, root: Path) -> str:
 
 
 def _source_order(value: str) -> int:
+    """Read the archive record order embedded by the extractor (smaller is newer)."""
     match = re.match(r"(\d{6})_", Path(value).name)
     return int(match.group(1)) if match else -1
 
@@ -92,56 +96,87 @@ def _path_key(path: Path) -> str:
     return os.path.normcase(os.path.abspath(path))
 
 
-def _role_from_classified_path(path: Path) -> str:
-    """分类清单缺失时，从“按角色/<角色>”目录结构恢复角色名。"""
+def _classification_from_path(path: Path) -> tuple[str, str]:
+    """分类清单缺失时，从新旧两种“按角色”目录结构恢复分类。"""
     parts = path.parts
     for index, part in enumerate(parts[:-1]):
         if part == "按角色" and index + 1 < len(parts):
-            return parts[index + 1]
-    return ""
+            if (
+                parts[index + 1] in RARITY_RANK
+                and index + 2 < len(parts)
+            ):
+                return parts[index + 1], parts[index + 2]
+            return "未分类", parts[index + 1]
+    return "", ""
+
+
+def _role_from_classified_path(path: Path) -> str:
+    """保留旧调用接口；新代码同时读取稀有度与角色名。"""
+    return _classification_from_path(path)[1]
 
 
 def _attach_role_metadata(root: Path, items: list[PreviewItem]) -> list[PreviewItem]:
-    """用分类清单、源 Mesh 和目录结构给预览项补充角色。"""
-    by_path: dict[str, str] = {}
-    roles_by_mesh: dict[str, set[str]] = {}
+    """用分类清单、源 Mesh 和目录结构给预览项补充稀有度与角色。"""
+    by_path: dict[str, tuple[str, str]] = {}
+    classifications_by_mesh: dict[str, set[tuple[str, str]]] = {}
     catalog = root / "角色分类清单.csv"
     if catalog.is_file():
         with catalog.open("r", newline="", encoding="utf-8-sig") as stream:
             for row in csv.DictReader(stream):
+                rarity = row.get("稀有度", "").strip() or "未分类"
                 role = row.get("角色分类", "").strip()
                 if not role:
                     continue
+                classification = (rarity, role)
                 raw_path = row.get("PMX", "").strip()
                 if raw_path:
                     catalog_path = Path(raw_path)
                     if not catalog_path.is_absolute():
                         catalog_path = root / catalog_path
-                    by_path[_path_key(catalog_path)] = role
+                    by_path[_path_key(catalog_path)] = classification
                 source_mesh = Path(row.get("源Mesh", "").strip()).name.lower()
                 if source_mesh:
-                    roles_by_mesh.setdefault(source_mesh, set()).add(role)
+                    classifications_by_mesh.setdefault(source_mesh, set()).add(
+                        classification
+                    )
 
     for item in items:
-        role = by_path.get(_path_key(item.path), "")
-        if not role and item.source_mesh:
-            candidates = roles_by_mesh.get(Path(item.source_mesh).name.lower(), set())
+        classification = by_path.get(_path_key(item.path))
+        if classification is None and item.source_mesh:
+            candidates = classifications_by_mesh.get(
+                Path(item.source_mesh).name.lower(), set()
+            )
             if len(candidates) == 1:
-                role = next(iter(candidates))
-        item.role = role or _role_from_classified_path(item.path) or "未分类"
+                classification = next(iter(candidates))
+        if classification is None:
+            classification = _classification_from_path(item.path)
+        item.rarity = classification[0] or "未分类"
+        item.role = classification[1] or "未分类"
     return items
 
 
-def catalog_role_names(root: Path) -> list[str]:
+def catalog_classifications(root: Path) -> list[tuple[str, str]]:
     catalog = root / "角色分类清单.csv"
-    roles: set[str] = set()
+    classifications: set[tuple[str, str]] = set()
     if catalog.is_file():
         with catalog.open("r", newline="", encoding="utf-8-sig") as stream:
             for row in csv.DictReader(stream):
+                rarity = row.get("稀有度", "").strip() or "未分类"
                 role = row.get("角色分类", "").strip()
                 if role and role != "未分类":
-                    roles.add(role)
-    return sorted(roles, key=str.lower)
+                    classifications.add((rarity, role))
+    return sorted(
+        classifications,
+        key=lambda value: (
+            RARITY_RANK.get(value[0], len(RARITY_RANK)),
+            value[1].lower(),
+        ),
+    )
+
+
+def catalog_role_names(root: Path) -> list[str]:
+    """兼容旧测试和调用方。"""
+    return sorted({role for _rarity, role in catalog_classifications(root)}, key=str.lower)
 
 
 def copy_model_folder(source: Path, destination_root: Path) -> Path:
@@ -626,24 +661,33 @@ class GpuPreviewRenderer:
 
 
 class RoleMoveDialog(tk.Toplevel):
-    def __init__(self, parent: tk.Misc, current_role: str, roles: list[str]):
+    def __init__(
+        self,
+        parent: tk.Misc,
+        current_classification: tuple[str, str],
+        classifications: list[tuple[str, str]],
+    ):
         super().__init__(parent)
         self.title("移动模型到其他类别")
         self.resizable(False, False)
         self.transient(parent)
         self.result: str | None = None
-        self.role_var = tk.StringVar(value=current_role)
+        current_label = " / ".join(current_classification)
+        self.target_roles = {
+            f"{rarity} / {role}": role for rarity, role in classifications
+        }
+        self.role_var = tk.StringVar(value=current_label)
 
         body = ttk.Frame(self, padding=14)
         body.pack(fill="both", expand=True)
-        ttk.Label(body, text=f"当前类别：{current_role}").pack(anchor="w")
-        ttk.Label(body, text="目标类别（可选择，也可输入新类别）：").pack(
+        ttk.Label(body, text=f"当前类别：{current_label}").pack(anchor="w")
+        ttk.Label(body, text="目标分类（稀有度 / 中文角色名，也可输入新类别）：").pack(
             anchor="w", pady=(12, 4)
         )
         combo = ttk.Combobox(
             body,
             textvariable=self.role_var,
-            values=tuple(roles),
+            values=tuple(self.target_roles),
             width=38,
         )
         combo.pack(fill="x")
@@ -666,12 +710,16 @@ class RoleMoveDialog(tk.Toplevel):
         if not value:
             messagebox.showinfo(APP_TITLE, "请输入或选择目标类别。", parent=self)
             return
-        self.result = role_classifier.normalize_role(value)
+        self.result = role_classifier.normalize_role(self.target_roles.get(value, value))
         self.destroy()
 
 
-def ask_target_role(parent: tk.Misc, current_role: str, roles: list[str]) -> str | None:
-    dialog = RoleMoveDialog(parent, current_role, roles)
+def ask_target_role(
+    parent: tk.Misc,
+    current_classification: tuple[str, str],
+    classifications: list[tuple[str, str]],
+) -> str | None:
+    dialog = RoleMoveDialog(parent, current_classification, classifications)
     parent.wait_window(dialog)
     return dialog.result
 
@@ -691,6 +739,7 @@ class PmxPreviewApp(tk.Tk):
         self.root_var = tk.StringVar(value=str(root))
         self.mode_var = tk.StringVar(value="成品模型")
         self.sort_var = tk.StringVar(value="新到旧")
+        self.rarity_var = tk.StringVar(value="全部稀有度")
         self.role_var = tk.StringVar(value="全部角色")
         self.search_var = tk.StringVar()
         self.status_var = tk.StringVar(value="正在读取 PMX 清单……")
@@ -698,6 +747,7 @@ class PmxPreviewApp(tk.Tk):
 
         self.items: list[PreviewItem] = []
         self.visible_items: list[PreviewItem] = []
+        self.classifications: list[tuple[str, str]] = []
         self.preview: PreviewData | None = None
         self.preview_image = None
         self.texture_image = None
@@ -721,6 +771,7 @@ class PmxPreviewApp(tk.Tk):
         except Exception as exc:
             self.gpu_error = f"{type(exc).__name__}: {exc}"
         self.search_var.trace_add("write", lambda *_: self._apply_filter())
+        self.rarity_var.trace_add("write", lambda *_: self._rarity_changed())
         self.role_var.trace_add("write", lambda *_: self._apply_filter())
         self.mode_var.trace_add("write", lambda *_: self.refresh_items())
         self.sort_var.trace_add("write", lambda *_: self._apply_filter())
@@ -754,11 +805,20 @@ class PmxPreviewApp(tk.Tk):
                 "全部 PMX",
             ),
         ).pack(side="left", padx=6)
-        ttk.Label(filters, text="角色").pack(side="left", padx=(8, 0))
+        ttk.Label(filters, text="稀有度").pack(side="left", padx=(8, 0))
+        self.rarity_combo = ttk.Combobox(
+            filters,
+            textvariable=self.rarity_var,
+            state="readonly",
+            width=8,
+            values=("全部稀有度",),
+        )
+        self.rarity_combo.pack(side="left", padx=6)
+        ttk.Label(filters, text="角色").pack(side="left", padx=(4, 0))
         self.role_combo = ttk.Combobox(
             filters,
             textvariable=self.role_var,
-            width=18,
+            width=15,
             values=("全部角色",),
         )
         self.role_combo.pack(side="left", padx=6)
@@ -793,17 +853,19 @@ class PmxPreviewApp(tk.Tk):
 
         self.tree = ttk.Treeview(
             left,
-            columns=("order", "role", "category", "size"),
+            columns=("order", "rarity", "role", "category", "size"),
             show="tree headings",
             selectmode="browse",
         )
         self.tree.heading("#0", text="模型")
-        self.tree.heading("order", text="序号")
+        self.tree.heading("order", text="资源序")
+        self.tree.heading("rarity", text="稀有度")
         self.tree.heading("role", text="角色")
         self.tree.heading("category", text="范围")
         self.tree.heading("size", text="源大小")
         self.tree.column("#0", width=230)
         self.tree.column("order", width=58, anchor="e")
+        self.tree.column("rarity", width=58, anchor="center")
         self.tree.column("role", width=130)
         self.tree.column("category", width=90)
         self.tree.column("size", width=70, anchor="e")
@@ -890,16 +952,29 @@ class PmxPreviewApp(tk.Tk):
 
     def _finish_refresh(self, items: list[PreviewItem]) -> None:
         self.items = items
-        roles = sorted(
+        self.classifications = sorted(
             {
-                item.role for item in items if item.role and item.role != "未分类"
-            } | set(catalog_role_names(Path(self.root_var.get()))),
-            key=str.lower,
+                (item.rarity, item.role)
+                for item in items
+                if item.role and item.role != "未分类"
+            }
+            | set(catalog_classifications(Path(self.root_var.get()))),
+            key=lambda value: (
+                RARITY_RANK.get(value[0], len(RARITY_RANK)),
+                value[1].lower(),
+            ),
         )
-        self.role_combo.configure(values=("全部角色", "未分类", *roles))
-        current_role = self.role_var.get().strip()
-        if current_role not in {"全部角色", "未分类", *roles}:
-            self.role_var.set("全部角色")
+        present_rarities = {item.rarity for item in items} | {
+            rarity for rarity, _role in self.classifications
+        }
+        rarities = [rarity for rarity in RARITY_ORDER if rarity in present_rarities]
+        rarities.extend(
+            sorted(present_rarities - set(RARITY_ORDER), key=str.lower)
+        )
+        self.rarity_combo.configure(values=("全部稀有度", *rarities))
+        if self.rarity_var.get() not in {"全部稀有度", *rarities}:
+            self.rarity_var.set("全部稀有度")
+        self._refresh_role_choices()
         self._apply_filter()
         self.status_var.set(
             f"当前显示 {len(self.visible_items):,}/{len(items):,} 个 PMX；单击列表即可预览"
@@ -916,8 +991,28 @@ class PmxPreviewApp(tk.Tk):
             self.tree.selection_set("0")
             self.on_select()
 
+    def _rarity_changed(self) -> None:
+        self._refresh_role_choices()
+        self._apply_filter()
+
+    def _refresh_role_choices(self) -> None:
+        rarity = self.rarity_var.get().strip()
+        roles = sorted(
+            {
+                role
+                for item_rarity, role in self.classifications
+                if rarity == "全部稀有度" or item_rarity == rarity
+            },
+            key=str.lower,
+        )
+        values = ("全部角色", "未分类", *roles)
+        self.role_combo.configure(values=values)
+        if self.role_var.get().strip() not in values:
+            self.role_var.set("全部角色")
+
     def _apply_filter(self) -> None:
         term = self.search_var.get().strip().lower()
+        rarity_term = self.rarity_var.get().strip()
         role_term = self.role_var.get().strip().lower()
         known_roles = {
             str(value).strip().lower()
@@ -927,7 +1022,8 @@ class PmxPreviewApp(tk.Tk):
         exact_role = role_term in known_roles
         self.visible_items = [
             item for item in self.items
-            if (
+            if (rarity_term == "全部稀有度" or item.rarity == rarity_term)
+            and (
                 not role_term
                 or role_term == "全部角色"
                 or (
@@ -939,6 +1035,7 @@ class PmxPreviewApp(tk.Tk):
             and (
                 not term
                 or term in item.path.name.lower()
+                or term in item.rarity.lower()
                 or term in item.role.lower()
                 or term in item.source_mesh.lower()
                 or term in str(item.path.parent).lower()
@@ -948,17 +1045,16 @@ class PmxPreviewApp(tk.Tk):
         if sort_mode == "新到旧":
             self.visible_items.sort(
                 key=lambda item: (
-                    item.source_order >= 0,
-                    item.source_order,
+                    item.source_order < 0,
+                    item.source_order if item.source_order >= 0 else 0,
                     item.path.name.lower(),
-                ),
-                reverse=True,
+                )
             )
         elif sort_mode == "旧到新":
             self.visible_items.sort(
                 key=lambda item: (
                     item.source_order < 0,
-                    item.source_order if item.source_order >= 0 else 0,
+                    -item.source_order if item.source_order >= 0 else 0,
                     item.path.name.lower(),
                 )
             )
@@ -968,7 +1064,11 @@ class PmxPreviewApp(tk.Tk):
             )
         elif sort_mode == "角色":
             self.visible_items.sort(
-                key=lambda item: (item.role.lower(), item.path.name.lower())
+                key=lambda item: (
+                    RARITY_RANK.get(item.rarity, len(RARITY_RANK)),
+                    item.role.lower(),
+                    item.path.name.lower(),
+                )
             )
         else:
             self.visible_items.sort(key=lambda item: item.path.name.lower())
@@ -979,6 +1079,7 @@ class PmxPreviewApp(tk.Tk):
                 "", "end", iid=str(index), text=item.display_name or item.path.stem,
                 values=(
                     item.source_order if item.source_order >= 0 else "—",
+                    item.rarity,
                     item.role,
                     item.category,
                     size,
@@ -987,7 +1088,7 @@ class PmxPreviewApp(tk.Tk):
         if self.items:
             self.status_var.set(
                 f"当前显示 {len(self.visible_items):,}/{len(self.items):,} 个 PMX；"
-                "可按角色筛选后连续预览"
+                "可按稀有度和角色筛选后连续预览"
             )
 
     def current_item(self) -> PreviewItem | None:
@@ -1047,7 +1148,8 @@ class PmxPreviewApp(tk.Tk):
             self.texture_image = None
         self.info_label.configure(
             text=(
-                f"角色：{(self.current_item().role if self.current_item() else '未分类')}\n"
+                f"分类：{(self.current_item().rarity if self.current_item() else '未分类')} / "
+                f"{(self.current_item().role if self.current_item() else '未分类')}\n"
                 f"顶点：{data.vertex_count:,}\n"
                 f"三角面：{data.face_count:,}\n"
                 f"材质：{data.material_count}\n"
@@ -1242,17 +1344,16 @@ class PmxPreviewApp(tk.Tk):
         item = self.current_item()
         if item is None:
             return
-        roles = [
-            str(value)
-            for value in self.role_combo.cget("values")
-            if str(value) not in {"全部角色", "未分类"}
-        ]
-        role = ask_target_role(self, item.role, roles)
+        role = ask_target_role(
+            self,
+            (item.rarity, item.role),
+            self.classifications,
+        )
         if role is None or role == item.role:
             return
         output_root = Path(self.root_var.get()).resolve()
         self.status_var.set(
-            f"正在把 {item.path.name} 从 {item.role} 移动到 {role}……"
+            f"正在把 {item.path.name} 从 {item.rarity} / {item.role} 移动到 {role}……"
         )
 
         def worker() -> None:
@@ -1284,6 +1385,7 @@ class PmxPreviewApp(tk.Tk):
         reports: int,
     ) -> None:
         self.initial_file = new_path
+        self.rarity_var.set("全部稀有度")
         self.role_var.set(new_role)
         self.status_var.set(
             f"已从 {old_role} 移动到 {new_role}；同步更新 {reports} 份报告"

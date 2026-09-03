@@ -13794,7 +13794,7 @@ def export_mesh_variant(
                 for material in (package.materials if package else [])
                 if (primary := material_primary_texture(material))
             ]
-            role = role_classifier.role_for_export(
+            role_path = role_classifier.role_path_for_export(
                 output_root,
                 "mesh:" + mesh_path.name.lower(),
                 model_name,
@@ -13802,10 +13802,10 @@ def export_mesh_variant(
                 [material.name for material in (package.materials if package else [])],
                 package.package_name if package else "",
             )
-            if role:
+            if role_path:
                 model_output = (
                     output_root / category / role_classifier.CLASSIFIED_FOLDER
-                    / role / size_bucket / folder_name
+                    / role_path / size_bucket / folder_name
                 )
         except Exception:
             # Classification is organizational metadata; export must remain usable
@@ -14183,7 +14183,7 @@ def save_composite_pmx(
             component_identity = "components:" + "|".join(
                 sorted(path.name.lower() for path in composite.mesh_paths)
             )
-            role = role_classifier.role_for_export(
+            role_path = role_classifier.role_path_for_export(
                 output_root,
                 component_identity,
                 clean_name,
@@ -14196,10 +14196,10 @@ def save_composite_pmx(
                 clean_name,
                 component_labels=[clean_name],
             )
-            if role:
+            if role_path:
                 model_output = (
                     output_root / "带贴图" / role_classifier.CLASSIFIED_FOLDER
-                    / role / size_bucket / f"{clean_name}_{short_hash}"
+                    / role_path / size_bucket / f"{clean_name}_{short_hash}"
                 )
         except Exception:
             pass
@@ -14430,11 +14430,11 @@ def write_finished_model_report(output_root: Path) -> tuple[int, int, int]:
     finished_rows = list(unique_by_pmx.values())
     finished_rows.sort(
         key=lambda row: (
+            archive_index(Path(str(row[0]))) is None,
             archive_index(Path(str(row[0])))
-            if archive_index(Path(str(row[0]))) is not None else -1,
+            if archive_index(Path(str(row[0]))) is not None else 0,
             str(row[1]).lower(),
-        ),
-        reverse=True,
+        )
     )
     finished_report = output_root / "成品模型报告.csv"
     with finished_report.open("w", newline="", encoding="utf-8-sig") as stream:
@@ -14667,18 +14667,24 @@ class RiggedMeshApp(tk.Tk):
         if sort_mode == "新到旧":
             visible.sort(
                 key=lambda row: (
-                    row.source_order >= 0,
-                    row.source_order,
-                    row.modified_ns,
+                    row.source_order < 0,
+                    (
+                        row.source_order
+                        if row.source_order >= 0
+                        else -row.modified_ns
+                    ),
                     row.path.name.lower(),
-                ),
-                reverse=True,
+                )
             )
         elif sort_mode == "旧到新":
             visible.sort(
                 key=lambda row: (
                     row.source_order < 0,
-                    row.source_order if row.source_order >= 0 else row.modified_ns,
+                    (
+                        -row.source_order
+                        if row.source_order >= 0
+                        else row.modified_ns
+                    ),
                     row.path.name.lower(),
                 )
             )
@@ -15436,6 +15442,33 @@ class RiggedMeshApp(tk.Tk):
 
                 output_root = selected_output / "PMX输出"
                 output_root.mkdir(parents=True, exist_ok=True)
+                try:
+                    import pmx_role_classifier as role_classifier
+
+                    character_catalog, catalog_refreshed = (
+                        role_classifier.prepare_character_catalog(
+                            output_root, refresh=True
+                        )
+                    )
+                    self.events.put(
+                        (
+                            "log",
+                            f"角色元数据：可用 {len(character_catalog)} 条"
+                            + (
+                                "，已从官方列表更新本地缓存。"
+                                if catalog_refreshed
+                                else "，使用本地缓存或当前可用列表。"
+                            ),
+                        )
+                    )
+                except Exception as exc:
+                    self.events.put(
+                        (
+                            "log",
+                            "角色元数据暂不可用，未确认资源将保留内部分类："
+                            f"{type(exc).__name__}: {exc}",
+                        )
+                    )
                 texture_cache = DecodedTextureCache(
                     model_folder.parent / "decoded_png_cache"
                 )
@@ -15709,12 +15742,15 @@ class RiggedMeshApp(tk.Tk):
                                 component_sizes.append(component_path.stat().st_size)
                             except OSError:
                                 component_sizes.append(0)
-                        newest_component = max(
-                            composite.mesh_paths,
-                            key=lambda path: (
-                                archive_index(path)
-                                if archive_index(path) is not None else -1
-                            ),
+                        indexed_components = [
+                            path
+                            for path in composite.mesh_paths
+                            if archive_index(path) is not None
+                        ]
+                        newest_component = (
+                            min(indexed_components, key=archive_index)
+                            if indexed_components
+                            else composite.mesh_paths[0]
                         )
                         composite_report_rows.append(
                             [
@@ -15931,6 +15967,58 @@ class RiggedMeshApp(tk.Tk):
                             f"{focus_counts['角色主包']} 个（其中单槽 "
                             f"{focus_counts['角色主包单槽']} 个），额外特效/关卡包 "
                             f"{focus_counts['额外包']} 个。",
+                        )
+                    )
+                try:
+                    import pmx_role_classifier as role_classifier
+
+                    self.events.put(
+                        ("status", "正在按稀有度和中文角色名整理成品")
+                    )
+                    role_entries = role_classifier.scan_entries(
+                        output_root,
+                        progress=lambda done, total: self.events.put(
+                            (
+                                "status",
+                                (
+                                    f"读取角色分类元数据 {done}/{total}"
+                                    if total
+                                    else f"读取角色分类元数据：已发现 {done} 个"
+                                ),
+                            )
+                        ),
+                    )
+                    role_moved, role_reports = role_classifier.apply_classification(
+                        output_root,
+                        role_entries,
+                        progress=lambda done, total: (
+                            self.events.put(
+                                (
+                                    "progress",
+                                    done * 100 / total if total else 100,
+                                )
+                            ),
+                            self.events.put(
+                                (
+                                    "status",
+                                    f"整理角色目录 {done}/{total}",
+                                )
+                            ),
+                        ),
+                    )
+                    self.events.put(
+                        (
+                            "log",
+                            f"角色分类：共 {len(role_entries)} 个带贴图成品；"
+                            f"移动 {role_moved} 个目录；同步 {role_reports} 份报告。",
+                        )
+                    )
+                except Exception as exc:
+                    self.events.put(
+                        (
+                            "log",
+                            "按稀有度/中文名整理失败，PMX 本身不受影响："
+                            f"{type(exc).__name__}: {exc}",
                         )
                     )
                 write_one_click_state(output_root, source_fingerprint)
