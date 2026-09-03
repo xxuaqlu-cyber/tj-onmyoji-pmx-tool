@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import os
 import re
 import shutil
@@ -44,6 +45,8 @@ REPORT_MODES = {
 }
 RARITY_ORDER = ("UR", "SP", "SSR", "SR", "R", "N", "呱太", "其他资源", "未分类")
 RARITY_RANK = {rarity: index for index, rarity in enumerate(RARITY_ORDER)}
+SCENE_FOLDER_NAME = "场景PMX"
+SCENE_MODE = "场景 PMX"
 
 
 @dataclass(slots=True)
@@ -78,6 +81,8 @@ class PreviewData:
 
 
 def _category_for(path: Path, root: Path) -> str:
+    if SCENE_FOLDER_NAME in path.parts or root.name == SCENE_FOLDER_NAME:
+        return "场景"
     try:
         relative = path.relative_to(root)
         return relative.parts[0] if len(relative.parts) > 1 else "PMX"
@@ -141,6 +146,10 @@ def _attach_role_metadata(root: Path, items: list[PreviewItem]) -> list[PreviewI
                     )
 
     for item in items:
+        if item.category == "场景":
+            item.rarity = "其他资源"
+            item.role = "场景"
+            continue
         classification = by_path.get(_path_key(item.path))
         if classification is None and item.source_mesh:
             candidates = classifications_by_mesh.get(
@@ -153,6 +162,61 @@ def _attach_role_metadata(root: Path, items: list[PreviewItem]) -> list[PreviewI
         item.rarity = classification[0] or "未分类"
         item.role = classification[1] or "未分类"
     return items
+
+
+def _scene_root_from(root: Path) -> Path | None:
+    """从场景目录、总输出目录或角色 PMX 目录定位场景 PMX 根目录。"""
+    root = root.resolve()
+    for candidate in (root, *root.parents):
+        if candidate.name == SCENE_FOLDER_NAME and candidate.is_dir():
+            return candidate
+    for candidate in (root / SCENE_FOLDER_NAME, root.parent / SCENE_FOLDER_NAME):
+        if candidate.is_dir():
+            return candidate.resolve()
+    return None
+
+
+def _discover_scene_items(root: Path) -> list[PreviewItem]:
+    scene_root = _scene_root_from(root)
+    if scene_root is None:
+        return []
+
+    pmx_paths = sorted(scene_root.rglob("*.pmx"), key=lambda path: str(path).lower())
+    folder_counts: dict[Path, int] = {}
+    for path in pmx_paths:
+        folder_counts[path.parent] = folder_counts.get(path.parent, 0) + 1
+
+    metadata_cache: dict[Path, tuple[str, str]] = {}
+    result: list[PreviewItem] = []
+    for path in pmx_paths:
+        if path.parent not in metadata_cache:
+            scene_name = path.parent.name
+            source_xml = ""
+            layout = path.parent / "场景布局.json"
+            if layout.is_file():
+                try:
+                    payload = json.loads(layout.read_text(encoding="utf-8"))
+                    scene_name = str(payload.get("scene", "")).strip() or scene_name
+                    source_xml = str(payload.get("source_xml", "")).strip()
+                except (OSError, UnicodeError, json.JSONDecodeError):
+                    pass
+            metadata_cache[path.parent] = (scene_name, source_xml)
+        scene_name, source_xml = metadata_cache[path.parent]
+        display_name = scene_name
+        if folder_counts[path.parent] > 1:
+            display_name = f"{scene_name} / {path.stem}"
+        result.append(
+            PreviewItem(
+                path=path.resolve(),
+                category="场景",
+                rarity="其他资源",
+                role="场景",
+                display_name=display_name,
+                source_mesh=scene_name,
+                source_order=_source_order(source_xml),
+            )
+        )
+    return result
 
 
 def catalog_classifications(root: Path) -> list[tuple[str, str]]:
@@ -255,6 +319,13 @@ def _read_report_items(
 
 
 def _discover_items(root: Path, mode: str) -> list[PreviewItem]:
+    scene_root = _scene_root_from(root)
+    if mode == SCENE_MODE or (
+        mode == "全部 PMX"
+        and scene_root is not None
+        and scene_root == root.resolve()
+    ):
+        return _discover_scene_items(root)
     if mode == "成品模型":
         items = _read_report_items(
             root,
@@ -734,10 +805,16 @@ class PmxPreviewApp(tk.Tk):
         initial = initial.resolve()
         self.initial_file = initial if initial.is_file() else None
         root = initial.parent if initial.is_file() else initial
-        if root.name != "PMX输出" and (root / "PMX输出").is_dir():
+        scene_root = _scene_root_from(root)
+        opened_from_scene = scene_root is not None and (
+            root.name == SCENE_FOLDER_NAME or SCENE_FOLDER_NAME in initial.parts
+        )
+        if opened_from_scene:
+            root = scene_root
+        elif root.name != "PMX输出" and (root / "PMX输出").is_dir():
             root = root / "PMX输出"
         self.root_var = tk.StringVar(value=str(root))
-        self.mode_var = tk.StringVar(value="成品模型")
+        self.mode_var = tk.StringVar(value=SCENE_MODE if opened_from_scene else "成品模型")
         self.sort_var = tk.StringVar(value="新到旧")
         self.rarity_var = tk.StringVar(value="全部稀有度")
         self.role_var = tk.StringVar(value="全部角色")
@@ -785,6 +862,9 @@ class PmxPreviewApp(tk.Tk):
             side="left", fill="x", expand=True, padx=6
         )
         ttk.Button(top, text="选择", command=self.choose_root).pack(side="left")
+        ttk.Button(top, text="场景目录", command=self.open_scene_root).pack(
+            side="left", padx=(6, 0)
+        )
         ttk.Button(top, text="刷新", command=self.refresh_items).pack(side="left", padx=(6, 0))
 
         filters = ttk.Frame(self, padding=(8, 0, 8, 8))
@@ -802,6 +882,7 @@ class PmxPreviewApp(tk.Tk):
                 "待确认材质变体",
                 "成品模型",
                 "未匹配贴图",
+                SCENE_MODE,
                 "全部 PMX",
             ),
         ).pack(side="left", padx=6)
@@ -931,9 +1012,28 @@ class PmxPreviewApp(tk.Tk):
         self.bind("<Down>", lambda _event: self.move_selection(1))
 
     def choose_root(self) -> None:
-        value = filedialog.askdirectory(initialdir=self.root_var.get(), title="选择 PMX输出 目录")
+        value = filedialog.askdirectory(initialdir=self.root_var.get(), title="选择 PMX 目录")
         if value:
             self.root_var.set(value)
+            self.refresh_items()
+
+    def open_scene_root(self) -> None:
+        current = Path(self.root_var.get()).resolve()
+        scene_root = _scene_root_from(current)
+        if scene_root is None:
+            scene_root = _scene_root_from(
+                Path(__file__).resolve().parent / "rigged_models"
+            )
+        if scene_root is None:
+            messagebox.showinfo(
+                APP_TITLE,
+                "尚未找到场景 PMX。请先在主工具中运行“解包带贴图场景 PMX”。",
+            )
+            return
+        self.root_var.set(str(scene_root))
+        if self.mode_var.get() != SCENE_MODE:
+            self.mode_var.set(SCENE_MODE)
+        else:
             self.refresh_items()
 
     def refresh_items(self) -> None:

@@ -21,6 +21,92 @@ PULL_BATCH_FILES = 100
 PULL_BATCH_CHARS = 24_000
 
 
+def infer_mumu_dir(adb: str) -> str:
+    """从旧版设置中的 adb 路径推断 MuMu 安装目录。"""
+    try:
+        path = Path(os.path.expandvars(adb)).expanduser()
+    except (OSError, ValueError):
+        return ""
+    for parent in (path, *path.parents):
+        if "mumu" in parent.name.lower():
+            return str(parent)
+    return ""
+
+
+def find_mumu_adb_candidates(mumu_dir: str) -> list[str]:
+    """找出 MuMu 目录内可用的 ADB，优先使用 shell/adb.exe。"""
+    value = os.path.expandvars(mumu_dir.strip())
+    if not value:
+        return []
+    root = Path(value).expanduser()
+    if root.is_file() and root.name.lower() == "adb.exe":
+        return [str(root.resolve())]
+    if not root.is_dir():
+        return []
+    candidates: list[Path] = []
+    try:
+        candidates = [path for path in root.rglob("adb.exe") if path.is_file()]
+    except OSError:
+        pass
+    candidates.sort(key=lambda path: (0 if path.parent.name.lower() == "shell" else 1, len(path.parts), str(path).lower()))
+    result: list[str] = []
+    seen: set[str] = set()
+    for path in candidates:
+        resolved = str(path.resolve())
+        if resolved.lower() not in seen:
+            seen.add(resolved.lower())
+            result.append(resolved)
+    return result
+
+
+def parse_adb_devices(output: str) -> list[dict[str, str]]:
+    """解析 `adb devices -l`，只返回当前可用的设备。"""
+    devices: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) < 2 or parts[1] != "device" or parts[0] in seen:
+            continue
+        model = ""
+        for part in parts[2:]:
+            if part.startswith("model:"):
+                model = part[6:].replace("_", " ")
+                break
+        seen.add(parts[0])
+        devices.append({"serial": parts[0], "model": model})
+    return devices
+
+
+def format_device_label(device: dict[str, str]) -> str:
+    serial = device.get("serial", "")
+    model = device.get("model", "")
+    return f"{serial}（{model}）" if model else serial
+
+
+def onmyoji_package_candidates(package_output: str) -> list[str]:
+    packages: list[str] = []
+    excluded = {
+        "com.netease.yysbwp",  # 阴阳师：百闻牌，不是阴阳师本体
+    }
+    for line in package_output.splitlines():
+        name = line.strip()
+        if name.startswith("package:"):
+            name = name[8:].strip()
+        if not name or any(char.isspace() for char in name):
+            continue
+        lowered = name.lower()
+        if name in excluded:
+            continue
+        if "onmyoji" in lowered:
+            packages.append(name)
+    known = [
+        "com.netease.onmyoji.wyzymnqsd_cps",
+        "com.netease.onmyoji.wyzymnqsd",
+        "com.netease.onmyoji",
+    ]
+    return list(dict.fromkeys([*packages, *known]))
+
+
 def subprocess_flags() -> int:
     return subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
@@ -28,6 +114,7 @@ def subprocess_flags() -> int:
 def load_settings() -> dict[str, str]:
     defaults = {
         "adb": shutil.which("adb") or "adb",
+        "mumu_dir": "",
         "device": DEFAULT_DEVICE,
         "remote": DEFAULT_REMOTE,
         "output": str(APP_DIR / "yys"),
@@ -178,7 +265,9 @@ class ResourcePullApp:
 
         settings = load_settings()
         self.adb_var = tk.StringVar(value=settings["adb"])
+        self.mumu_dir_var = tk.StringVar(value=settings.get("mumu_dir") or infer_mumu_dir(settings["adb"]))
         self.device_var = tk.StringVar(value=settings["device"])
+        self.device_display_var = tk.StringVar(value=settings["device"])
         self.remote_var = tk.StringVar(value=settings["remote"])
         self.output_var = tk.StringVar(value=settings["output"])
         self.status_var = tk.StringVar(value="请确认设备和目录，然后开始拉取。")
@@ -187,6 +276,8 @@ class ResourcePullApp:
         self.current_process: subprocess.Popen[str] | None = None
         self.cancel_requested = False
         self.busy = False
+        self.discovered_devices: dict[str, dict[str, str]] = {}
+        self.device_labels: dict[str, str] = {}
 
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -196,47 +287,57 @@ class ResourcePullApp:
         outer = ttk.Frame(self.root, padding=14)
         outer.pack(fill="both", expand=True)
         outer.columnconfigure(1, weight=1)
-        outer.rowconfigure(6, weight=1)
+        outer.rowconfigure(7, weight=1)
 
-        ttk.Label(outer, text="ADB 程序").grid(row=0, column=0, sticky="w", pady=5)
-        ttk.Entry(outer, textvariable=self.adb_var).grid(
+        ttk.Label(outer, text="MuMu 模拟器目录").grid(row=0, column=0, sticky="w", pady=5)
+        ttk.Entry(outer, textvariable=self.mumu_dir_var).grid(
             row=0, column=1, sticky="ew", padx=(10, 6), pady=5
         )
-        ttk.Button(outer, text="浏览…", command=self.choose_adb).grid(
+        ttk.Button(outer, text="选择…", command=self.choose_mumu_dir).grid(
             row=0, column=2, sticky="ew", pady=5
         )
 
-        ttk.Label(outer, text="设备地址/序列号").grid(row=1, column=0, sticky="w", pady=5)
-        self.device_combo = ttk.Combobox(outer, textvariable=self.device_var)
-        self.device_combo.grid(row=1, column=1, sticky="ew", padx=(10, 6), pady=5)
-        ttk.Button(outer, text="检测设备", command=self.refresh_devices).grid(
+        ttk.Label(outer, text="ADB 程序").grid(row=1, column=0, sticky="w", pady=5)
+        ttk.Entry(outer, textvariable=self.adb_var).grid(
+            row=1, column=1, sticky="ew", padx=(10, 6), pady=5
+        )
+        ttk.Button(outer, text="浏览…", command=self.choose_adb).grid(
             row=1, column=2, sticky="ew", pady=5
         )
 
-        ttk.Label(outer, text="Android 源目录").grid(row=2, column=0, sticky="w", pady=5)
-        ttk.Entry(outer, textvariable=self.remote_var).grid(
-            row=2, column=1, columnspan=2, sticky="ew", padx=(10, 0), pady=5
+        ttk.Label(outer, text="正在运行的模拟器").grid(row=2, column=0, sticky="w", pady=5)
+        self.device_combo = ttk.Combobox(outer, textvariable=self.device_display_var)
+        self.device_combo.grid(row=2, column=1, sticky="ew", padx=(10, 6), pady=5)
+        self.device_combo.bind("<<ComboboxSelected>>", self.on_device_selected)
+        ttk.Button(outer, text="检测设备", command=self.refresh_devices).grid(
+            row=2, column=2, sticky="ew", pady=5
         )
 
-        ttk.Label(outer, text="本地保存目录").grid(row=3, column=0, sticky="w", pady=5)
+        ttk.Label(outer, text="Android 源目录").grid(row=3, column=0, sticky="w", pady=5)
+        ttk.Entry(outer, textvariable=self.remote_var).grid(
+            row=3, column=1, columnspan=2, sticky="ew", padx=(10, 0), pady=5
+        )
+
+        ttk.Label(outer, text="本地保存目录").grid(row=4, column=0, sticky="w", pady=5)
         ttk.Entry(outer, textvariable=self.output_var).grid(
-            row=3, column=1, sticky="ew", padx=(10, 6), pady=5
+            row=4, column=1, sticky="ew", padx=(10, 6), pady=5
         )
         ttk.Button(outer, text="选择…", command=self.choose_output).grid(
-            row=3, column=2, sticky="ew", pady=5
+            row=4, column=2, sticky="ew", pady=5
         )
 
         note = (
+            "先选择 MuMu 目录并检测设备，再从下拉框选择实例；工具会自动查找阴阳师目录。"
             "默认保存到本工具所在目录下的 yys；所有字段均可修改并会保存在本机。"
             "增量模式只下载新增、变化或本地缺失的文件；完整模式会重新下载全部文件。"
             "拉取前请先在模拟器内完成游戏更新。"
         )
         ttk.Label(outer, text=note, foreground="#555555", wraplength=790).grid(
-            row=4, column=0, columnspan=3, sticky="w", pady=(6, 10)
+            row=5, column=0, columnspan=3, sticky="w", pady=(6, 10)
         )
 
         actions = ttk.Frame(outer)
-        actions.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(0, 10))
+        actions.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(0, 10))
         self.connect_button = ttk.Button(actions, text="连接并检测", command=self.connect_device)
         self.connect_button.pack(side="left")
         self.pull_button = ttk.Button(
@@ -255,7 +356,7 @@ class ResourcePullApp:
         self.progress.pack(side="right", padx=(10, 0))
 
         log_frame = ttk.LabelFrame(outer, text="运行日志", padding=6)
-        log_frame.grid(row=6, column=0, columnspan=3, sticky="nsew")
+        log_frame.grid(row=7, column=0, columnspan=3, sticky="nsew")
         log_frame.rowconfigure(0, weight=1)
         log_frame.columnconfigure(0, weight=1)
         self.log = tk.Text(log_frame, wrap="word", height=16, state="disabled")
@@ -265,8 +366,16 @@ class ResourcePullApp:
         self.log.configure(yscrollcommand=scrollbar.set)
 
         ttk.Label(outer, textvariable=self.status_var, anchor="w").grid(
-            row=7, column=0, columnspan=3, sticky="ew", pady=(8, 0)
+            row=8, column=0, columnspan=3, sticky="ew", pady=(8, 0)
         )
+
+    def choose_mumu_dir(self) -> None:
+        current = Path(os.path.expandvars(self.mumu_dir_var.get())).expanduser()
+        initial = current if current.is_dir() else APP_DIR
+        selected = filedialog.askdirectory(title="选择 MuMu 模拟器目录", initialdir=str(initial))
+        if selected:
+            self.mumu_dir_var.set(selected)
+            self.refresh_devices()
 
     def choose_adb(self) -> None:
         selected = filedialog.askopenfilename(
@@ -305,6 +414,7 @@ class ResourcePullApp:
     def save_settings(self) -> None:
         payload = {
             "adb": self.adb_var.get().strip(),
+            "mumu_dir": self.mumu_dir_var.get().strip(),
             "device": self.device_var.get().strip(),
             "remote": self.remote_var.get().strip(),
             "output": self.output_var.get().strip(),
@@ -402,17 +512,30 @@ class ResourcePullApp:
     def refresh_devices(self) -> None:
         def worker() -> None:
             try:
-                adb = self.resolve_adb()
-                code, output = self.run_command([adb, "devices"])
-                if code != 0:
-                    raise RuntimeError(output.strip() or "无法读取 ADB 设备列表。")
-                devices = []
-                for line in output.splitlines()[1:]:
-                    parts = line.split()
-                    if len(parts) >= 2 and parts[1] == "device":
-                        devices.append(parts[0])
-                self.events.put(("devices", devices))
-                self.events.put(("done", f"检测完成，共发现 {len(devices)} 台可用设备。"))
+                try:
+                    configured = self.resolve_adb()
+                except RuntimeError:
+                    configured = ""
+                candidates = find_mumu_adb_candidates(self.mumu_dir_var.get())
+                if configured and configured not in candidates:
+                    candidates.insert(0, configured)
+                if not candidates:
+                    raise RuntimeError("找不到 MuMu 目录中的 adb.exe。请选择正确的模拟器目录，或手动指定 ADB 程序。")
+                discovered: dict[str, dict[str, str]] = {}
+                for adb in candidates:
+                    try:
+                        code, output = self.run_command([adb, "devices", "-l"], log_output=False)
+                    except OSError:
+                        continue
+                    if code != 0:
+                        continue
+                    for device in parse_adb_devices(output):
+                        device["adb"] = adb
+                        discovered.setdefault(device["serial"], device)
+                if not discovered:
+                    raise RuntimeError("未发现正在运行的模拟器。请确认 MuMu 已启动，并检查目录是否正确。")
+                self.events.put(("devices", list(discovered.values())))
+                self.events.put(("done", f"检测完成，共发现 {len(discovered)} 台可用模拟器。"))
             except Exception as exc:
                 self.events.put(("error", str(exc)))
 
@@ -421,7 +544,7 @@ class ResourcePullApp:
     def connect_device(self) -> None:
         def worker() -> None:
             try:
-                adb = self.resolve_adb()
+                adb = self.selected_adb()
                 device = self.device_var.get().strip()
                 if not device:
                     raise RuntimeError("请输入设备地址或序列号。")
@@ -431,6 +554,77 @@ class ResourcePullApp:
                 self.events.put(("error", str(exc)))
 
         self.start_worker(worker, "正在连接并检测设备…")
+
+    def selected_adb(self) -> str:
+        device = self.device_var.get().strip()
+        record = self.discovered_devices.get(device)
+        if record and record.get("adb"):
+            self.adb_var.set(record["adb"])
+            return record["adb"]
+        return self.resolve_adb()
+
+    def on_device_selected(self, _event=None) -> None:
+        selected = self.device_display_var.get().strip()
+        serial = self.device_labels.get(selected, selected)
+        self.device_var.set(serial)
+        record = self.discovered_devices.get(serial)
+        if record and record.get("adb"):
+            self.adb_var.set(record["adb"])
+            self.auto_detect_remote(record["adb"], record["serial"])
+
+    def auto_detect_remote(self, adb: str, device: str) -> None:
+        def worker() -> None:
+            try:
+                packages_output = self.run_command(
+                    [adb, "-s", device, "shell", "pm", "list", "packages"],
+                    log_output=False,
+                )[1]
+                packages = onmyoji_package_candidates(packages_output)
+                bases = ["/sdcard/Android/data", "/storage/emulated/0/Android/data"]
+                paths = [f"{base}/{package}" for base in bases for package in packages]
+                for remote in paths:
+                    code, listing = self.run_command(
+                        [adb, "-s", device, "shell", "test", "-d", remote],
+                        log_output=False,
+                    )
+                    if code == 0:
+                        self.events.put(("remote", remote))
+                        self.events.put(("log", f"已自动找到阴阳师目录：{remote}"))
+                        return
+                # 某些渠道包的包名不含 onmyoji，最后从 Android/data 目录名兜底筛选。
+                code, listing = self.run_command(
+                    [
+                        adb,
+                        "-s",
+                        device,
+                        "shell",
+                        "find",
+                        "/sdcard/Android/data",
+                        "/storage/emulated/0/Android/data",
+                        "-mindepth",
+                        "1",
+                        "-maxdepth",
+                        "1",
+                        "-type",
+                        "d",
+                    ],
+                    log_output=False,
+                )
+                if code == 0:
+                    matches = [
+                        line.strip()
+                        for line in listing.splitlines()
+                        if line.strip() and "onmyoji" in PurePosixPath(line.strip()).name.lower()
+                    ]
+                    if matches:
+                        self.events.put(("remote", matches[0]))
+                        self.events.put(("log", f"已自动找到阴阳师目录：{matches[0]}"))
+                        return
+                self.events.put(("log", "未自动找到阴阳师目录，请手动填写 Android 源目录。"))
+            except Exception as exc:
+                self.events.put(("log", f"自动查找阴阳师目录失败：{exc}"))
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def start_pull(self) -> None:
         try:
@@ -460,7 +654,7 @@ class ResourcePullApp:
 
         def worker() -> None:
             try:
-                adb = self.resolve_adb()
+                adb = self.selected_adb()
                 output.mkdir(parents=True, exist_ok=True)
                 package_output.mkdir(parents=True, exist_ok=True)
                 self.ensure_device(adb, device)
@@ -524,7 +718,7 @@ class ResourcePullApp:
 
         def worker() -> None:
             try:
-                adb = self.resolve_adb()
+                adb = self.selected_adb()
                 output.mkdir(parents=True, exist_ok=True)
                 package_output.mkdir(parents=True, exist_ok=True)
                 self.ensure_device(adb, device)
@@ -632,10 +826,30 @@ class ResourcePullApp:
             if kind == "log":
                 self.append_log(str(value))
             elif kind == "devices":
-                devices = list(value) if isinstance(value, list) else []
+                records = list(value) if isinstance(value, list) else []
+                self.discovered_devices = {
+                    record["serial"]: record
+                    for record in records
+                    if isinstance(record, dict) and record.get("serial")
+                }
+                self.device_labels = {
+                    format_device_label(record): record["serial"]
+                    for record in self.discovered_devices.values()
+                }
+                devices = list(self.device_labels)
                 self.device_combo.configure(values=devices)
-                if devices and self.device_var.get().strip() not in devices:
-                    self.device_var.set(devices[0])
+                current_serial = self.device_var.get().strip()
+                selected_label = next(
+                    (label for label, serial in self.device_labels.items() if serial == current_serial),
+                    devices[0] if devices else "",
+                )
+                if selected_label:
+                    self.device_display_var.set(selected_label)
+                    self.device_var.set(self.device_labels[selected_label])
+                if devices:
+                    self.on_device_selected()
+            elif kind == "remote":
+                self.remote_var.set(str(value))
             elif kind == "done":
                 self.set_busy(False, str(value))
                 self.append_log(str(value))

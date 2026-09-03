@@ -54,6 +54,10 @@ PMX_OUTPUT_FORMAT_VERSION = 32
 MATERIAL_RESOLVER_VERSION = 41
 # 主体/附件组合发现规则版本；只影响“完整组合”，不抬高 PMX 文件格式版本。
 COMPOSITE_RESOLVER_VERSION = 6
+# 场景 PMX 的布局烘焙版本。只在 SCN 层级、坐标变换、分块或场景材质
+# 规则变化时递增；普通角色模型规则变化不应让场景缓存全部失效。
+SCENE_PMX_PIPELINE_VERSION = 3
+SCENE_PMX_VERTEX_LIMIT = 500_000
 _RES_ASSET_PATHS_MEMORY_CACHE: dict[tuple[object, ...], list[str]] = {}
 _SCRIPT3_GIM_PATHS_MEMORY_CACHE: dict[tuple[object, ...], list[str]] = {}
 _FX_ASSET_PATHS_MEMORY_CACHE: dict[tuple[object, ...], list[str]] = {}
@@ -311,6 +315,26 @@ class CompositeModel:
     # True 表示关系唯一且为模型固有组成：成品清单只保留合并结果，隐藏独立件。
     # 可选 Socket 姿态/换装变体保持 False。
     direct_merge: bool = False
+
+
+@dataclass(slots=True)
+class SceneCatalogEntry:
+    source_path: Path
+    display_name: str
+    content_path: str
+    model_count: int
+    component_group_count: int
+    effect_count: int
+
+
+@dataclass(slots=True)
+class SceneModelInstance:
+    name: str
+    uuid: str
+    logical_gim: str
+    material_override: str | None
+    transform: tuple[float, ...]
+    component_group: str | None = None
 
 
 def package_primary_texture_sources(package: MaterialPackage) -> frozenset[Path]:
@@ -14449,6 +14473,1104 @@ def write_finished_model_report(output_root: Path) -> tuple[int, int, int]:
     return len(finished_rows), len(selected), hidden_independent
 
 
+_SCENE_IDENTITY_MATRIX = (
+    1.0, 0.0, 0.0, 0.0,
+    0.0, 1.0, 0.0, 0.0,
+    0.0, 0.0, 1.0, 0.0,
+    0.0, 0.0, 0.0, 1.0,
+)
+
+
+def _read_scene_xml_root(path: Path) -> ET.Element:
+    """读取新旧 SCN XML；旧资源中的中文筛选名可能是 GBK/混合编码。"""
+    data = path.read_bytes()
+    try:
+        return ET.fromstring(data)
+    except (ET.ParseError, UnicodeError):
+        # 部分旧 SCN 没有 XML encoding 声明，甚至夹有损坏的编辑器中文标签。
+        # 这些文字不参与模型布局；替换坏字符可完整保留结构与数值属性。
+        return ET.fromstring(data.decode("gb18030", errors="replace"))
+
+
+def _scene_float_vector(
+    raw: str | None,
+    count: int,
+    default: tuple[float, ...],
+) -> tuple[float, ...]:
+    if not raw:
+        return default
+    try:
+        values = tuple(float(item.strip()) for item in raw.split(","))
+    except ValueError:
+        return default
+    return values if len(values) == count else default
+
+
+def _scene_node_matrix(node: ET.Element) -> tuple[float, ...]:
+    position = _scene_float_vector(
+        node.get("Position"), 3, (0.0, 0.0, 0.0)
+    )
+    scale = _scene_float_vector(node.get("Scale"), 3, (1.0, 1.0, 1.0))
+    rotation = _scene_float_vector(
+        node.get("Rotation"), 16, _SCENE_IDENTITY_MATRIX
+    )
+    scale_matrix = (
+        scale[0], 0.0, 0.0, 0.0,
+        0.0, scale[1], 0.0, 0.0,
+        0.0, 0.0, scale[2], 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    )
+    translation = (
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        position[0], position[1], position[2], 1.0,
+    )
+    # NeoX SCN 使用 row-vector：局部点依次经过 Scale、Rotation、Position。
+    return _matrix4_multiply(
+        _matrix4_multiply(scale_matrix, tuple(rotation)), translation
+    )
+
+
+def _scene_linear_determinant(matrix: tuple[float, ...]) -> float:
+    a, b, c = matrix[0], matrix[1], matrix[2]
+    d, e, f = matrix[4], matrix[5], matrix[6]
+    g, h, i = matrix[8], matrix[9], matrix[10]
+    return a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)
+
+
+def _scene_normal_matrix(matrix: tuple[float, ...]) -> tuple[float, ...]:
+    inverse = _inverse_affine_row_matrix4(matrix)
+    # row-vector 法线使用 (L^-1)^T；平移必须清零。
+    return (
+        inverse[0], inverse[4], inverse[8], 0.0,
+        inverse[1], inverse[5], inverse[9], 0.0,
+        inverse[2], inverse[6], inverse[10], 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    )
+
+
+def _scene_file_table(parent: ET.Element | None) -> dict[int, str]:
+    result: dict[int, str] = {}
+    if parent is None:
+        return result
+    for node in list(parent):
+        match = re.fullmatch(r"File_(\d+)", node.tag, re.IGNORECASE)
+        if not match:
+            continue
+        value = (node.get("Path") or "").strip().replace("\\", "/")
+        if value:
+            result[int(match.group(1))] = value
+    return result
+
+
+def _scene_display_identity(root: ET.Element, path: Path) -> tuple[str, str]:
+    global_node = root.find(".//Global")
+    content_path = (
+        (global_node.get("ContentPath") or "").strip().replace("\\", "/")
+        if global_node is not None else ""
+    )
+    display = content_path
+    if display.lower().endswith("_content"):
+        display = display[:-8]
+    display = display.strip("/") or extracted_resource_label(path) or path.stem
+    return display, content_path
+
+
+def scan_scene_catalog(
+    scene_root: Path,
+    progress: Callable[[int, int], None] | None = None,
+) -> list[SceneCatalogEntry]:
+    files = sorted(scene_root.rglob("*.xml"), key=lambda item: item.name.lower())
+    entries: list[SceneCatalogEntry] = []
+    for number, path in enumerate(files, 1):
+        try:
+            root = _read_scene_xml_root(path)
+            entities = root.find(".//Entities")
+            if entities is None:
+                continue
+            models_node = entities.find("Models")
+            direct_count = (
+                sum(1 for node in list(models_node) if node.tag.lower() == "model")
+                if models_node is not None else 0
+            )
+            component_groups_node = entities.find("ComponentGroups/Groups")
+            component_groups = (
+                list(component_groups_node)
+                if component_groups_node is not None else []
+            )
+            component_count = sum(
+                len(group.findall("model")) for group in component_groups
+            )
+            model_count = direct_count + component_count
+            if not model_count:
+                continue
+            fx_node = entities.find("Fxes")
+            effect_count = len(list(fx_node)) if fx_node is not None else 0
+            effect_count += sum(
+                len(group.findall("sfx")) for group in component_groups
+            )
+            display, content_path = _scene_display_identity(root, path)
+            entries.append(
+                SceneCatalogEntry(
+                    source_path=path.resolve(),
+                    display_name=display,
+                    content_path=content_path,
+                    model_count=model_count,
+                    component_group_count=len(component_groups),
+                    effect_count=effect_count,
+                )
+            )
+        except (OSError, ET.ParseError, UnicodeError, ValueError):
+            continue
+        finally:
+            if progress and (number % 50 == 0 or number == len(files)):
+                progress(number, len(files))
+    entries.sort(key=lambda item: item.display_name.lower())
+    return entries
+
+
+def load_scene_instances(entry: SceneCatalogEntry) -> list[SceneModelInstance]:
+    root = _read_scene_xml_root(entry.source_path)
+    entities = root.find(".//Entities")
+    if entities is None:
+        return []
+    files = _scene_file_table(entities.find("AllFiles"))
+    result: list[SceneModelInstance] = []
+
+    def add_model(
+        node: ET.Element,
+        parent_matrix: tuple[float, ...] | None = None,
+        component_group: str | None = None,
+    ) -> None:
+        try:
+            file_index = int(node.get("FilePathIndex") or "-1")
+        except ValueError:
+            return
+        logical_gim = files.get(file_index, "")
+        if not logical_gim.lower().endswith(".gim"):
+            return
+        transform = _scene_node_matrix(node)
+        if parent_matrix is not None:
+            transform = _matrix4_multiply(transform, parent_matrix)
+        material_override = (node.get("MaterialGroupFile") or "").strip()
+        result.append(
+            SceneModelInstance(
+                name=(node.get("Name") or Path(logical_gim).stem).strip(),
+                uuid=(node.get("UUID") or "").strip(),
+                logical_gim=logical_gim,
+                material_override=material_override or None,
+                transform=transform,
+                component_group=component_group,
+            )
+        )
+
+    models_node = entities.find("Models")
+    if models_node is not None:
+        for node in list(models_node):
+            if node.tag.lower() == "model":
+                add_model(node)
+
+    component_groups = entities.find("ComponentGroups/Groups")
+    if component_groups is not None:
+        for group in list(component_groups):
+            group_matrix = _scene_node_matrix(group)
+            group_name = (group.get("Name") or group.tag).strip()
+            for node in group.findall("model"):
+                add_model(node, group_matrix, group_name)
+    return result
+
+
+def ensure_scene_cache(
+    source_root: Path | None,
+    unpacked_root: Path,
+    log: Callable[[str], None] | None = None,
+    progress: Callable[[str, int, int], None] | None = None,
+) -> Path:
+    """增量解包 scene 包；无游戏源目录时允许直接使用已有缓存。"""
+    scene_root = unpacked_root / "scene"
+    if source_root is None:
+        if any(scene_root.rglob("*.xml")):
+            return scene_root
+        raise RuntimeError("没有场景解包缓存；请选择包含 scene.idx 的完整 yys 目录")
+
+    import onmyoji_wpk_gui as wpk
+
+    groups = wpk.discover_groups(
+        source_root,
+        progress=progress,
+        stems={"scene"},
+    )
+    group = next((item for item in groups if item.stem == "scene"), None)
+    if group is None:
+        raise RuntimeError("所选游戏资源中没有 scene.idx / scene*.wpk")
+    if not _manifest_matches_idx(scene_root, group.records):
+        if log:
+            log("正在增量解包 scene 场景描述；未变化内容直接复用。")
+        engine = wpk.ExtractorEngine(
+            log or (lambda _text: None),
+            lambda done, total, text: (
+                progress("scene", done, total) if progress else None
+            ),
+            threading.Event(),
+        )
+        engine.extract_groups([group], unpacked_root, None, True)
+    elif log:
+        log("scene 场景描述缓存与当前索引一致，直接复用。")
+    return scene_root
+
+
+class SceneResourceResolver:
+    """用逻辑路径 THX 哈希精确解析场景的 GIM/Mesh/MTG/KTX。"""
+
+    def __init__(
+        self,
+        thd_dir: Path,
+        source_root: Path | None,
+        unpacked_root: Path,
+        log: Callable[[str], None] | None = None,
+    ):
+        import onmyoji_wpk_gui as wpk
+        from thd_resource_index import (
+            cloudfilesys_name_hash,
+            read_model_thx,
+            read_thx_namehash_seeds,
+        )
+
+        self.wpk = wpk
+        self.cloudfilesys_name_hash = cloudfilesys_name_hash
+        self.unpacked_root = unpacked_root
+        self.cache_root = unpacked_root / "scene_resources"
+        self.source_root = source_root
+        self.log = log
+        self.result_cache: dict[str, Path | None] = {}
+        self.physical_by_digest: dict[str, Path] = {}
+        self.thx_sources: dict[
+            str, tuple[dict[int, object], tuple[int, ...]]
+        ] = {}
+        self.content_records: dict[str, list[tuple[Path, object]]] = defaultdict(list)
+        self.loaded_archive_stems: set[str] = set()
+        self.handles: dict[Path, object] = {}
+        self.zstandard_module = None
+        self.extracted_count = 0
+        self.base_url = ""
+        cloud_config = thd_dir.parent / "cloud.json"
+        if cloud_config.is_file():
+            try:
+                cloud_value = json.loads(cloud_config.read_text(encoding="utf-8"))
+                self.base_url = str(cloud_value.get("base_url") or "").strip()
+            except (OSError, ValueError, json.JSONDecodeError):
+                self.base_url = ""
+
+        thd_roots = [thd_dir]
+        extension_root = thd_dir.parent / "thdext1"
+        if extension_root.is_dir():
+            thd_roots.append(extension_root)
+        for root in thd_roots:
+            for thx_path in sorted(root.glob("*.thx")):
+                try:
+                    records = {
+                        record.name_hash: record
+                        for record in read_model_thx(thx_path)
+                    }
+                    seeds = read_thx_namehash_seeds(thx_path)
+                except Exception:
+                    continue
+                self.thx_sources[thx_path.stem.lower()] = (records, seeds)
+
+        # 不能对 unpacked 做 rglob：model/levelsets 常有二十多万个实体文件，
+        # 仅为了找十几个清单就遍历全树会让窗口看似卡死数分钟。
+        manifest_candidates = list(unpacked_root.glob("*/manifest.csv"))
+        manifest_candidates.extend(
+            unpacked_root.glob("extra_rigged/*/manifest.csv")
+        )
+        manifest_candidates.extend(
+            unpacked_root.glob("extra_rigged/*/material_manifest.csv")
+        )
+        for manifest in dict.fromkeys(path.resolve() for path in manifest_candidates):
+            self._load_manifest(manifest)
+        for path in (unpacked_root / "cross_package_textures").rglob("*.ktx"):
+            digest = path.stem.lower()
+            if re.fullmatch(r"[0-9a-f]{32}", digest):
+                self.physical_by_digest.setdefault(digest, path.resolve())
+        for path in self.cache_root.glob("*/*"):
+            digest = path.stem.lower()
+            if path.is_file() and re.fullmatch(r"[0-9a-f]{32}", digest):
+                self.physical_by_digest.setdefault(digest, path.resolve())
+
+    def _load_manifest(self, manifest: Path) -> None:
+        try:
+            with manifest.open("r", newline="", encoding="utf-8-sig") as stream:
+                for row in csv.DictReader(stream):
+                    digest = (row.get("resource_hash") or "").strip().lower()
+                    relative = (row.get("output_path") or "").strip()
+                    status = (row.get("status") or "").strip().lower()
+                    if not re.fullmatch(r"[0-9a-f]{32}", digest) or not relative:
+                        continue
+                    if status and status not in {"ok", "rigged", "static_mesh"}:
+                        continue
+                    rel = Path(relative.replace("\\", "/"))
+                    # 标准解包清单写 ``levelsets/pkg_...``，额外缓存清单写
+                    # 相对本组目录的路径。这里可由首段直接确定，无需为十几万行
+                    # 逐个调用 Path.is_file()；实体存在性留到真正解析该 MD5 时检查。
+                    if rel.parts and rel.parts[0].lower() == manifest.parent.name.lower():
+                        path = manifest.parent.parent / rel
+                    else:
+                        path = manifest.parent / rel
+                    self.physical_by_digest.setdefault(
+                        digest, Path(os.path.abspath(path))
+                    )
+        except (OSError, UnicodeError, csv.Error):
+            return
+
+    @staticmethod
+    def _preferred_packages(reference: str) -> tuple[str, ...]:
+        normalized = reference.strip().replace("\\", "/").lower().lstrip("/")
+        prefix = normalized.split("/", 1)[0]
+        table = {
+            "levelsets": ("levelsets", "res"),
+            "lbslevelsets": ("levelsets", "res"),
+            "model": ("model", "res"),
+            "static": ("static", "res"),
+            "scene": ("scene", "res"),
+            "fx": ("fx_model", "fx", "fx_texture", "res"),
+            "natural": ("res", "levelsets"),
+        }
+        return table.get(prefix, (prefix, "res"))
+
+    def _record_hits(
+        self, reference: str, packages: tuple[str, ...] | None = None
+    ) -> dict[str, object]:
+        hits: dict[str, object] = {}
+        names = packages or tuple(self.thx_sources)
+        for package_name in names:
+            source = self.thx_sources.get(package_name)
+            if source is None:
+                continue
+            records, seeds = source
+            for variant in _package_reference_variants(reference, package_name):
+                for seed in seeds:
+                    name_hash = self.cloudfilesys_name_hash(
+                        variant, package_name, seed
+                    )
+                    record = records.get(name_hash)
+                    if record is not None:
+                        hits.setdefault(record.content_md5.lower(), record)
+        return hits
+
+    def _load_archive_stem(self, stem: str) -> None:
+        stem = stem.lower()
+        if stem in self.loaded_archive_stems or self.source_root is None:
+            return
+        self.loaded_archive_stems.add(stem)
+        idx_path = self.source_root / f"{stem}.idx"
+        if not idx_path.is_file():
+            return
+        try:
+            _marker, records = self.wpk.parse_idx(idx_path)
+        except Exception:
+            return
+        pattern = re.compile(rf"^{re.escape(stem)}(\d+)\.wpk$", re.IGNORECASE)
+        packages: dict[int, Path] = {}
+        for path in self.source_root.glob(f"{stem}*.wpk"):
+            match = pattern.fullmatch(path.name)
+            if match:
+                packages[int(match.group(1))] = path.resolve()
+        for record in records:
+            package = packages.get(record.package_id)
+            if not self.wpk.record_is_active(record) or package is None:
+                continue
+            self.content_records[record.resource_hash.lower()].append(
+                (package, record)
+            )
+
+    def _extract_digest(
+        self,
+        digest: str,
+        preferred_packages: tuple[str, ...],
+        thx_record: object | None = None,
+    ) -> Path | None:
+        existing = self.physical_by_digest.get(digest)
+        if existing is not None and existing.is_file():
+            return existing
+        for stem in preferred_packages:
+            self._load_archive_stem(stem)
+            if self.content_records.get(digest):
+                break
+        if not self.content_records.get(digest):
+            for stem in self.thx_sources:
+                self._load_archive_stem(stem)
+                if self.content_records.get(digest):
+                    break
+        for package_path, record in self.content_records.get(digest, []):
+            try:
+                stream = self.handles.get(package_path)
+                if stream is None:
+                    stream = package_path.open("rb")
+                    self.handles[package_path] = stream
+                read_size = self.wpk.record_read_size(record)
+                stream.seek(record.offset)
+                blob = stream.read(read_size)
+                if len(blob) != read_size:
+                    continue
+                decoded, _ = self.wpk.decode_stage1(blob, record.key_length)
+                if self.zstandard_module is None:
+                    self.zstandard_module = self.wpk.load_zstandard()
+                decoded, _ = self.wpk.unwrap_payload(
+                    decoded, self.zstandard_module
+                )
+                if hashlib.md5(decoded).hexdigest() != digest:
+                    continue
+                extension = self.wpk.detect_extension(decoded)
+                target = self.cache_root / digest[:2] / f"{digest}.{extension}"
+                target.parent.mkdir(parents=True, exist_ok=True)
+                temporary = target.with_suffix(target.suffix + ".tmp")
+                temporary.write_bytes(decoded)
+                temporary.replace(target)
+                self.physical_by_digest[digest] = target.resolve()
+                self.extracted_count += 1
+                return target.resolve()
+            except Exception:
+                continue
+        return self._download_digest(digest, thx_record)
+
+    def _download_digest(
+        self, digest: str, thx_record: object | None
+    ) -> Path | None:
+        """本地 WPK 缺项时，按 THX 内容 MD5 从官方动态仓库精确补取。"""
+        if not self.base_url or thx_record is None:
+            return None
+        expected_size = int(getattr(thx_record, "size", 0) or 0)
+        if expected_size < 8 or expected_size > 512 * 1024 * 1024:
+            return None
+        try:
+            import urllib.request
+
+            url = self.base_url.rstrip("/") + f"/dynamic/{digest[:2]}/{digest[2:]}"
+            request = urllib.request.Request(
+                url, headers={"User-Agent": "OnmyojiResourceTool/1.0"}
+            )
+            with urllib.request.urlopen(request, timeout=30) as response:
+                blob = response.read(expected_size + 1)
+            if len(blob) != expected_size:
+                return None
+            decoded, _ = self.wpk.decode_stage1(blob, len(blob))
+            if self.zstandard_module is None:
+                self.zstandard_module = self.wpk.load_zstandard()
+            decoded, _ = self.wpk.unwrap_payload(decoded, self.zstandard_module)
+            if hashlib.md5(decoded).hexdigest() != digest:
+                return None
+            extension = self.wpk.detect_extension(decoded)
+            target = self.cache_root / digest[:2] / f"{digest}.{extension}"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            temporary = target.with_suffix(target.suffix + ".tmp")
+            temporary.write_bytes(decoded)
+            temporary.replace(target)
+            self.physical_by_digest[digest] = target.resolve()
+            self.extracted_count += 1
+            return target.resolve()
+        except Exception:
+            return None
+
+    def resolve(self, reference: str) -> Path | None:
+        key = reference.strip().replace("\\", "/").lower()
+        if key in self.result_cache:
+            return self.result_cache[key]
+
+        preferred = self._preferred_packages(reference)
+        hits: dict[str, object] = {}
+        chosen_packages = preferred
+        # 路径首段就是 NeoX 包身份。先逐包按优先级解析，避免旧资源同时在
+        # res 兼容池中保留另一版本时，把本应明确的 levelsets/static 判成歧义。
+        for package_name in preferred:
+            package_hits = self._record_hits(reference, (package_name,))
+            if package_hits:
+                hits = package_hits
+                chosen_packages = (package_name,)
+                break
+        if not hits:
+            hits = self._record_hits(reference)
+            chosen_packages = tuple(self.thx_sources)
+        # 精确逻辑路径若在多个包中指向不同内容，不能擅自选一个。
+        if len(hits) != 1:
+            self.result_cache[key] = None
+            return None
+        digest = next(iter(hits))
+        result = self._extract_digest(digest, chosen_packages, hits[digest])
+        self.result_cache[key] = result
+        return result
+
+    def close(self) -> None:
+        for stream in self.handles.values():
+            try:
+                stream.close()
+            except Exception:
+                pass
+        self.handles.clear()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback_value):
+        self.close()
+
+
+def _scene_reference(reference: str, anchor: str) -> str:
+    value = reference.strip().replace("\\", "/")
+    if not value:
+        return ""
+    # 清理编辑器遗留绝对路径，只接受其中 res 后面的稳定资源逻辑名。
+    drive_match = re.match(r"^[A-Za-z]:/(?:.*?/)?res/(.+)$", value, re.IGNORECASE)
+    if drive_match:
+        value = drive_match.group(1)
+    known_prefixes = (
+        "levelsets/", "lbslevelsets/", "model/", "static/", "scene/",
+        "fx/", "natural/", "res/",
+    )
+    if value.lower().startswith(known_prefixes):
+        return value
+    parent = anchor.replace("\\", "/").rsplit("/", 1)[0]
+    return f"{parent}/{value}" if parent else value
+
+
+def _scene_gim_material_reference(path: Path) -> str | None:
+    try:
+        root = ET.parse(path).getroot()
+    except (OSError, ET.ParseError, UnicodeError):
+        return None
+    for node in root.iter():
+        for key, value in node.attrib.items():
+            if key.lower() not in {"materialgroup", "materialgroupfile", "mtg"}:
+                continue
+            normalized = (value or "").strip().replace("\\", "/")
+            if normalized.lower().endswith(".mtg"):
+                return normalized
+    return None
+
+
+def _scene_materials_for_instance(
+    instance: SceneModelInstance,
+    mesh: ParsedMesh,
+    gim_path: Path,
+    resolver: SceneResourceResolver,
+) -> tuple[
+    list[MaterialDefinition], dict[str, Path], str | None, str | None
+]:
+    gim_submeshes = parse_gim_submeshes(gim_path)
+    mtg_reference = instance.material_override
+    if mtg_reference:
+        mtg_reference = _scene_reference(mtg_reference, instance.logical_gim)
+    if not mtg_reference:
+        declared = _scene_gim_material_reference(gim_path)
+        mtg_reference = (
+            _scene_reference(declared, instance.logical_gim)
+            if declared else instance.logical_gim[:-4] + ".mtg"
+        )
+    mtg_path = resolver.resolve(mtg_reference)
+    source_materials = parse_material_xml(mtg_path) if mtg_path else []
+    issue = None if source_materials else "找不到精确 MaterialGroup"
+
+    if gim_submeshes and len(gim_submeshes) == len(mesh.submeshes):
+        ordered, _ = order_materials_by_gim_partial(
+            source_materials, gim_submeshes
+        )
+    else:
+        ordered = list(source_materials[: len(mesh.submeshes)])
+    while len(ordered) < len(mesh.submeshes):
+        sub_index = len(ordered)
+        sub_name = (
+            gim_submeshes[sub_index].name
+            if sub_index < len(gim_submeshes)
+            else f"{instance.name}_材质{sub_index}"
+        )
+        ordered.append(MaterialDefinition(sub_name, {}))
+
+    textures: dict[str, Path] = {}
+    for material in ordered:
+        primary = material_primary_texture(material)
+        if not primary:
+            continue
+        logical = _scene_reference(primary, mtg_reference)
+        source = resolver.resolve(logical)
+        if source is not None:
+            # save_pmx 按材质里保留的原始键查找。
+            textures[primary] = source
+    expected_primary = len({
+        material_primary_texture(material)
+        for material in ordered
+        if material_primary_texture(material)
+    })
+    if expected_primary and len(textures) < expected_primary:
+        issue = (
+            f"主贴图未完全解析：{len(textures)}/"
+            f"{expected_primary}"
+        )
+    return ordered, textures, mtg_reference if mtg_path else None, issue
+
+
+def _scene_empty_chunk() -> dict[str, object]:
+    return {
+        "version": 2,
+        "submeshes": [],
+        "positions": [],
+        "normals": [],
+        "faces": [],
+        "uvs": [],
+        "materials": [],
+        "textures": {},
+        "instances": [],
+    }
+
+
+def _append_scene_instance(
+    chunk: dict[str, object],
+    mesh: ParsedMesh,
+    instance: SceneModelInstance,
+    materials: list[MaterialDefinition],
+    textures: dict[str, Path],
+) -> None:
+    positions: list[tuple[float, float, float]] = chunk["positions"]  # type: ignore[assignment]
+    normals: list[tuple[float, float, float]] = chunk["normals"]  # type: ignore[assignment]
+    faces: list[tuple[int, int, int]] = chunk["faces"]  # type: ignore[assignment]
+    vertex_offset = len(positions)
+    normal_matrix = _scene_normal_matrix(instance.transform)
+    positions.extend(
+        _transform_row_position(value, instance.transform)
+        for value in mesh.positions
+    )
+    for value in mesh.normals:
+        if not all(math.isfinite(item) for item in value):
+            value = (0.0, 1.0, 0.0)
+        transformed = _transform_row_normal(value, normal_matrix)
+        normals.append(
+            transformed
+            if all(math.isfinite(item) for item in transformed)
+            else (0.0, 1.0, 0.0)
+        )
+    reverse_winding = _scene_linear_determinant(instance.transform) < 0.0
+    if reverse_winding:
+        faces.extend(
+            (a + vertex_offset, c + vertex_offset, b + vertex_offset)
+            for a, b, c in mesh.faces
+        )
+    else:
+        faces.extend(
+            (a + vertex_offset, b + vertex_offset, c + vertex_offset)
+            for a, b, c in mesh.faces
+        )
+    chunk["uvs"].extend(mesh.uvs)  # type: ignore[union-attr]
+    chunk["submeshes"].extend(mesh.submeshes)  # type: ignore[union-attr]
+    # 两个不同目录的 MTG 可能都写相对 ``diffuse.tga``。PMX 的贴图表以
+    # 字符串为键，必须在实体不同时改成内部唯一键，否则后加入者会覆盖前者。
+    chunk_textures: dict[str, Path] = chunk["textures"]  # type: ignore[assignment]
+    remapped_materials: list[MaterialDefinition] = []
+    for material in materials:
+        material_textures = dict(material.textures)
+        for slot, original in list(material_textures.items()):
+            source = textures.get(original)
+            if source is None:
+                continue
+            key = original
+            existing = chunk_textures.get(key)
+            if (
+                existing is not None
+                and os.path.normcase(os.path.abspath(existing))
+                != os.path.normcase(os.path.abspath(source))
+            ):
+                suffix = hashlib.md5(str(source).encode("utf-8")).hexdigest()[:8]
+                key = f"{original}#场景{suffix}"
+                material_textures[slot] = key
+            chunk_textures[key] = source
+        remapped_materials.append(
+            MaterialDefinition(
+                material.name, material_textures, material.diffuse_color
+            )
+        )
+    chunk["materials"].extend(remapped_materials)  # type: ignore[union-attr]
+    chunk["instances"].append(instance)  # type: ignore[union-attr]
+    chunk["version"] = max(int(chunk["version"]), mesh.version)
+
+
+def _scene_chunk_mesh(chunk: dict[str, object]) -> ParsedMesh:
+    positions = list(chunk["positions"])
+    return ParsedMesh(
+        version=int(chunk["version"]),
+        submeshes=list(chunk["submeshes"]),
+        bone_parents=[-1],
+        bone_names=["__scene_root__"],
+        bone_matrices=[_SCENE_IDENTITY_MATRIX],
+        positions=positions,
+        normals=list(chunk["normals"]),
+        faces=list(chunk["faces"]),
+        uvs=list(chunk["uvs"]),
+        joints=[(0, 0, 0, 0) for _ in positions],
+        weights=[(1.0, 0.0, 0.0, 0.0) for _ in positions],
+    )
+
+
+def _optimize_scene_material_batches(chunk: dict[str, object]) -> None:
+    """按 PMX 最终可见材质合并面段，避免一实例一次 draw call。"""
+    submeshes: list[tuple[int, int, int, int]] = list(chunk["submeshes"])
+    materials: list[MaterialDefinition] = list(chunk["materials"])
+    faces: list[tuple[int, int, int]] = list(chunk["faces"])
+    texture_sources: dict[str, Path] = dict(chunk["textures"])
+    buckets: dict[
+        tuple[object, ...], tuple[MaterialDefinition, list[tuple[int, int, int]]]
+    ] = {}
+    face_offset = 0
+    for index, submesh in enumerate(submeshes):
+        face_count = submesh[1]
+        segment = faces[face_offset : face_offset + face_count]
+        face_offset += face_count
+        material = (
+            materials[index]
+            if index < len(materials)
+            else MaterialDefinition(f"材质{index}", {})
+        )
+        primary = material_primary_texture(material)
+        source = texture_sources.get(primary) if primary else None
+        if source is not None:
+            texture_identity: object = os.path.normcase(os.path.abspath(source))
+        elif primary:
+            # 未解析的两个逻辑贴图不能因为都呈白色就被误认为同一材质。
+            texture_identity = "missing:" + primary.replace("\\", "/").lower()
+        else:
+            texture_identity = None
+        color = material.diffuse_color or (1.0, 1.0, 1.0, 1.0)
+        signature = (
+            texture_identity,
+            tuple(round(float(value), 6) for value in color),
+        )
+        bucket = buckets.get(signature)
+        if bucket is None:
+            buckets[signature] = (material, list(segment))
+        else:
+            bucket[1].extend(segment)
+
+    if face_offset < len(faces):
+        material = MaterialDefinition("未分配材质", {})
+        signature = (None, (1.0, 1.0, 1.0, 1.0))
+        bucket = buckets.get(signature)
+        if bucket is None:
+            buckets[signature] = (material, list(faces[face_offset:]))
+        else:
+            bucket[1].extend(faces[face_offset:])
+
+    optimized_faces: list[tuple[int, int, int]] = []
+    optimized_submeshes: list[tuple[int, int, int, int]] = []
+    optimized_materials: list[MaterialDefinition] = []
+    for material, segment in buckets.values():
+        if not segment:
+            continue
+        optimized_faces.extend(segment)
+        optimized_submeshes.append((0, len(segment), 1, 0))
+        optimized_materials.append(material)
+    chunk["faces"] = optimized_faces
+    chunk["submeshes"] = optimized_submeshes
+    chunk["materials"] = optimized_materials
+
+
+def _scene_export_fingerprint(entry: SceneCatalogEntry, thd_dir: Path) -> str:
+    source_digest = hashlib.md5(entry.source_path.read_bytes()).hexdigest()
+    thx_stamps = [
+        _file_build_stamp(path)
+        for path in sorted(thd_dir.glob("*.thx"), key=lambda item: item.name.lower())
+    ]
+    payload = json.dumps(
+        {
+            "pipeline": SCENE_PMX_PIPELINE_VERSION,
+            "pmx": PMX_OUTPUT_FORMAT_VERSION,
+            "scene": source_digest,
+            "thx": thx_stamps,
+            "vertex_limit": SCENE_PMX_VERTEX_LIMIT,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def export_scene_pmx(
+    entry: SceneCatalogEntry,
+    output_root: Path,
+    resolver: SceneResourceResolver,
+    thd_dir: Path,
+    texture_cache: DecodedTextureCache,
+    fast_reuse: bool = True,
+    progress: Callable[[str, int, int], None] | None = None,
+) -> tuple[Path, int, int, int, bool]:
+    """导出一个摆放完成的静态场景；返回目录/分块/成功实例/失败实例/复用。"""
+    clean_name = re.sub(
+        r"[^0-9A-Za-z_\-\u4e00-\u9fff]+", "_", entry.display_name
+    ).strip("_") or "scene"
+    scene_key = hashlib.sha1(
+        str(entry.source_path).encode("utf-8", errors="replace")
+    ).hexdigest()[:8]
+    scene_output = output_root / f"{clean_name}_{scene_key}"
+    meta_path = scene_output / ".build.json"
+    fingerprint = _scene_export_fingerprint(entry, thd_dir)
+    old_metadata: dict[str, object] = {}
+    if meta_path.is_file():
+        try:
+            old_metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            old_metadata = {}
+    old_outputs = [
+        scene_output / str(value)
+        for value in old_metadata.get("outputs", [])
+        if isinstance(value, str)
+    ]
+    if (
+        fast_reuse
+        and old_metadata.get("fingerprint") == fingerprint
+        and int(old_metadata.get("failed_instances", 0)) == 0
+        and int(old_metadata.get("resource_warnings", 0)) == 0
+        and old_outputs
+        and all(path.is_file() for path in old_outputs)
+    ):
+        return (
+            scene_output,
+            len(old_outputs),
+            int(old_metadata.get("resolved_instances", 0)),
+            int(old_metadata.get("failed_instances", 0)),
+            True,
+        )
+
+    instances = load_scene_instances(entry)
+    mesh_cache: dict[str, tuple[Path, ParsedMesh, Path] | None] = {}
+    material_cache: dict[
+        tuple[str, str], tuple[
+            list[MaterialDefinition], dict[str, Path], str | None, str | None
+        ]
+    ] = {}
+    chunks: list[dict[str, object]] = []
+    chunk = _scene_empty_chunk()
+    layout_rows: list[dict[str, object]] = []
+    missing_rows: list[list[object]] = []
+    resolved_count = 0
+    failed_instance_count = 0
+    resource_warning_count = 0
+
+    for number, instance in enumerate(instances, 1):
+        reason = ""
+        mesh_path: Path | None = None
+        mtg_reference: str | None = None
+        try:
+            cached_mesh = mesh_cache.get(instance.logical_gim)
+            if instance.logical_gim not in mesh_cache:
+                gim_path = resolver.resolve(instance.logical_gim)
+                if gim_path is None:
+                    mesh_cache[instance.logical_gim] = None
+                else:
+                    declared_mesh = parse_gim_mesh_reference(gim_path)
+                    mesh_reference = (
+                        _scene_reference(declared_mesh, instance.logical_gim)
+                        if declared_mesh
+                        else instance.logical_gim[:-4] + ".mesh"
+                    )
+                    mesh_path = resolver.resolve(mesh_reference)
+                    if mesh_path is None:
+                        mesh_cache[instance.logical_gim] = None
+                    else:
+                        parsed_mesh = parse_mesh(mesh_path)
+                        if any(
+                            not all(math.isfinite(value) for value in position)
+                            for position in parsed_mesh.positions
+                        ):
+                            mesh_cache[instance.logical_gim] = None
+                        else:
+                            mesh_cache[instance.logical_gim] = (
+                                gim_path, parsed_mesh, mesh_path
+                            )
+                cached_mesh = mesh_cache.get(instance.logical_gim)
+            if cached_mesh is None:
+                raise MeshFormatError("找不到精确 GIM 或 Mesh")
+            gim_path, mesh, mesh_path = cached_mesh
+            if abs(_scene_linear_determinant(instance.transform)) <= 1e-10:
+                raise MeshFormatError("实例变换矩阵不可逆")
+
+            material_key = (
+                instance.logical_gim.lower(),
+                (instance.material_override or "").replace("\\", "/").lower(),
+            )
+            cached_material = material_cache.get(material_key)
+            if cached_material is None:
+                cached_material = _scene_materials_for_instance(
+                    instance, mesh, gim_path, resolver
+                )
+                material_cache[material_key] = cached_material
+            materials, textures, mtg_reference, material_issue = cached_material
+
+            if (
+                chunk["positions"]
+                and len(chunk["positions"]) + len(mesh.positions)
+                > SCENE_PMX_VERTEX_LIMIT
+            ):
+                chunks.append(chunk)
+                chunk = _scene_empty_chunk()
+            chunk_index = len(chunks) + 1
+            _append_scene_instance(chunk, mesh, instance, materials, textures)
+            resolved_count += 1
+            if material_issue:
+                resource_warning_count += 1
+                missing_rows.append(
+                    [
+                        "材质/贴图", instance.name, instance.uuid,
+                        instance.logical_gim, instance.material_override or "",
+                        material_issue,
+                    ]
+                )
+            layout_rows.append(
+                {
+                    "name": instance.name,
+                    "uuid": instance.uuid,
+                    "gim": instance.logical_gim,
+                    "mesh": str(mesh_path),
+                    "material_group": mtg_reference,
+                    "component_group": instance.component_group,
+                    "chunk": chunk_index,
+                    "source_transform": list(instance.transform),
+                    "pmx_coordinate_rule": "(-x, y, -z)",
+                    "status": (
+                        f"ok; {material_issue}" if material_issue else "ok"
+                    ),
+                }
+            )
+        except Exception as exc:
+            reason = f"{type(exc).__name__}: {exc}"
+            failed_instance_count += 1
+            missing_rows.append(
+                [
+                    "几何", instance.name, instance.uuid,
+                    instance.logical_gim, instance.material_override or "", reason,
+                ]
+            )
+            layout_rows.append(
+                {
+                    "name": instance.name,
+                    "uuid": instance.uuid,
+                    "gim": instance.logical_gim,
+                    "mesh": str(mesh_path) if mesh_path else None,
+                    "material_group": mtg_reference,
+                    "component_group": instance.component_group,
+                    "chunk": None,
+                    "source_transform": list(instance.transform),
+                    "pmx_coordinate_rule": "(-x, y, -z)",
+                    "status": reason,
+                }
+            )
+        if progress and (number % 10 == 0 or number == len(instances)):
+            progress("解析并摆放模型", number, len(instances))
+    if chunk["positions"]:
+        chunks.append(chunk)
+    if not chunks:
+        raise RuntimeError(f"{entry.display_name} 没有可导出的模型实例")
+
+    for current in chunks:
+        _optimize_scene_material_batches(current)
+
+    scene_output.mkdir(parents=True, exist_ok=True)
+    materialized: dict[tuple[str, str], Path] = {}
+    texture_total = len({
+        (original, str(source))
+        for current in chunks
+        for original, source in current["textures"].items()
+    })
+    texture_done = 0
+    output_paths: list[Path] = []
+    for index, current in enumerate(chunks, 1):
+        texture_files: dict[str, Path] = {}
+        for original, source in current["textures"].items():
+            cache_key = (original, str(source))
+            png_path = materialized.get(cache_key)
+            if png_path is None:
+                clean_texture = re.sub(
+                    r"[^0-9A-Za-z_\-\u4e00-\u9fff]+",
+                    "_",
+                    Path(original.replace("\\", "/")).stem,
+                ).strip("_") or "texture"
+                suffix = hashlib.md5(str(source).encode("utf-8")).hexdigest()[:8]
+                png_path = scene_output / "textures" / f"{clean_texture}_{suffix}.png"
+                if source.suffix.lower() == ".png":
+                    png_path.parent.mkdir(parents=True, exist_ok=True)
+                    if not png_path.is_file():
+                        shutil.copyfile(source, png_path)
+                else:
+                    texture_cache.materialize(source.read_bytes(), png_path)
+                materialized[cache_key] = png_path
+                texture_done += 1
+                if progress:
+                    progress("解码场景贴图", texture_done, texture_total)
+            texture_files[original] = png_path
+
+        pmx_name = (
+            f"{clean_name}.pmx" if len(chunks) == 1
+            else f"{clean_name}_分块{index:03d}.pmx"
+        )
+        pmx_path = scene_output / pmx_name
+        save_pmx(
+            _scene_chunk_mesh(current),
+            pmx_path,
+            clean_name if len(chunks) == 1 else f"{clean_name}_分块{index:03d}",
+            list(current["materials"]),
+            texture_files,
+        )
+        output_paths.append(pmx_path)
+        if progress:
+            progress("写入 PMX 分块", index, len(chunks))
+
+    layout_path = scene_output / "场景布局.json"
+    layout_path.write_text(
+        json.dumps(
+            {
+                "scene": entry.display_name,
+                "content_path": entry.content_path,
+                "source_xml": str(entry.source_path),
+                "source_coordinate": "NeoX row-vector",
+                "pmx_coordinate_rule": "(-x, y, -z)",
+                "vertex_limit_per_chunk": SCENE_PMX_VERTEX_LIMIT,
+                "instances": layout_rows,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    missing_path = scene_output / "缺失资源.csv"
+    with missing_path.open("w", newline="", encoding="utf-8-sig") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(["类型", "实例名", "UUID", "GIM", "材质覆盖", "原因"])
+        writer.writerows(missing_rows)
+
+    current_set = {path.resolve() for path in output_paths}
+    for old_path in old_outputs:
+        try:
+            if old_path.resolve() not in current_set and old_path.is_file():
+                old_path.unlink()
+        except OSError:
+            pass
+    meta_path.write_text(
+        json.dumps(
+            {
+                "fingerprint": fingerprint,
+                "pipeline": SCENE_PMX_PIPELINE_VERSION,
+                "outputs": [path.name for path in output_paths],
+                "resolved_instances": resolved_count,
+                "failed_instances": failed_instance_count,
+                "resource_warnings": resource_warning_count,
+                "source_scene": str(entry.source_path),
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return (
+        scene_output, len(output_paths), resolved_count, len(missing_rows), False
+    )
+
+
 def install_pmx_dependency() -> None:
     subprocess.check_call(
         [
@@ -14467,11 +15589,103 @@ def human_size(value: int) -> str:
     return f"{value / (1024 * 1024):.1f} MB"
 
 
+class SceneSelectionDialog(tk.Toplevel):
+    def __init__(self, parent: tk.Misc, entries: list[SceneCatalogEntry]):
+        super().__init__(parent)
+        self.title("选择要导出的场景")
+        self.geometry("960x620")
+        self.minsize(720, 420)
+        self.transient(parent)
+        self.entries = entries
+        self.visible_entries: list[SceneCatalogEntry] = []
+        self.result: list[SceneCatalogEntry] = []
+        self.search_var = tk.StringVar()
+
+        top = ttk.Frame(self)
+        top.pack(fill="x", padx=10, pady=10)
+        ttk.Label(top, text="搜索内部场景路径").pack(side="left")
+        search = ttk.Entry(top, textvariable=self.search_var)
+        search.pack(side="left", fill="x", expand=True, padx=(8, 0))
+        self.search_var.trace_add("write", lambda *_args: self._refresh())
+
+        table = ttk.Frame(self)
+        table.pack(fill="both", expand=True, padx=10)
+        columns = ("name", "models", "groups", "effects")
+        self.tree = ttk.Treeview(
+            table,
+            columns=columns,
+            show="headings",
+            selectmode="extended",
+        )
+        self.tree.heading("name", text="内部场景路径")
+        self.tree.heading("models", text="模型实例")
+        self.tree.heading("groups", text="组件组")
+        self.tree.heading("effects", text="特效（仅报告）")
+        self.tree.column("name", width=610, anchor="w")
+        self.tree.column("models", width=90, anchor="center")
+        self.tree.column("groups", width=80, anchor="center")
+        self.tree.column("effects", width=100, anchor="center")
+        scrollbar = ttk.Scrollbar(table, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scrollbar.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        self.tree.bind("<Double-1>", lambda _event: self._accept())
+
+        bottom = ttk.Frame(self)
+        bottom.pack(fill="x", padx=10, pady=10)
+        ttk.Label(
+            bottom,
+            text="可按 Ctrl/Shift 多选；大场景会自动拆成保持同一坐标原点的 PMX。",
+        ).pack(side="left")
+        ttk.Button(bottom, text="取消", command=self.destroy).pack(side="right")
+        ttk.Button(bottom, text="导出所选", command=self._accept).pack(
+            side="right", padx=(0, 8)
+        )
+
+        self._refresh()
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self.grab_set()
+        search.focus_set()
+
+    def _refresh(self) -> None:
+        query = self.search_var.get().strip().lower()
+        self.visible_entries = [
+            entry for entry in self.entries
+            if not query
+            or query in entry.display_name.lower()
+            or query in entry.content_path.lower()
+        ]
+        self.tree.delete(*self.tree.get_children())
+        for index, entry in enumerate(self.visible_entries):
+            self.tree.insert(
+                "", "end", iid=str(index),
+                values=(
+                    entry.display_name,
+                    entry.model_count,
+                    entry.component_group_count,
+                    entry.effect_count,
+                ),
+            )
+
+    def _accept(self) -> None:
+        selected: list[SceneCatalogEntry] = []
+        for item in self.tree.selection():
+            try:
+                selected.append(self.visible_entries[int(item)])
+            except (ValueError, IndexError):
+                continue
+        if not selected:
+            messagebox.showinfo(APP_TITLE, "请先选择至少一个场景。", parent=self)
+            return
+        self.result = selected
+        self.destroy()
+
+
 class RiggedMeshApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_TITLE)
-        self.geometry("900x570")
+        self.geometry("980x590")
         self.minsize(760, 500)
 
         root = Path(__file__).resolve().parent
@@ -14526,11 +15740,17 @@ class RiggedMeshApp(tk.Tk):
             actions, text="一键解包带贴图 PMX", command=self.start_one_click
         )
         textured_button.pack(side="left", fill="x", expand=True, padx=8, pady=10)
+        scene_button = ttk.Button(
+            actions, text="解包带贴图场景 PMX", command=self.start_scene_pmx
+        )
+        scene_button.pack(side="left", fill="x", expand=True, padx=8, pady=10)
         install_button = ttk.Button(
             actions, text="安装依赖", command=self.start_install
         )
         install_button.pack(side="left", padx=8, pady=10)
-        self.action_buttons = [white_button, textured_button, install_button]
+        self.action_buttons = [
+            white_button, textured_button, scene_button, install_button
+        ]
 
         status = ttk.Frame(self)
         status.pack(fill="x", **pad)
@@ -14545,7 +15765,8 @@ class RiggedMeshApp(tk.Tk):
         self.log.pack(fill="both", expand=True, padx=5, pady=5)
         self._log(
             "选择完整 yys 目录（也兼容 cloudfilesys3/res）。“PMX 白模”只解包并转换"
-            "模型；“带贴图 PMX”会继续分析 THD、恢复材质贴图并组合确定附件。"
+            "模型；“带贴图 PMX”会继续分析 THD、恢复材质贴图并组合确定附件；"
+            "“场景 PMX”按 SCN 中的原始位置、旋转、缩放还原静态场景。"
         )
 
     def choose_input(self):
@@ -14734,6 +15955,199 @@ class RiggedMeshApp(tk.Tk):
             if 0 <= index < len(self.visible_rows):
                 rows.append(self.visible_rows[index])
         return rows
+
+    def start_scene_pmx(self):
+        selected_input = Path(self.input_var.get()).resolve()
+        source_root, _model_folder = resolve_source_and_model_folder(selected_input)
+        unpacked_root = Path(__file__).resolve().parent / "unpacked"
+        cached_scene = unpacked_root / "scene"
+        if source_root is None and not any(cached_scene.rglob("*.xml")):
+            messagebox.showerror(
+                APP_TITLE,
+                "请选择完整 yys 目录，或先准备工具旁的 unpacked/scene 场景缓存。",
+            )
+            return
+
+        def worker():
+            payload = None
+            try:
+                try:
+                    import pymeshio  # noqa: F401
+                    import astc_encoder.pil_codec  # noqa: F401
+                    from PIL import Image  # noqa: F401
+                except ImportError:
+                    self.events.put(("log", "首次运行：正在安装场景 PMX 与贴图依赖……"))
+                    self.events.put(("status", "正在安装依赖"))
+                    install_pmx_dependency()
+
+                scene_root = ensure_scene_cache(
+                    source_root,
+                    unpacked_root,
+                    log=lambda text: self.events.put(("log", text)),
+                    progress=lambda stem, done, total: (
+                        self.events.put((
+                            "progress", done * 100 / total if total else 100
+                        )),
+                        self.events.put((
+                            "status", f"准备场景资源 {stem} {done}/{total}"
+                        )),
+                    ),
+                )
+                self.events.put(("status", "正在建立场景清单"))
+                entries = scan_scene_catalog(
+                    scene_root,
+                    progress=lambda done, total: (
+                        self.events.put((
+                            "progress", done * 100 / total if total else 100
+                        )),
+                        self.events.put((
+                            "status", f"扫描场景 {done}/{total}"
+                        )),
+                    ),
+                )
+                if not entries:
+                    raise RuntimeError("没有找到包含模型实例的 SCN 场景")
+
+                thd_dir = source_root.parent / "thd" if source_root else None
+                if thd_dir is None or not (thd_dir / "scene.thx").is_file():
+                    candidates = list(selected_input.rglob("scene.thx"))
+                    if not candidates:
+                        candidates = list(
+                            (Path(__file__).resolve().parent / "yys").rglob(
+                                "scene.thx"
+                            )
+                        )
+                    thd_dir = candidates[0].parent if candidates else None
+                if thd_dir is None:
+                    raise RuntimeError("找不到 cloudfilesys3/thd/scene.thx")
+                self.events.put((
+                    "log",
+                    f"场景清单完成：{len(entries):,} 个可导出场景。",
+                ))
+                payload = (entries, source_root, thd_dir.resolve())
+            except Exception:
+                self.events.put(("error", traceback.format_exc()))
+            finally:
+                self.events.put(("busy", False))
+            if payload is not None:
+                self.events.put(("scene_catalog_ready", payload))
+
+        self._run_worker(worker)
+
+    def _choose_scene_entries(
+        self,
+        entries: list[SceneCatalogEntry],
+        source_root: Path | None,
+        thd_dir: Path,
+    ) -> None:
+        dialog = SceneSelectionDialog(self, entries)
+        self.wait_window(dialog)
+        if dialog.result:
+            self._start_scene_export(dialog.result, source_root, thd_dir)
+
+    def _start_scene_export(
+        self,
+        entries: list[SceneCatalogEntry],
+        source_root: Path | None,
+        thd_dir: Path,
+    ) -> None:
+        selected_output = Path(self.output_var.get()).resolve()
+        fast_reuse = bool(self.fast_reuse_var.get())
+        unpacked_root = Path(__file__).resolve().parent / "unpacked"
+
+        def worker():
+            try:
+                output_root = selected_output / "场景PMX"
+                output_root.mkdir(parents=True, exist_ok=True)
+                texture_cache = DecodedTextureCache(
+                    unpacked_root / "decoded_png_cache"
+                )
+                total_scenes = len(entries)
+                generated = reused = failed_scenes = 0
+                total_instances = missing_instances = total_chunks = 0
+                self.events.put(("status", "正在建立场景资源索引"))
+                self.events.put((
+                    "log",
+                    "正在读取 THX 与解包清单；只按需补取所选场景引用的资源。",
+                ))
+                with SceneResourceResolver(
+                    thd_dir,
+                    source_root,
+                    unpacked_root,
+                    log=lambda text: self.events.put(("log", text)),
+                ) as resolver:
+                    for scene_number, entry in enumerate(entries, 1):
+                        self.events.put((
+                            "log",
+                            f"开始场景 {scene_number}/{total_scenes}："
+                            f"{entry.display_name}（{entry.model_count:,} 个实例）",
+                        ))
+
+                        def report_stage(label: str, done: int, total: int) -> None:
+                            inner = done / total if total else 1.0
+                            overall = (
+                                (scene_number - 1 + inner) * 100 / total_scenes
+                            )
+                            self.events.put(("progress", overall))
+                            self.events.put((
+                                "status",
+                                f"场景 {scene_number}/{total_scenes} · "
+                                f"{label} {done}/{total}",
+                            ))
+
+                        try:
+                            folder, chunks, resolved, missing, was_reused = (
+                                export_scene_pmx(
+                                    entry,
+                                    output_root,
+                                    resolver,
+                                    thd_dir,
+                                    texture_cache,
+                                    fast_reuse=fast_reuse,
+                                    progress=report_stage,
+                                )
+                            )
+                            total_chunks += chunks
+                            total_instances += resolved
+                            missing_instances += missing
+                            if was_reused:
+                                reused += 1
+                            else:
+                                generated += 1
+                            self.events.put((
+                                "log",
+                                f"场景完成：{entry.display_name}；分块 {chunks}，"
+                                f"实例 {resolved}，缺失 {missing}；输出 {folder}",
+                            ))
+                        except Exception as exc:
+                            failed_scenes += 1
+                            self.events.put((
+                                "log",
+                                f"[场景失败] {entry.display_name}: "
+                                f"{type(exc).__name__}: {exc}",
+                            ))
+                        self.events.put((
+                            "progress", scene_number * 100 / total_scenes
+                        ))
+
+                    targeted = resolver.extracted_count
+
+                summary = (
+                    f"场景 PMX 完成：新生成 {generated}，增量复用 {reused}，"
+                    f"失败场景 {failed_scenes}；共 {total_chunks} 个 PMX 分块，"
+                    f"成功摆放 {total_instances:,} 个实例，缺失 {missing_instances:,} 个。\n"
+                    f"按需补取资源 {targeted:,} 个。\n输出：{output_root}"
+                )
+                self.events.put(("progress", 100))
+                self.events.put(("status", "场景 PMX 导出完成"))
+                self.events.put(("log", summary.replace("\n", "；")))
+                self.events.put(("done_message", summary))
+            except Exception:
+                self.events.put(("error", traceback.format_exc()))
+            finally:
+                self.events.put(("busy", False))
+
+        self._run_worker(worker)
 
     def start_white_pmx(self):
         """一键增量解包全部可用 Mesh，并输出不做材质匹配的 PMX 白模。"""
@@ -16303,6 +17717,9 @@ class RiggedMeshApp(tk.Tk):
                     )
                 elif kind == "done_message":
                     messagebox.showinfo(APP_TITLE, str(payload))
+                elif kind == "scene_catalog_ready":
+                    entries, source_root, thd_dir = payload
+                    self._choose_scene_entries(entries, source_root, thd_dir)
                 elif kind == "error":
                     self._log(str(payload))
                     messagebox.showerror(APP_TITLE, "任务失败，详情见日志。")
