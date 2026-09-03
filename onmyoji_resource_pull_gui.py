@@ -6,6 +6,7 @@ import queue
 import shlex
 import shutil
 import subprocess
+import sys
 import threading
 import tkinter as tk
 from pathlib import Path, PurePosixPath
@@ -348,6 +349,10 @@ class ResourcePullApp:
             actions, text="增量拉取更新", command=self.start_incremental_pull
         )
         self.incremental_button.pack(side="left")
+        self.update_button = ttk.Button(
+            actions, text="更新项目", command=self.update_project
+        )
+        self.update_button.pack(side="left", padx=(8, 0))
         self.cancel_button = ttk.Button(
             actions, text="停止", command=self.cancel, state="disabled"
         )
@@ -432,6 +437,7 @@ class ResourcePullApp:
         self.connect_button.configure(state=button_state)
         self.pull_button.configure(state=button_state)
         self.incremental_button.configure(state=button_state)
+        self.update_button.configure(state=button_state)
         self.cancel_button.configure(state="normal" if value else "disabled")
         if value:
             self.progress.start(12)
@@ -807,6 +813,47 @@ class ResourcePullApp:
 
         self.start_worker(worker, "正在检查增量更新…")
 
+    def update_project(self) -> None:
+        if not messagebox.askokcancel(
+            "更新项目",
+            "将从 GitHub 拉取项目最新内容。更新成功后程序会自动重启。\n\n"
+            "请先停止其他正在编辑或运行的项目文件。",
+        ):
+            return
+
+        def worker() -> None:
+            try:
+                code, output = self.run_command(
+                    ["git", "pull", "--ff-only", "origin", "main"],
+                    cwd=APP_DIR,
+                )
+                if code != 0:
+                    raise RuntimeError(output.strip() or "GitHub 更新失败。")
+                self.events.put(("restart", "项目更新完成，正在重启…"))
+            except OSError as exc:
+                self.events.put(("error", f"无法执行 Git 更新，请确认已安装 Git：{exc}"))
+            except Exception as exc:
+                self.events.put(("error", str(exc)))
+
+        self.start_worker(worker, "正在从 GitHub 更新项目…")
+
+    def restart_application(self) -> None:
+        self.save_settings()
+        script = Path(sys.argv[0]).resolve()
+        command = [sys.executable, str(script), *sys.argv[1:]]
+        try:
+            subprocess.Popen(
+                command,
+                cwd=str(APP_DIR),
+                creationflags=subprocess_flags(),
+            )
+        except OSError as exc:
+            self.set_busy(False, "项目已更新，但自动重启失败。")
+            self.append_log(f"错误：{exc}")
+            messagebox.showerror("重启失败", f"项目已更新，请手动重新启动工具。\n\n{exc}")
+            return
+        self.root.after(150, self.root.destroy)
+
     def cancel(self) -> None:
         self.cancel_requested = True
         process = self.current_process
@@ -850,6 +897,10 @@ class ResourcePullApp:
                     self.on_device_selected()
             elif kind == "remote":
                 self.remote_var.set(str(value))
+            elif kind == "restart":
+                self.set_busy(False, str(value))
+                self.append_log(str(value))
+                self.restart_application()
             elif kind == "done":
                 self.set_busy(False, str(value))
                 self.append_log(str(value))
