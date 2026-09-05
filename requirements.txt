@@ -5,4 +5,4 @@ cryptography
 zstandard
 numpy
 moderngl
-
+lz4

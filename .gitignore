@@ -1,7 +1,9 @@
 # Game assets and generated data (never publish these)
 /yys/
 /unpacked/
+/unpacked_npk/
 /rigged_models/
+/rigged_models_npk/
 /backup/
 /tj-tool-lite/
 *.apk
@@ -10,6 +12,12 @@
 __pycache__/
 *.py[cod]
 *.log
+*.obj
+/.motion_cache/
+/.tmp_*/
+/resdb_decomp.bin
+tools/*.nanim
+tools/test_*.vmd
 /.resource_pull_settings.json
 /.agents/
 /nul

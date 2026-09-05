@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shutil
+import struct
 import sys
 import threading
 from collections import OrderedDict
@@ -164,6 +165,64 @@ def _attach_role_metadata(root: Path, items: list[PreviewItem]) -> list[PreviewI
     return items
 
 
+def _attach_source_metadata(root: Path, items: list[PreviewItem]) -> list[PreviewItem]:
+    """Fill source size/order for items found by walking output directories.
+
+    Report-backed modes already receive this data in ``_read_report_items``.
+    Directory-backed modes (notably "all PMX" and category fallbacks) used to
+    leave every size at zero, which made the source-size sort a no-op.
+    """
+    by_path: dict[str, tuple[int, str, int]] = {}
+    report_names = (
+        "纹理恢复报告.csv",
+        "成品模型报告.csv",
+        "完整组合报告.csv",
+        *REPORT_MODES.values(),
+    )
+    for report_name in dict.fromkeys(report_names):
+        report = root / report_name
+        if not report.is_file():
+            continue
+        try:
+            with report.open("r", newline="", encoding="utf-8-sig") as stream:
+                for row in csv.DictReader(stream):
+                    raw_path = (row.get("PMX") or "").strip()
+                    if not raw_path:
+                        continue
+                    path = Path(raw_path)
+                    if not path.is_absolute():
+                        path = root / path
+                    try:
+                        source_size = int(row.get("源Mesh大小", "0") or 0)
+                    except ValueError:
+                        source_size = 0
+                    source_mesh = (row.get("源Mesh") or "").strip()
+                    metadata = (
+                        source_size,
+                        source_mesh,
+                        _source_order(source_mesh),
+                    )
+                    key = _path_key(path)
+                    previous = by_path.get(key)
+                    if previous is None or metadata[0] > previous[0]:
+                        by_path[key] = metadata
+        except (OSError, UnicodeError, csv.Error):
+            continue
+
+    for item in items:
+        metadata = by_path.get(_path_key(item.path))
+        if metadata is None:
+            continue
+        source_size, source_mesh, source_order = metadata
+        if not item.source_size:
+            item.source_size = source_size
+        if not item.source_mesh:
+            item.source_mesh = source_mesh
+        if item.source_order < 0:
+            item.source_order = source_order
+    return items
+
+
 def _scene_root_from(root: Path) -> Path | None:
     """从场景目录、总输出目录或角色 PMX 目录定位场景 PMX 根目录。"""
     root = root.resolve()
@@ -243,8 +302,60 @@ def catalog_role_names(root: Path) -> list[str]:
     return sorted({role for _rarity, role in catalog_classifications(root)}, key=str.lower)
 
 
-def copy_model_folder(source: Path, destination_root: Path) -> Path:
-    """把整个模型目录复制到目标目录；同名时保留双方并给新副本加序号。"""
+def _write_uncompressed_dds(source: Path, target: Path) -> None:
+    """Write an exact RGBA8 DDS copy without depending on external texconv."""
+    with Image.open(source) as image:
+        rgba = image.convert("RGBA")
+        width, height = rgba.size
+        # DDS_HEADER (124 bytes), followed by an uncompressed RGBA pixel mask.
+        header = bytearray(124)
+        struct.pack_into(
+            "<7I",
+            header,
+            0,
+            124,
+            0x0002100F,  # CAPS | HEIGHT | WIDTH | PIXELFORMAT
+            height,
+            width,
+            width * 4,
+            0,
+            0,
+        )
+        struct.pack_into("<I", header, 76, 32)  # DDS_PIXELFORMAT.size
+        struct.pack_into("<I", header, 80, 0x41)  # RGB | ALPHAPIXELS
+        struct.pack_into(
+            "<5I", header, 88, 32,
+            0x00FF0000, 0x0000FF00, 0x000000FF, 0xFF000000,
+        )
+        struct.pack_into("<I", header, 108, 0x1000)  # DDSCAPS_TEXTURE
+        # DDS uses BGRA byte order for these masks; rows remain top-to-bottom.
+        pixels = bytearray(rgba.tobytes())
+        for offset in range(0, len(pixels), 4):
+            pixels[offset], pixels[offset + 2] = pixels[offset + 2], pixels[offset]
+        target.write_bytes(b"DDS " + bytes(header) + bytes(pixels))
+
+
+def _add_dds_copies(target: Path) -> int:
+    """Add lossless DDS companions for ordinary image files in a model copy."""
+    textures = target / "textures"
+    if not textures.is_dir():
+        return 0
+    created = 0
+    for source in textures.iterdir():
+        if not source.is_file() or source.suffix.lower() not in {".png", ".jpg", ".jpeg", ".bmp", ".tga"}:
+            continue
+        output = source.with_suffix(".dds")
+        if output.exists():
+            continue
+        _write_uncompressed_dds(source, output)
+        created += 1
+    return created
+
+
+def copy_model_folder(
+    source: Path, destination_root: Path, texture_format: str = "default"
+) -> tuple[Path, int]:
+    """Copy a model folder and optionally add exact DDS texture companions."""
     source = source.resolve()
     destination_root = destination_root.resolve()
     if not source.is_dir():
@@ -258,7 +369,8 @@ def copy_model_folder(source: Path, destination_root: Path) -> Path:
         target = destination_root / f"{source.name}_{suffix}"
         suffix += 1
     shutil.copytree(source, target)
-    return target
+    dds_count = _add_dds_copies(target) if texture_format == "dds" else 0
+    return target, dds_count
 
 
 def _read_report_items(
@@ -382,7 +494,8 @@ def _discover_items(root: Path, mode: str) -> list[PreviewItem]:
 
 
 def discover_items(root: Path, mode: str) -> list[PreviewItem]:
-    return _attach_role_metadata(root, _discover_items(root, mode))
+    items = _attach_source_metadata(root, _discover_items(root, mode))
+    return _attach_role_metadata(root, items)
 
 
 def _rgb(value, default: tuple[int, int, int]) -> tuple[int, int, int]:
@@ -413,8 +526,10 @@ def _load_texture_pixels(
         return None, None
 
 
-def load_preview(path: Path) -> PreviewData:
-    model = pymeshio.pmx.reader.read_from_file(str(path))
+def load_preview(path: Path, model=None) -> PreviewData:
+    """Build preview buffers, optionally reusing an already parsed PMX model."""
+    if model is None:
+        model = pymeshio.pmx.reader.read_from_file(str(path))
     positions = np.asarray(
         [
             (vertex.position.x, vertex.position.y, vertex.position.z)
@@ -678,6 +793,17 @@ class GpuPreviewRenderer:
             protected.add(key)
         self._trim_texture_cache(protected)
 
+    def update_positions(self, positions: np.ndarray) -> None:
+        """Update an already prepared mesh for lightweight animation preview."""
+        if self.data is None or self.vbo is None:
+            raise RuntimeError("GPU 模型尚未准备")
+        if positions.shape != self.data.positions.shape:
+            raise ValueError("动画顶点数量与 PMX 不一致")
+        packed = np.ascontiguousarray(
+            np.column_stack((positions, self.data.uvs)), dtype=np.float32
+        )
+        self.vbo.write(packed.tobytes())
+
     def _ensure_fbo(self, width: int, height: int) -> None:
         if self.fbo_size == (width, height):
             return
@@ -841,6 +967,7 @@ class PmxPreviewApp(tk.Tk):
         self.gpu_renderer: GpuPreviewRenderer | None = None
         self.gpu_error = ""
         self.last_export_dir: Path | None = None
+        self.last_export_texture_format = "default"
 
         self._build_ui()
         try:
@@ -1516,6 +1643,12 @@ class PmxPreviewApp(tk.Tk):
         if not value:
             return
         self.last_export_dir = Path(value).resolve()
+        use_dds = messagebox.askyesno(
+            APP_TITLE,
+            "导出贴图格式？\n\n是：在 textures 中额外生成无压缩 DDS（保留原 PNG）\n否：保持模型目录原有贴图格式",
+            parent=self,
+        )
+        self.last_export_texture_format = "dds" if use_dds else "default"
         self.item_menu.entryconfigure("导出到上次选择目录", state="normal")
         self._export_current_model_folder(self.last_export_dir)
 
@@ -1544,8 +1677,10 @@ class PmxPreviewApp(tk.Tk):
 
         def worker() -> None:
             try:
-                target = copy_model_folder(source, destination_root)
-                self.after(0, lambda: self._finish_folder_export(target))
+                target, dds_count = copy_model_folder(
+                    source, destination_root, self.last_export_texture_format
+                )
+                self.after(0, lambda: self._finish_folder_export(target, dds_count))
             except Exception as exc:
                 error_message = f"导出模型文件夹失败：\n{type(exc).__name__}: {exc}"
                 self.after(
@@ -1555,11 +1690,16 @@ class PmxPreviewApp(tk.Tk):
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _finish_folder_export(self, target: Path) -> None:
+    def _finish_folder_export(self, target: Path, dds_count: int = 0) -> None:
         self.status_var.set(f"已导出模型文件夹：{target}")
+        detail = (
+            f"\n\n已生成无压缩 DDS：{dds_count} 张（原 PNG 已保留，PMX 仍引用 PNG）。"
+            if dds_count
+            else ""
+        )
         messagebox.showinfo(
             APP_TITLE,
-            f"已复制整个模型文件夹：\n{target}",
+            f"已复制整个模型文件夹：\n{target}{detail}",
             parent=self,
         )
 

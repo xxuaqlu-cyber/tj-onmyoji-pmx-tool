@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 r"""
-阴阳师 WPK 解包结果：角色/静态道具 Mesh 与 PMX 转换器
+阴阳师 WPK / 旧版 NPK：角色/静态道具 Mesh 与 PMX 转换器
 
 默认扫描：
-    当前脚本目录\unpacked\model
+    新版：当前脚本目录\unpacked\model
+    旧版：当前脚本目录\unpacked_npk\model
 
 Mesh 类型：
     bone_exist(uint32) != 0 为带骨模型；bone_exist == 0 为合法静态道具/附件，
@@ -22,6 +23,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import io
 import json
 import math
 import os
@@ -39,7 +41,7 @@ import zipfile
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterable
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -48,10 +50,10 @@ from tkinter import filedialog, messagebox, ttk
 APP_TITLE = "阴阳师 PMX 一键解包工具"
 # 这里只表示 PMX 文件本身的输出兼容版本。材质匹配规则、报告格式或 GUI
 # 调整不应修改它，否则所有 .build.json 会同时失效并触发一次全量重写。
-PMX_OUTPUT_FORMAT_VERSION = 32
+PMX_OUTPUT_FORMAT_VERSION = 33
 # 材质 resolver 的输入/规则兼容版本。只在匹配逻辑会改变最终材质包时递增；
 # GUI、报告和预览器调整不得递增。
-MATERIAL_RESOLVER_VERSION = 41
+MATERIAL_RESOLVER_VERSION = 43
 # 主体/附件组合发现规则版本；只影响“完整组合”，不抬高 PMX 文件格式版本。
 COMPOSITE_RESOLVER_VERSION = 6
 # 场景 PMX 的布局烘焙版本。只在 SCN 层级、坐标变换、分块或场景材质
@@ -69,6 +71,10 @@ _ORPHAN_MANIFEST_CACHE: dict[
 ] = {}
 _PMX_BUILD_OUTPUT_CACHE: dict[str, dict[str, list[Path]]] = {}
 TRUSTED_MATERIAL_CONFIDENCE = frozenset({
+    "旧NPK物理组精确",
+    "旧NPK物理组精确主贴图",
+    "旧NPK几何组精确",
+    "旧NPK几何组精确主贴图",
     "hot-update-directory-exact",
     "hot-update-directory-exact-main-texture",
     "THD-logical-family-GIM-exact",
@@ -235,6 +241,7 @@ class SkeletonHierarchy:
     bone_names: tuple[str, ...]
     bone_keys: tuple[str, ...]
     bone_parents: tuple[int, ...]
+    bone_bind_transforms: tuple[tuple[float, ...], ...] = ()
 
 
 @dataclass(slots=True)
@@ -287,6 +294,8 @@ def material_primary_texture(material: MaterialDefinition) -> str | None:
 class GimSubmesh:
     name: str
     material_index: int
+    bounding_center: tuple[float, float, float] | None = None
+    bounding_half: tuple[float, float, float] | None = None
 
 
 @dataclass(slots=True)
@@ -649,6 +658,7 @@ def read_skeleton_hierarchy(path: Path) -> SkeletonHierarchy | None:
     bone_count = len(bone_names)
     expected_parent_offset = data_marker + 16 + bone_count * 4
     candidates: dict[tuple[int, ...], tuple[int, int, int]] = {}
+    parent_positions: dict[tuple[int, ...], int] = {}
     for delta in range(-16, 18, 2):
         position = expected_parent_offset + delta
         if position < data_marker + 8 or position + bone_count * 2 > name_marker:
@@ -671,12 +681,56 @@ def read_skeleton_hierarchy(path: Path) -> SkeletonHierarchy | None:
             -forward_edges,
             -abs(delta),
         )
+        parent_positions[parents] = position
     if not candidates:
         return None
     ranked = sorted(candidates.items(), key=lambda item: item[1], reverse=True)
     if len(ranked) > 1 and ranked[0][1] == ranked[1][1]:
         return None
     parents = ranked[0][0]
+    parent_position = parent_positions[parents]
+    bind_transforms: tuple[tuple[float, ...], ...] = ()
+    # The bytes between the uint16 parent table and local TRS data vary between
+    # NeoX exports.  In particular, character Skeletons in this game use a
+    # two-byte alignment pad, while some older files have reserved uint32s.
+    # Do not assume a single layout: accept the first nearby, internally valid
+    # TRS block.  Missing this offset makes the preview fall back to an action's
+    # first frame, which is often a visibly different pose from the PMX bind.
+    bind_size = bone_count * 10 * 4
+    bind_base = parent_position + bone_count * 2
+    for padding in range(0, 18, 2):
+        bind_offset = bind_base + padding
+        if bind_offset + bind_size > name_marker:
+            continue
+        try:
+            raw_bind = struct.unpack_from(
+                f"<{bone_count * 10}f", data, bind_offset
+            )
+        except struct.error:
+            continue
+        grouped = tuple(
+            tuple(raw_bind[index * 10 : (index + 1) * 10])
+            for index in range(bone_count)
+        )
+        quaternion_lengths = tuple(
+            math.sqrt(sum(value * value for value in transform[3:7]))
+            for transform in grouped
+        )
+        scale_values = tuple(
+            abs(value)
+            for transform in grouped
+            for value in transform[7:10]
+        )
+        if (
+            all(
+                all(math.isfinite(value) for value in transform)
+                for transform in grouped
+            )
+            and all(0.5 <= length <= 1.5 for length in quaternion_lengths)
+            and all(1.0e-6 <= value <= 1.0e3 for value in scale_values)
+        ):
+            bind_transforms = grouped
+            break
     bone_keys = tuple(_normalized_bone_key(name) for name in bone_names)
     if len(set(bone_keys)) != len(bone_keys):
         return None
@@ -686,6 +740,7 @@ def read_skeleton_hierarchy(path: Path) -> SkeletonHierarchy | None:
         bone_names=bone_names,
         bone_keys=bone_keys,
         bone_parents=parents,
+        bone_bind_transforms=bind_transforms,
     )
 
 
@@ -3269,13 +3324,65 @@ def parse_gim_submeshes(path: Path) -> list[GimSubmesh]:
             material_index = int(raw_index)
         except ValueError:
             return []
-        result.append(
-            GimSubmesh(
-                name=(node.get("Name") or f"Sub{len(result)}").strip(),
-                material_index=material_index,
-            )
-        )
+        bounds: list[tuple[float, float, float] | None] = []
+        for attribute in ("BoundingCenter", "BoundingHalf"):
+            try:
+                values = tuple(
+                    float(value.strip())
+                    for value in (node.get(attribute) or "").split(",")
+                )
+            except ValueError:
+                values = ()
+            bounds.append(values if len(values) == 3 else None)
+        result.append(GimSubmesh(
+            name=(node.get("Name") or f"Sub{len(result)}").strip(),
+            material_index=material_index,
+            bounding_center=bounds[0],
+            bounding_half=bounds[1],
+        ))
     return result
+
+
+def _mesh_submesh_bounds(
+    mesh: ParsedMesh,
+) -> list[tuple[tuple[float, float, float], tuple[float, float, float]]]:
+    """Calculate per-submesh bounds in the same form stored by GIM XML."""
+    result = []
+    vertex_offset = 0
+    for vertex_count, _face_count, _uv_layers, _color_layers in mesh.submeshes:
+        positions = mesh.positions[vertex_offset : vertex_offset + vertex_count]
+        vertex_offset += vertex_count
+        if not positions:
+            return []
+        minimum = tuple(min(position[axis] for position in positions) for axis in range(3))
+        maximum = tuple(max(position[axis] for position in positions) for axis in range(3))
+        center = tuple((minimum[axis] + maximum[axis]) / 2.0 for axis in range(3))
+        half = tuple((maximum[axis] - minimum[axis]) / 2.0 for axis in range(3))
+        result.append((center, half))
+    return result
+
+
+def _gim_geometry_matches_mesh(
+    gim_submeshes: list[GimSubmesh],
+    mesh: ParsedMesh,
+) -> bool:
+    """Require every declared GIM bound to match the corresponding Mesh slot."""
+    if len(gim_submeshes) != len(mesh.submeshes):
+        return False
+    mesh_bounds = _mesh_submesh_bounds(mesh)
+    if len(mesh_bounds) != len(gim_submeshes):
+        return False
+    for gim, (mesh_center, mesh_half) in zip(gim_submeshes, mesh_bounds):
+        if gim.bounding_center is None or gim.bounding_half is None:
+            return False
+        for declared, actual in zip(
+            (*gim.bounding_center, *gim.bounding_half),
+            (*mesh_center, *mesh_half),
+        ):
+            tolerance = max(0.002, abs(declared) * 0.0002)
+            if abs(declared - actual) > tolerance:
+                return False
+    return True
 
 
 def _normalized_material_name(value: str) -> str:
@@ -3323,6 +3430,252 @@ def order_materials_by_gim(
     return ordered
 
 
+def build_old_npk_material_packages(
+    model_folder: Path,
+    progress: Callable[[int, int], None] | None = None,
+) -> tuple[
+    list[MaterialPackage],
+    dict[Path, MaterialPackage],
+    dict[Path, list[MaterialPackage]],
+]:
+    """Restore old-PC materials using a GIM -> Mesh geometry proof.
+
+    Physical proximity narrows the candidates but never proves identity.  A
+    candidate Mesh must reproduce every GIM submesh bounding box, and images
+    must live inside that verified physical bundle.  This rejects common
+    same-slot-count false positives while allowing more unambiguous bundles.
+    """
+    import onmyoji_npk as npk
+
+    model_folder = model_folder.resolve()
+    manifest_path = model_folder / "npk_manifest.json"
+    if not manifest_path.is_file():
+        return [], {}, {}
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        resources = [npk.ExtractedResource(**item) for item in payload["resources"]]
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        return [], {}, {}
+
+    by_archive: dict[str, list[tuple[object, Path]]] = defaultdict(list)
+    resource_by_path: dict[Path, object] = {}
+    high_textures_by_hash: dict[str, list[Path]] = defaultdict(list)
+    model_textures_by_hash: dict[str, list[Path]] = defaultdict(list)
+    for item in resources:
+        path = (model_folder / item.relative_path).resolve()
+        if path.is_file():
+            by_archive[item.archive.lower()].append((item, path))
+            resource_by_path[path] = item
+            if (
+                item.archive.lower() in npk.TEXTURE_ARCHIVES
+                and item.image_hash
+            ):
+                high_textures_by_hash[item.image_hash].append(path)
+            elif path.suffix.lower() in {".dds", ".ktx", ".png", ".jpg", ".bmp"} and item.image_hash:
+                model_textures_by_hash[item.image_hash].append(path)
+    for rows in by_archive.values():
+        rows.sort(key=lambda pair: pair[0].physical_order)
+
+    image_suffixes = {".ktx", ".dds", ".png", ".jpg", ".jpeg", ".bmp"}
+    packages: list[MaterialPackage] = []
+    candidates: dict[Path, list[MaterialPackage]] = defaultdict(list)
+    material_rows: list[tuple[str, int, object, Path, list[MaterialDefinition]]] = []
+    mesh_by_order: dict[str, dict[int, tuple[object, Path]]] = defaultdict(dict)
+    gim_by_order: dict[
+        str, dict[int, tuple[object, Path, list[GimSubmesh]]]
+    ] = defaultdict(dict)
+    image_by_order: dict[str, dict[int, Path]] = defaultdict(dict)
+    for archive, rows in by_archive.items():
+        if archive in npk.TEXTURE_ARCHIVES:
+            continue
+        for position, (item, path) in enumerate(rows):
+            suffix = path.suffix.lower()
+            if suffix == ".mesh":
+                mesh_by_order[archive][item.physical_order] = (item, path)
+                continue
+            if suffix in image_suffixes:
+                image_by_order[archive][item.physical_order] = path
+                continue
+            if suffix != ".xml":
+                continue
+            materials = parse_material_xml(path)
+            if materials:
+                material_rows.append((archive, position, item, path, materials))
+            submeshes = parse_gim_submeshes(path)
+            if submeshes:
+                gim_by_order[archive][item.physical_order] = (
+                    item, path, submeshes
+                )
+
+    parsed_mesh_cache: dict[Path, ParsedMesh | None] = {}
+    total = len(material_rows)
+    for number, (archive, position, item, material_path, materials) in enumerate(
+        material_rows, 1
+    ):
+        material_families = {
+            Path(reference.replace("\\", "/")).parent.name.lower()
+            for material in materials
+            for reference in [material_primary_texture(material)]
+            if reference and reference.replace("\\", "/").lower().startswith("model/")
+        }
+        proven: list[
+            tuple[tuple[int, int, int, int], object, Path, list[GimSubmesh], object, Path]
+        ] = []
+        for gim_order in range(item.physical_order - 12, item.physical_order + 13):
+            gim = gim_by_order[archive].get(gim_order)
+            if gim is None:
+                continue
+            gim_item, gim_path, gim_submeshes = gim
+            if not any(0 <= submesh.material_index < len(materials) for submesh in gim_submeshes):
+                continue
+            gim_reference = parse_gim_mesh_reference(gim_path) or ""
+            gim_family = (
+                Path(gim_reference.replace("\\", "/")).parent.name.lower()
+                if gim_reference
+                else str(getattr(gim_item, "semantic_label", "")).lower()
+            )
+            family_match = bool(
+                gim_family
+                and any(
+                    gim_family == family
+                    or gim_family in family
+                    or family in gim_family
+                    for family in material_families
+                )
+            )
+            for mesh_order in range(item.physical_order - 12, item.physical_order + 13):
+                mesh_row = mesh_by_order[archive].get(mesh_order)
+                if mesh_row is None:
+                    continue
+                mesh_item, mesh_path = mesh_row
+                if mesh_path not in parsed_mesh_cache:
+                    try:
+                        parsed_mesh_cache[mesh_path] = parse_mesh(mesh_path)
+                    except (OSError, MeshFormatError, ValueError):
+                        parsed_mesh_cache[mesh_path] = None
+                parsed_mesh = parsed_mesh_cache[mesh_path]
+                if parsed_mesh is None or not _gim_geometry_matches_mesh(
+                    gim_submeshes, parsed_mesh
+                ):
+                    continue
+                bundle_order = gim_order < mesh_order < item.physical_order
+                if not family_match and not bundle_order:
+                    continue
+                span = max(gim_order, mesh_order, item.physical_order) - min(
+                    gim_order, mesh_order, item.physical_order
+                )
+                score = (
+                    0 if family_match else 1,
+                    0 if bundle_order else 1,
+                    span,
+                    abs(item.physical_order - gim_order),
+                )
+                proven.append((
+                    score, gim_item, gim_path, gim_submeshes, mesh_item, mesh_path
+                ))
+        proven.sort(key=lambda value: value[0])
+        if not proven or (len(proven) > 1 and proven[0][0] == proven[1][0]):
+            if progress and (number % 100 == 0 or number == total):
+                progress(number, total)
+            continue
+        _score, gim_item, gim_path, gim_submeshes, mesh_item, mesh_path = proven[0]
+        ordered_materials, valid = order_materials_by_gim_partial(
+            materials, gim_submeshes
+        )
+        if valid == 0:
+            if progress and (number % 100 == 0 or number == total):
+                progress(number, total)
+            continue
+
+        all_refs: list[str] = []
+        primary_refs: list[str] = []
+        for material in ordered_materials:
+            for reference in material.textures.values():
+                normalized_reference = reference.replace("\\", "/").lower()
+                # Built-in shader/editor textures are shared engine resources,
+                # not members of this model's physical bundle.
+                is_model_reference = normalized_reference.startswith("model/")
+                if is_model_reference and reference not in all_refs:
+                    all_refs.append(reference)
+            primary = material_primary_texture(material)
+            if (
+                primary
+                and primary.replace("\\", "/").lower().startswith("model/")
+                and primary not in primary_refs
+            ):
+                primary_refs.append(primary)
+        gim_order = gim_item.physical_order
+        mesh_order = mesh_item.physical_order
+        lower = min(gim_order, mesh_order) + 1
+        upper = max(gim_order, mesh_order) - 1
+        images = [
+            image_by_order[archive][order]
+            for order in range(lower, upper + 1)
+            if order in image_by_order[archive]
+        ]
+        # model*.npk carries a compact DDS used by the desktop fallback path;
+        # tex_res.npk often carries the same picture as a larger KTX.  An exact,
+        # globally unique visual hash safely upgrades the candidate without
+        # relying on the opaque NPK filename signature.
+        upgraded_images: list[Path] = []
+        for image_path in images:
+            image_item = resource_by_path.get(image_path)
+            image_hash = getattr(image_item, "image_hash", "")
+            matches = high_textures_by_hash.get(image_hash, [])
+            reciprocal = model_textures_by_hash.get(image_hash, [])
+            upgraded_images.append(
+                matches[0]
+                if len(matches) == 1 and len(reciprocal) == 1
+                else image_path
+            )
+        images = upgraded_images
+        texture_map: dict[str, Path] = {}
+        confidence = ""
+        if all_refs and len(images) == len(all_refs):
+            texture_map = dict(zip(all_refs, images))
+            confidence = "旧NPK几何组精确"
+        elif primary_refs and len(images) == len(primary_refs):
+            texture_map = dict(zip(primary_refs, images))
+            confidence = "旧NPK几何组精确主贴图"
+        if not confidence:
+            if progress and (number % 100 == 0 or number == total):
+                progress(number, total)
+            continue
+
+        package_name = (
+            getattr(item, "semantic_label", "")
+            or getattr(gim_item, "semantic_label", "")
+            or f"{archive}-{item.physical_order:06d}"
+        )
+        package = MaterialPackage(
+            xml_path=material_path,
+            index=item.physical_order,
+            package_name=package_name,
+            materials=ordered_materials,
+            mesh_paths=[mesh_path],
+            texture_map=texture_map,
+            confidence=confidence,
+        )
+        packages.append(package)
+        candidates[mesh_path].append(package)
+        if progress and (number % 100 == 0 or number == total):
+            progress(number, total)
+
+    by_mesh: dict[Path, MaterialPackage] = {}
+    variants: dict[Path, list[MaterialPackage]] = {}
+    for mesh_path, values in candidates.items():
+        unique: dict[tuple[object, ...], MaterialPackage] = {}
+        for package in values:
+            signature = _material_variant_signature(package.materials)
+            old = unique.get(signature)
+            if old is None or len(package.texture_map) > len(old.texture_map):
+                unique[signature] = package
+        variants[mesh_path.resolve()] = list(unique.values())
+        if len(unique) == 1:
+            by_mesh[mesh_path.resolve()] = next(iter(unique.values()))
+    return packages, by_mesh, variants
+
+
 def _manifest_hash_maps(
     model_folder: Path,
     include_auxiliary: bool = True,
@@ -3348,6 +3701,21 @@ def _manifest_hash_maps(
                 # manifest 由解包器写出；逐条 resolve/stat 十万文件在机械盘上会很慢。
                 by_md5[digest] = path
                 by_path[path] = digest
+
+    npk_manifest = model_folder / "npk_manifest.json"
+    if npk_manifest.is_file():
+        try:
+            payload = json.loads(npk_manifest.read_text(encoding="utf-8"))
+            for row in payload.get("resources", ()):
+                digest = str(row.get("content_md5", "")).strip().lower()
+                output = str(row.get("relative_path", "")).strip()
+                if len(digest) != 32 or not output:
+                    continue
+                path = model_folder / Path(output.replace("\\", "/"))
+                by_md5.setdefault(digest, path)
+                by_path.setdefault(path, digest)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
 
     # A few hot-update extraction runs materialize resources successfully but
     # omit their rows from manifest.csv.  Their filenames still carry the
@@ -4072,6 +4440,393 @@ class CrossPackageTextureResolver:
         return result
 
 
+def sync_large_white_model_dependencies(
+    output_root: Path,
+    thd_dir: Path,
+    model_folder: Path,
+    log: Callable[[str], None] | None = None,
+) -> dict[str, int]:
+    """Close official THP material dependencies for the large main-model report.
+
+    The report is deliberately the scope limiter: effects and level components
+    are not pulled in here.  For each reported Mesh we follow only its current
+    ``model.thp`` parent and children, then verify every recovered XML/KTX by
+    the THX content MD5.  This is a dependency closure, not a filename or
+    archive-neighbour heuristic.
+    """
+    result = {
+        "targets": 0,
+        "official_dependencies": 0,
+        "logical_gims": 0,
+        "reused": 0,
+        "local": 0,
+        "remote": 0,
+        "missing": 0,
+    }
+    report_path = output_root / "白模优先检查_角色主包.csv"
+    thx_path = thd_dir / "model.thx"
+    thp_path = thd_dir / "model.thp"
+    if not report_path.is_file() or not thx_path.is_file() or not thp_path.is_file():
+        return result
+    try:
+        with report_path.open("r", newline="", encoding="utf-8-sig") as stream:
+            report_rows = list(csv.DictReader(stream))
+    except (OSError, csv.Error):
+        return result
+
+    target_paths: set[Path] = set()
+    for row in report_rows:
+        raw_path = str(row.get("物理Mesh路径") or "").strip()
+        if not raw_path:
+            continue
+        path = Path(raw_path).resolve()
+        try:
+            if path.is_file() and path.stat().st_size >= 100 * 1024:
+                target_paths.add(path)
+        except OSError:
+            continue
+    if not target_paths:
+        return result
+    result["targets"] = len(target_paths)
+
+    from thd_resource_index import (
+        cloudfilesys_name_hash,
+        read_model_thp,
+        read_model_thx,
+        read_thx_namehash_seeds,
+    )
+
+
+def _material_package_for_mesh(
+    package: MaterialPackage,
+    mesh_path: Path,
+) -> MaterialPackage:
+    """为同内容 Mesh 副本创建独立索引视图。
+
+    材质定义本身可以共享，但 ``mesh_paths`` 必须只包含当前别名；否则
+    组合模型分析会把规范路径和热更新副本误认为两个组件。
+    """
+    return MaterialPackage(
+        xml_path=package.xml_path,
+        index=package.index,
+        package_name=package.package_name,
+        materials=package.materials,
+        mesh_paths=[mesh_path],
+        texture_map=dict(package.texture_map),
+        confidence=package.confidence,
+    )
+
+
+def _merge_material_mesh_content_aliases(
+    by_mesh: dict[Path, MaterialPackage],
+    variants_by_mesh: dict[Path, list[MaterialPackage]],
+    md5_by_path: dict[Path, str],
+) -> int:
+    """按完整内容 MD5 把材质包扩展到同一 Mesh 的所有物理副本。
+
+    解包器允许规范包、热更新依赖和 loose_model 同时落盘。同一个官方
+    Mesh 因而可能有多个路径，而 THX/GIM 解析只会先命中其中一个路径。
+    这里只使用清单已记录或已验证的完整 MD5，绝不通过文件名或几何推断。
+    """
+    paths_by_md5: dict[str, set[Path]] = defaultdict(set)
+    for raw_path, digest in md5_by_path.items():
+        digest = str(digest).strip().lower()
+        if len(digest) != 32 or raw_path.suffix.lower() != ".mesh":
+            continue
+        try:
+            path = raw_path.resolve()
+        except OSError:
+            path = raw_path
+        paths_by_md5[digest].add(path)
+
+    def digest_for(path: Path) -> str | None:
+        digest = md5_by_path.get(path)
+        if digest is None:
+            try:
+                digest = md5_by_path.get(path.resolve())
+            except OSError:
+                digest = None
+        digest = str(digest or "").strip().lower()
+        return digest if len(digest) == 32 else None
+
+    added = 0
+    # Snapshot the source entries so aliases do not recursively fan out.
+    source_by_mesh = list(by_mesh.items())
+    for source_path, package in source_by_mesh:
+        digest = digest_for(source_path)
+        if digest is None:
+            continue
+        for alias_path in paths_by_md5.get(digest, ()):
+            if alias_path == source_path or not alias_path.is_file():
+                continue
+            if alias_path not in by_mesh:
+                by_mesh[alias_path] = _material_package_for_mesh(
+                    package, alias_path
+                )
+                added += 1
+
+    source_variants = list(variants_by_mesh.items())
+    for source_path, source_packages in source_variants:
+        digest = digest_for(source_path)
+        if digest is None:
+            continue
+        for alias_path in paths_by_md5.get(digest, ()):
+            if alias_path == source_path:
+                continue
+            target = variants_by_mesh.setdefault(alias_path, [])
+            signatures = {
+                _material_variant_signature(item.materials)
+                for item in target
+            }
+            for package in source_packages:
+                signature = _material_variant_signature(package.materials)
+                if signature in signatures:
+                    continue
+                target.append(
+                    _material_package_for_mesh(package, alias_path)
+                )
+                signatures.add(signature)
+    return added
+
+    try:
+        records = read_model_thx(thx_path)
+        dependencies = read_model_thp(thp_path)
+        namehash_seeds = read_thx_namehash_seeds(thx_path)
+    except (OSError, ValueError, EOFError):
+        return result
+    record_by_hash = {record.name_hash: record for record in records}
+    records_by_md5: dict[str, list[object]] = defaultdict(list)
+    parents_by_child: dict[int, list[int]] = defaultdict(list)
+    for record in records:
+        records_by_md5[record.content_md5].append(record)
+    for parent_hash, child_hashes in dependencies.items():
+        for child_hash in child_hashes:
+            parents_by_child[child_hash].append(parent_hash)
+
+    # Meshes in loose_model/hot-update caches may not be present in the model
+    # manifest, so derive their content identity directly.  The report contains
+    # only a few dozen P0 paths and this is still an exact MD5 identity check.
+    mesh_digests: set[str] = set()
+    for path in target_paths:
+        try:
+            mesh_digests.add(hashlib.md5(path.read_bytes()).hexdigest())
+        except OSError:
+            continue
+
+    wanted: dict[str, object] = {}
+    for mesh_digest in mesh_digests:
+        for mesh_record in records_by_md5.get(mesh_digest, []):
+            for parent_hash in parents_by_child.get(mesh_record.name_hash, []):
+                parent = record_by_hash.get(parent_hash)
+                if parent is not None:
+                    wanted.setdefault(parent.content_md5, parent)
+                for child_hash in dependencies.get(parent_hash, []):
+                    child = record_by_hash.get(child_hash)
+                    if child is not None:
+                        wanted.setdefault(child.content_md5, child)
+
+    # A number of hot-update entries retain their exact logical Mesh identity
+    # in res descriptors after model.thp has dropped the parent GIM.  A sibling
+    # ``.gim`` lookup through the same THX seeds is still an official identity
+    # relation.  It recovers the GIM for later material analysis, but does not
+    # invent a MaterialGroup when no dependency table declares one.
+    try:
+        logical_paths = load_res_asset_paths(thd_dir, model_folder)
+    except Exception:
+        logical_paths = []
+    for raw_reference in logical_paths:
+        reference = raw_reference.strip().replace("\\", "/").lower()
+        if not reference.startswith("model/") or not reference.endswith(".mesh"):
+            continue
+        mesh_hits = {
+            record.content_md5
+            for variant in _package_reference_variants(reference, "model")
+            for seed in namehash_seeds
+            if (record := record_by_hash.get(
+                cloudfilesys_name_hash(variant, "model", seed)
+            )) is not None
+        }
+        if len(mesh_hits) != 1 or next(iter(mesh_hits)) not in mesh_digests:
+            continue
+        gim_hits = {
+            record
+            for variant in _package_reference_variants(reference[:-5] + ".gim", "model")
+            for seed in namehash_seeds
+            if (record := record_by_hash.get(
+                cloudfilesys_name_hash(variant, "model", seed)
+            )) is not None
+        }
+        if len(gim_hits) != 1:
+            continue
+        gim_record = next(iter(gim_hits))
+        if gim_record.content_md5 not in wanted:
+            wanted[gim_record.content_md5] = gim_record
+            result["logical_gims"] += 1
+    result["official_dependencies"] = len(wanted)
+    if not wanted:
+        if log:
+            log(
+                f"大白模官方依赖闭包：检查 {len(target_paths):,} 个；"
+                "当前及已缓存 THP 均未声明父材质链。"
+            )
+        return result
+
+    import onmyoji_wpk_gui as wpk
+
+    cache_root = model_folder.parent / "extra_rigged" / "model_dependencies"
+    cache_manifest = cache_root / "material_manifest.csv"
+    known: dict[str, str] = {}
+    if cache_manifest.is_file():
+        try:
+            with cache_manifest.open("r", newline="", encoding="utf-8-sig") as stream:
+                for row in csv.DictReader(stream):
+                    digest = (row.get("resource_hash") or "").strip().lower()
+                    relative = (row.get("output_path") or "").strip()
+                    if (
+                        len(digest) == 32
+                        and relative
+                        and row.get("status") == "ok"
+                        and (cache_root / Path(relative.replace("\\", "/"))).is_file()
+                    ):
+                        known[digest] = relative
+        except (OSError, csv.Error):
+            known = {}
+
+    by_md5, _ = _manifest_hash_maps(model_folder)
+
+    def save_content(digest: str, data: bytes) -> bool:
+        extension = wpk.detect_extension(data)
+        if extension not in {"xml", "ktx"} or hashlib.md5(data).hexdigest() != digest:
+            return False
+        target = cache_root / digest[:2] / f"{digest}.{extension}"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_suffix(target.suffix + ".tmp")
+        temporary.write_bytes(data)
+        temporary.replace(target)
+        known[digest] = str(target.relative_to(cache_root))
+        return True
+
+    unresolved = set(wanted) - set(known)
+    for digest in list(unresolved):
+        existing = by_md5.get(digest)
+        if existing is None or existing.suffix.lower() not in {".xml", ".ktx"}:
+            continue
+        try:
+            if save_content(digest, existing.read_bytes()):
+                unresolved.remove(digest)
+                result["reused"] += 1
+        except OSError:
+            continue
+
+    # A model THP can point at an XML/KTX stored in any current WPK family.
+    # Scan IDX records only for the exact still-missing MD5s, then decode the
+    # matching slot; we never use its ordinal position as evidence.
+    local_sources: dict[str, list[tuple[Path, object]]] = defaultdict(list)
+    source_root = thd_dir.parent / "res"
+    if unresolved and source_root.is_dir():
+        for idx_path in sorted(source_root.glob("*.idx"), key=lambda item: item.name.lower()):
+            stem = idx_path.stem
+            group = _load_named_wpk_group(source_root, stem)
+            if group is None:
+                continue
+            for item in group.records:
+                digest = item.resource_hash.lower()
+                if (
+                    digest in unresolved
+                    and wpk.record_is_active(item)
+                    and item.package_id in group.packages
+                ):
+                    local_sources[digest].append((group.packages[item.package_id], item))
+
+    zstandard_module = wpk.load_zstandard()
+    for digest in list(unresolved):
+        for package_path, item in local_sources.get(digest, []):
+            try:
+                read_size = wpk.record_read_size(item)
+                with package_path.open("rb") as stream:
+                    stream.seek(item.offset)
+                    blob = stream.read(read_size)
+                decoded, _ = wpk.decode_stage1(blob, item.key_length)
+                decoded, _ = wpk.unwrap_payload(decoded, zstandard_module)
+                if save_content(digest, decoded):
+                    unresolved.remove(digest)
+                    result["local"] += 1
+                    break
+            except Exception:
+                continue
+
+    # Remaining entries have an exact THX identity but no local WPK slot.  The
+    # dynamic store is contacted only for this finite, official MD5 set.
+    base_url = ""
+    cloud_config = thd_dir.parent / "cloud.json"
+    if unresolved and cloud_config.is_file():
+        try:
+            base_url = str(json.loads(cloud_config.read_text(encoding="utf-8")).get("base_url") or "").strip()
+        except (OSError, ValueError, json.JSONDecodeError):
+            base_url = ""
+    if unresolved and base_url:
+        try:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            import urllib.request
+
+            remote_candidates = [
+                (digest, wanted[digest])
+                for digest in unresolved
+                if 8 <= int(getattr(wanted[digest], "size", 0) or 0)
+                <= 32 * 1024 * 1024
+            ]
+
+            def download_one(digest: str, record: object) -> tuple[str, bytes | None]:
+                expected_size = int(getattr(record, "size", 0) or 0)
+                try:
+                    url = base_url.rstrip("/") + f"/dynamic/{digest[:2]}/{digest[2:]}"
+                    request = urllib.request.Request(
+                        url, headers={"User-Agent": "OnmyojiResourceTool/1.0"}
+                    )
+                    with urllib.request.urlopen(request, timeout=8) as response:
+                        blob = response.read(expected_size + 1)
+                    if len(blob) != expected_size:
+                        return digest, None
+                    decoded, _ = wpk.decode_stage1(blob, len(blob))
+                    decoded, _ = wpk.unwrap_payload(decoded, zstandard_module)
+                    return digest, decoded
+                except Exception:
+                    return digest, None
+
+            if remote_candidates:
+                with ThreadPoolExecutor(
+                    max_workers=min(4, len(remote_candidates))
+                ) as executor:
+                    futures = [
+                        executor.submit(download_one, digest, record)
+                        for digest, record in remote_candidates
+                    ]
+                    for future in as_completed(futures):
+                        digest, decoded = future.result()
+                        if decoded is not None and save_content(digest, decoded):
+                            unresolved.remove(digest)
+                            result["remote"] += 1
+        except ImportError:
+            pass
+
+    result["missing"] = len(unresolved)
+    if known:
+        cache_root.mkdir(parents=True, exist_ok=True)
+        with cache_manifest.open("w", newline="", encoding="utf-8-sig") as stream:
+            writer = csv.writer(stream)
+            writer.writerow(["resource_hash", "output_path", "status"])
+            for digest, relative in sorted(known.items()):
+                writer.writerow([digest, relative, "ok"])
+    if log:
+        log(
+            f"大白模官方依赖闭包：目标 {result['targets']:,}；"
+            f"THP/逻辑依赖 {result['official_dependencies']:,}（补回 GIM {result['logical_gims']:,}）；"
+            f"复用 {result['reused']:,}、本地补出 {result['local']:,}、"
+            f"官方下载 {result['remote']:,}、仍缺 {result['missing']:,}。"
+        )
+    return result
+
+
 def sync_large_white_remote_textures(
     output_root: Path,
     thd_dir: Path,
@@ -4635,6 +5390,79 @@ def load_fx_asset_paths(
     _FX_ASSET_PATHS_MEMORY_CACHE[memory_key] = paths
     _FX_TEX0_BINDINGS_MEMORY_CACHE[memory_key] = tex0_bindings
     return list(paths)
+
+
+def _correct_cross_mesh_package_labels(
+    packages: Iterable[MaterialPackage],
+    asset_paths: Iterable[str],
+    resolve_mesh_reference: Callable[[str], Path | None],
+) -> int:
+    """Correct a decoded GIM label only when it names another exact Mesh.
+
+    Some APK-extracted GIM XML filenames retain an old semantic label instead
+    of their current THX logical key. The label is normally useful for a PMX
+    name, but it must not make ``foo.mesh`` appear as ``bar_show`` when the
+    latter is an independently indexed Mesh. Build a reverse identity map
+    solely from explicit res/script Mesh or GIM paths, then rename only when:
+
+    * the current physical Mesh has one exact logical Mesh identity; and
+    * the existing package label itself resolves to a different exact Mesh.
+
+    Ambiguous shared geometry, material-only names, and unindexed labels are
+    deliberately left untouched.
+    """
+    logicals_by_mesh: dict[Path, set[str]] = defaultdict(set)
+    meshes_by_stem: dict[str, set[Path]] = defaultdict(set)
+    references: set[str] = set()
+    for raw_reference in asset_paths:
+        reference = raw_reference.strip().replace("\\", "/").lower().lstrip("/")
+        if not reference.startswith("model/"):
+            continue
+        if reference.endswith(".mesh"):
+            references.add(reference)
+        elif reference.endswith(".gim"):
+            # script3 commonly records the GIM but omits its same-stem Mesh.
+            # The candidate only becomes evidence if THX resolves it exactly.
+            references.add(reference[:-4] + ".mesh")
+
+    for reference in references:
+        path = resolve_mesh_reference(reference)
+        if path is None:
+            continue
+        try:
+            path = path.resolve()
+        except OSError:
+            continue
+        logicals_by_mesh[path].add(reference)
+        meshes_by_stem[Path(reference).stem.lower()].add(path)
+
+    renamed = 0
+    seen: set[int] = set()
+    for package in packages:
+        marker = id(package)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        if len(package.mesh_paths) != 1:
+            continue
+        try:
+            mesh_path = package.mesh_paths[0].resolve()
+        except OSError:
+            continue
+        logicals = logicals_by_mesh.get(mesh_path, set())
+        if len(logicals) != 1:
+            continue
+        desired = Path(next(iter(logicals))).stem
+        label = package.package_name.strip().lower()
+        label_meshes = meshes_by_stem.get(label, set())
+        if (
+            desired.lower() != label
+            and label_meshes
+            and mesh_path not in label_meshes
+        ):
+            package.package_name = desired
+            renamed += 1
+    return renamed
 
 
 def load_fx_tex0_bindings(
@@ -6376,7 +7204,7 @@ def build_material_packages(
             mesh_path = dependency_paths[start]
             segment = dependency_paths[start + 1 : end]
             texture_paths = [
-                path for path in segment if path.suffix.lower() == ".ktx"
+                path for path in segment if path.suffix.lower() in IMAGE_SUFFIXES
             ]
             material_choices: list[
                 tuple[Path, list[MaterialDefinition], list[str]]
@@ -6654,7 +7482,7 @@ def build_material_packages(
                         )
                         if (
                             candidate_path is not None
-                            and candidate_path.suffix.lower() == ".ktx"
+                            and candidate_path.suffix.lower() in IMAGE_SUFFIXES
                         ):
                             exact_record = candidate
                             break
@@ -6672,9 +7500,9 @@ def build_material_packages(
                     by_md5.get(record.content_md5)
                     if record is not None else None
                 )
-                if texture_path is None or texture_path.suffix.lower() != ".ktx":
+                if texture_path is None or texture_path.suffix.lower() not in IMAGE_SUFFIXES:
                     texture_path = cross_texture_resolver.resolve(reference)
-                if texture_path is not None and texture_path.suffix.lower() == ".ktx":
+                if texture_path is not None and texture_path.suffix.lower() in IMAGE_SUFFIXES:
                     texture_map[reference] = texture_path
 
             # PMX 显示只依赖每个材质的主颜色贴图。新材质常用 Tex0，
@@ -7182,6 +8010,37 @@ def build_material_packages(
             append_variant(mesh_path, package)
     for mesh_path, package in by_mesh.items():
         append_variant(mesh_path, package)
+
+    def resolve_current_logical_mesh(reference: str) -> Path | None:
+        for seed in namehash_seeds:
+            record = record_by_name_hash.get(
+                cloudfilesys_name_hash(reference, "model", seed)
+            )
+            path = by_md5.get(record.content_md5) if record is not None else None
+            if path is not None and path.suffix.lower() == ".mesh":
+                return path
+        return None
+
+    # Prefer the exact logical Mesh identity over an APK XML's stale decoded
+    # label, but only for a proven cross-Mesh collision.
+    _correct_cross_mesh_package_labels(
+        (
+            package
+            for variants in variants_by_mesh.values()
+            for package in variants
+        ),
+        all_asset_paths,
+        resolve_current_logical_mesh,
+    )
+
+    # 同一官方 Mesh 可能同时存在于规范包、_hotdeps 或 loose_model。材质
+    # 解析以内容身份为准，但导出扫描使用实际副本路径；在最终索引层补齐
+    # 这些 MD5 别名，避免副本无条件退化成白模。
+    _merge_material_mesh_content_aliases(
+        by_mesh,
+        variants_by_mesh,
+        md5_by_path,
+    )
 
     return packages, by_mesh, variants_by_mesh
 
@@ -12723,43 +13582,208 @@ def restore_mesh_hierarchy_from_skeleton(
     mesh_keys = tuple(_normalized_bone_key(name) for name in mesh.bone_names)
     if len(set(mesh_keys)) != len(mesh_keys):
         return False
-    folder = _locate_skeleton_folder(mesh_path)
-    if folder is None:
+    skeleton = _match_skeleton_hierarchy(mesh, mesh_path)
+    if skeleton is None:
         return False
-    index = _get_skeleton_hierarchy_index(folder)
-    candidate_sets = [index.by_bone.get(key) for key in mesh_keys]
-    if any(not candidates for candidates in candidate_sets):
-        return False
-    smallest = min(candidate_sets, key=lambda candidates: len(candidates or ()))
-    candidate_ids = set(smallest or ())
-    for candidates in candidate_sets:
-        candidate_ids.intersection_update(candidates or ())
-        if not candidate_ids:
-            return False
 
-    projections = {
-        projected
-        for candidate_id in candidate_ids
-        if (
-            projected := _project_skeleton_parents(
-                mesh_keys, index.layouts[candidate_id]
-            )
-        ) is not None
-    }
-    # 通用骨名可能落入多个角色 Skeleton；所有候选必须对
-    # 父链给出同一答案，否则宁可保留 Mesh 原表。
-    if len(projections) != 1:
+    parents = _project_skeleton_parents(mesh_keys, skeleton)
+    if parents is None:
         return False
-    parents = next(iter(projections))
     if parents == tuple(mesh.bone_parents):
         return False
     mesh.bone_parents = list(parents)
     return True
 
 
+def _match_skeleton_hierarchy(
+    mesh: ParsedMesh,
+    mesh_path: Path,
+) -> SkeletonHierarchy | None:
+    """按完整骨名集合定位唯一官方 Skeleton。"""
+    if mesh.bone_names == ["__static_root__"] or not mesh.bone_names:
+        return None
+    mesh_keys = tuple(_normalized_bone_key(name) for name in mesh.bone_names)
+    if len(set(mesh_keys)) != len(mesh_keys):
+        return None
+    folder = _locate_skeleton_folder(mesh_path)
+    if folder is None:
+        return None
+    index = _get_skeleton_hierarchy_index(folder)
+    candidate_sets = [index.by_bone.get(key) for key in mesh_keys]
+    if any(not candidates for candidates in candidate_sets):
+        return None
+    candidate_ids = set(min(candidate_sets, key=lambda item: len(item or ())) or ())
+    for candidates in candidate_sets:
+        candidate_ids.intersection_update(candidates or ())
+        if not candidate_ids:
+            return None
+    if len(candidate_ids) != 1:
+        return None
+    return index.layouts[next(iter(candidate_ids))]
+
+
+def _trs_row_matrix4(transform: tuple[float, ...]) -> tuple[float, ...]:
+    """将 Skeleton 的 local tx/quat/scale 转为 NeoX row-vector 矩阵。"""
+    if len(transform) != 10 or not all(math.isfinite(value) for value in transform):
+        raise MeshFormatError("Skeleton bind TRS 无效")
+    tx, ty, tz, x, y, z, w, sx, sy, sz = transform
+    length = math.sqrt(x * x + y * y + z * z + w * w)
+    if length <= 1.0e-8:
+        x = y = z = 0.0
+        w = 1.0
+    else:
+        x, y, z, w = x / length, y / length, z / length, w / length
+    result = [
+        1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y + z * w),
+        2.0 * (x * z - y * w), 0.0,
+        2.0 * (x * y - z * w), 1.0 - 2.0 * (x * x + z * z),
+        2.0 * (y * z + x * w), 0.0,
+        2.0 * (x * z + y * w), 2.0 * (y * z - x * w),
+        1.0 - 2.0 * (x * x + y * y), 0.0,
+        tx, ty, tz, 1.0,
+    ]
+    result[0:3] = [value * sx for value in result[0:3]]
+    result[4:7] = [value * sy for value in result[4:7]]
+    result[8:11] = [value * sz for value in result[8:11]]
+    return tuple(result)
+
+
+def _skeleton_bind_global_matrices(
+    skeleton: SkeletonHierarchy,
+) -> tuple[tuple[float, ...], ...] | None:
+    """按官方父链合成 Skeleton bind global 矩阵。"""
+    count = len(skeleton.bone_names)
+    if len(skeleton.bone_bind_transforms) != count:
+        return None
+    result: list[tuple[float, ...] | None] = [None] * count
+    visiting = [0] * count
+
+    def visit(index: int) -> tuple[float, ...]:
+        if result[index] is not None:
+            return result[index]  # type: ignore[return-value]
+        if visiting[index] == 1:
+            raise MeshFormatError("Skeleton 父链存在循环")
+        visiting[index] = 1
+        local = _trs_row_matrix4(skeleton.bone_bind_transforms[index])
+        parent = skeleton.bone_parents[index]
+        if 0 <= parent < count:
+            value = _matrix4_multiply(local, visit(parent))
+        else:
+            value = local
+        if not all(math.isfinite(item) for item in value):
+            raise MeshFormatError("Skeleton bind 矩阵包含非有限值")
+        result[index] = value
+        visiting[index] = 2
+        return value
+
+    try:
+        return tuple(visit(index) for index in range(count))  # type: ignore[arg-type]
+    except (IndexError, MeshFormatError):
+        return None
+
+
+def _matrix4_max_delta(left: tuple[float, ...], right: tuple[float, ...]) -> float:
+    return max(abs(a - b) for a, b in zip(left, right))
+
+
+def _transpose_row_normal_matrix4(
+    matrix: tuple[float, ...],
+) -> tuple[float, ...]:
+    """返回把经过 matrix 的法线逆变换回 bind 空间所需的转置矩阵。"""
+    return (
+        matrix[0], matrix[4], matrix[8], 0.0,
+        matrix[1], matrix[5], matrix[9], 0.0,
+        matrix[2], matrix[6], matrix[10], 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    )
+
+
+def _restore_mesh_bind_pose(
+    mesh: ParsedMesh,
+    skeleton: SkeletonHierarchy,
+) -> bool:
+    """把动作已烘焙进 Mesh 的顶点/骨矩阵还原为官方 bind/T-pose。"""
+    bind_globals = _skeleton_bind_global_matrices(skeleton)
+    if bind_globals is None:
+        return False
+    skeleton_indices = {
+        key: index for index, key in enumerate(skeleton.bone_keys)
+    }
+    mesh_to_skeleton: list[int] = []
+    for name in mesh.bone_names:
+        index = skeleton_indices.get(_normalized_bone_key(name))
+        if index is None:
+            return False
+        mesh_to_skeleton.append(index)
+    current_globals = [tuple(matrix) for matrix in mesh.bone_matrices]
+    if any(
+        len(matrix) != 16 or not all(math.isfinite(value) for value in matrix)
+        for matrix in current_globals
+    ):
+        return False
+    weighted_bones = {
+        joint
+        for joints, weights in zip(mesh.joints, mesh.weights)
+        for joint, weight in zip(joints, weights)
+        if weight > 1.0e-8 and 0 <= joint < len(mesh.bone_names)
+    }
+    if not weighted_bones:
+        return False
+    changed = any(
+        _matrix4_max_delta(
+            current_globals[index], bind_globals[mesh_to_skeleton[index]]
+        ) > 1.0e-3
+        for index in weighted_bones
+    )
+    if not changed:
+        return False
+
+    skin_matrices: list[tuple[float, ...]] = []
+    try:
+        for mesh_index, skeleton_index in enumerate(mesh_to_skeleton):
+            current = current_globals[mesh_index]
+            bind = bind_globals[skeleton_index]
+            skin_matrices.append(
+                _matrix4_multiply(_inverse_affine_row_matrix4(bind), current)
+            )
+        restored_positions: list[tuple[float, float, float]] = []
+        restored_normals: list[tuple[float, float, float]] = []
+        for position, normal, joints, weights in zip(
+            mesh.positions, mesh.normals, mesh.joints, mesh.weights
+        ):
+            clean_weights = [max(0.0, float(value)) for value in weights]
+            total = sum(clean_weights)
+            if total <= 1.0e-8:
+                clean_weights = [1.0, 0.0, 0.0, 0.0]
+            elif abs(total - 1.0) > 1.0e-5:
+                clean_weights = [value / total for value in clean_weights]
+            weighted = [0.0] * 16
+            for joint, weight in zip(joints, clean_weights):
+                if weight <= 0.0 or joint < 0 or joint >= len(skin_matrices):
+                    continue
+                matrix = skin_matrices[joint]
+                for component in range(16):
+                    weighted[component] += weight * matrix[component]
+            inverse_weighted = _inverse_affine_row_matrix4(tuple(weighted))
+            restored_positions.append(_transform_row_position(position, inverse_weighted))
+            normal_matrix = _transpose_row_normal_matrix4(tuple(weighted))
+            restored_normals.append(_transform_row_normal(normal, normal_matrix))
+        mesh.positions = restored_positions
+        mesh.normals = restored_normals
+        mesh.bone_matrices = [
+            bind_globals[skeleton_index] for skeleton_index in mesh_to_skeleton
+        ]
+        return True
+    except (MeshFormatError, ValueError, OverflowError):
+        return False
+
+
 def parse_mesh_for_pmx(path: Path) -> ParsedMesh:
     mesh = parse_mesh(path)
-    restore_mesh_hierarchy_from_skeleton(mesh, path)
+    skeleton = _match_skeleton_hierarchy(mesh, path)
+    if skeleton is not None:
+        restore_mesh_hierarchy_from_skeleton(mesh, path)
+        _restore_mesh_bind_pose(mesh, skeleton)
     return mesh
 
 
@@ -13376,7 +14400,7 @@ def decode_ktx_to_png(ktx_data: bytes, output_path: Path) -> None:
 
 
 class DecodedTextureCache:
-    """同一份 KTX 只解码一次，模型目录中复制已解码的 PNG。"""
+    """同一份 KTX/DDS/常规图片只解码一次，再复制为 PNG。"""
 
     def __init__(self, cache_root: Path):
         self.cache_root = cache_root
@@ -13389,7 +14413,15 @@ class DecodedTextureCache:
             temporary = cached.with_suffix(".png.tmp")
             try:
                 temporary.unlink(missing_ok=True)
-                decode_ktx_to_png(ktx_data, temporary)
+                if ktx_data.startswith((b"\xABKTX 11\xBB\r\n\x1A\n", b"\xABKTX 20\xBB\r\n\x1A\n")):
+                    decode_ktx_to_png(ktx_data, temporary)
+                else:
+                    from PIL import Image
+
+                    with Image.open(io.BytesIO(ktx_data)) as image:
+                        image.convert("RGBA").save(
+                            temporary, "PNG", compress_level=1
+                        )
                 if not temporary.is_file() or temporary.stat().st_size == 0:
                     raise RuntimeError("贴图解码结果为空")
                 temporary.replace(cached)
@@ -15577,6 +16609,7 @@ def install_pmx_dependency() -> None:
             sys.executable, "-m", "pip", "install", "--upgrade",
             "pymeshio", "Pillow", "astc-encoder-py",
             "cryptography", "zstandard", "numpy", "moderngl",
+            "lz4",
         ]
     )
 
@@ -15685,13 +16718,14 @@ class RiggedMeshApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_TITLE)
-        self.geometry("980x590")
+        self.geometry("980x625")
         self.minsize(760, 500)
 
         root = Path(__file__).resolve().parent
         default_input = root / "yys" if (root / "yys").is_dir() else root
         default_output = root / "rigged_models"
 
+        self.source_mode_var = tk.StringVar(value="wpk")
         self.input_var = tk.StringVar(value=str(default_input))
         self.output_var = tk.StringVar(value=str(default_output))
         self.fast_reuse_var = tk.BooleanVar(value=True)
@@ -15713,20 +16747,38 @@ class RiggedMeshApp(tk.Tk):
         paths = ttk.LabelFrame(self, text="目录")
         paths.pack(fill="x", **pad)
 
-        ttk.Label(paths, text="阴阳师目录").grid(row=0, column=0, sticky="w", **pad)
-        ttk.Entry(paths, textvariable=self.input_var).grid(
-            row=0, column=1, sticky="ew", **pad
-        )
-        ttk.Button(paths, text="选择", command=self.choose_input).grid(
-            row=0, column=2, **pad
-        )
+        ttk.Label(paths, text="客户端版本").grid(row=0, column=0, sticky="w", **pad)
+        mode_frame = ttk.Frame(paths)
+        mode_frame.grid(row=0, column=1, columnspan=2, sticky="w", **pad)
+        ttk.Radiobutton(
+            mode_frame,
+            text="新版 WPK（移动端）",
+            variable=self.source_mode_var,
+            value="wpk",
+            command=self._source_mode_changed,
+        ).pack(side="left")
+        ttk.Radiobutton(
+            mode_frame,
+            text="旧版 NPK（桌面端）",
+            variable=self.source_mode_var,
+            value="npk",
+            command=self._source_mode_changed,
+        ).pack(side="left", padx=(18, 0))
 
-        ttk.Label(paths, text="输出目录").grid(row=1, column=0, sticky="w", **pad)
-        ttk.Entry(paths, textvariable=self.output_var).grid(
+        ttk.Label(paths, text="阴阳师目录").grid(row=1, column=0, sticky="w", **pad)
+        ttk.Entry(paths, textvariable=self.input_var).grid(
             row=1, column=1, sticky="ew", **pad
         )
-        ttk.Button(paths, text="选择", command=self.choose_output).grid(
+        ttk.Button(paths, text="选择", command=self.choose_input).grid(
             row=1, column=2, **pad
+        )
+
+        ttk.Label(paths, text="输出目录").grid(row=2, column=0, sticky="w", **pad)
+        ttk.Entry(paths, textvariable=self.output_var).grid(
+            row=2, column=1, sticky="ew", **pad
+        )
+        ttk.Button(paths, text="选择", command=self.choose_output).grid(
+            row=2, column=2, **pad
         )
         paths.columnconfigure(1, weight=1)
 
@@ -15764,17 +16816,47 @@ class RiggedMeshApp(tk.Tk):
         self.log = tk.Text(log_frame, height=15, wrap="word")
         self.log.pack(fill="both", expand=True, padx=5, pady=5)
         self._log(
-            "选择完整 yys 目录（也兼容 cloudfilesys3/res）。“PMX 白模”只解包并转换"
+            "先选择新版 WPK 或旧版桌面 NPK。新版选择完整 yys 目录（也兼容 "
+            "cloudfilesys3/res），旧版选择包含 model1.npk、model2.npk、qmodel.npk、"
+            "tex_res.npk 的游戏目录。“PMX 白模”只解包并转换"
             "模型；“带贴图 PMX”会继续分析 THD、恢复材质贴图并组合确定附件；"
             "“场景 PMX”按 SCN 中的原始位置、旋转、缩放还原静态场景。"
         )
 
+    def _default_output_for_mode(self, mode: str | None = None) -> Path:
+        root = Path(__file__).resolve().parent
+        return root / ("rigged_models_npk" if (mode or self.source_mode_var.get()) == "npk" else "rigged_models")
+
+    def _model_folder_for_mode(self) -> Path:
+        root = Path(__file__).resolve().parent
+        if self.source_mode_var.get() == "npk":
+            return root / "unpacked_npk" / "model"
+        return resolve_source_and_model_folder(Path(self.input_var.get()))[1]
+
+    def _source_mode_changed(self) -> None:
+        root = Path(__file__).resolve().parent
+        known_defaults = {root / "rigged_models", root / "rigged_models_npk"}
+        current = Path(self.output_var.get()).resolve()
+        if current in {path.resolve() for path in known_defaults}:
+            self.output_var.set(str(self._default_output_for_mode()))
+        mode_label = "旧版桌面 NPK" if self.source_mode_var.get() == "npk" else "新版移动端 WPK"
+        self.status_var.set(f"已选择{mode_label}；请确认游戏目录。")
+
     def choose_input(self):
+        old_mode = self.source_mode_var.get() == "npk"
         value = filedialog.askdirectory(
-            title="选择完整 yys 目录或 cloudfilesys3/res", initialdir=self.input_var.get()
+            title=(
+                "选择包含 model1.npk / tex_res.npk 的旧版阴阳师目录"
+                if old_mode else "选择完整 yys 目录或 cloudfilesys3/res"
+            ),
+            initialdir=self.input_var.get(),
         )
         if value:
             self.input_var.set(value)
+            import onmyoji_npk as npk
+            if npk.is_old_npk_root(Path(value)) and not old_mode:
+                self.source_mode_var.set("npk")
+                self._source_mode_changed()
 
     def choose_output(self):
         value = filedialog.askdirectory(
@@ -15826,7 +16908,7 @@ class RiggedMeshApp(tk.Tk):
         threading.Thread(target=target, daemon=True).start()
 
     def start_scan(self):
-        _, folder = resolve_source_and_model_folder(Path(self.input_var.get()))
+        folder = self._model_folder_for_mode()
         if not folder.exists():
             messagebox.showerror(
                 APP_TITLE,
@@ -15924,7 +17006,7 @@ class RiggedMeshApp(tk.Tk):
 
         self.visible_rows = visible
         self.tree.delete(*self.tree.get_children())
-        _, base = resolve_source_and_model_folder(Path(self.input_var.get()))
+        base = self._model_folder_for_mode()
         for index, row in enumerate(visible):
             try:
                 folder = str(row.path.parent.relative_to(base))
@@ -15957,6 +17039,12 @@ class RiggedMeshApp(tk.Tk):
         return rows
 
     def start_scene_pmx(self):
+        if self.source_mode_var.get() == "npk":
+            messagebox.showinfo(
+                APP_TITLE,
+                "旧版 NPK 当前支持角色/附件模型解包；场景导出仍请选择新版 WPK。",
+            )
+            return
         selected_input = Path(self.input_var.get()).resolve()
         source_root, _model_folder = resolve_source_and_model_folder(selected_input)
         unpacked_root = Path(__file__).resolve().parent / "unpacked"
@@ -16153,11 +17241,34 @@ class RiggedMeshApp(tk.Tk):
         """一键增量解包全部可用 Mesh，并输出不做材质匹配的 PMX 白模。"""
         selected_input = Path(self.input_var.get()).resolve()
         selected_output = Path(self.output_var.get()).resolve()
-        source_root, model_folder = resolve_source_and_model_folder(selected_input)
-        if source_root is None and not (model_folder / "manifest.csv").exists():
+        old_mode = self.source_mode_var.get() == "npk"
+        old_root = None
+        if old_mode:
+            import onmyoji_npk as npk
+
+            old_root = npk.locate_old_npk_root(selected_input)
+            source_root = None
+            model_folder = Path(__file__).resolve().parent / "unpacked_npk" / "model"
+        else:
+            source_root, model_folder = resolve_source_and_model_folder(selected_input)
+        has_cache = (
+            any(
+                (model_folder / name).exists()
+                for name in ("npk_manifest_models.json", "npk_manifest.json")
+            )
+            if old_mode else (model_folder / "manifest.csv").exists()
+        )
+        if (old_mode and old_root is None and not has_cache) or (
+            not old_mode and source_root is None and not has_cache
+        ):
             messagebox.showerror(
                 APP_TITLE,
-                "请选择完整 yys 目录，或包含 model.idx、model*.wpk 的 res 目录。",
+                (
+                    "请选择包含 model1.npk、model2.npk、qmodel.npk 和 tex_res.npk "
+                    "的旧版阴阳师目录。"
+                    if old_mode else
+                    "请选择完整 yys 目录，或包含 model.idx、model*.wpk 的 res 目录。"
+                ),
             )
             return
 
@@ -16169,6 +17280,21 @@ class RiggedMeshApp(tk.Tk):
                     self.events.put(("log", "首次运行：正在自动安装解包与 PMX 依赖……"))
                     self.events.put(("status", "正在安装依赖"))
                     install_pmx_dependency()
+
+                if old_mode and old_root is not None:
+                    import onmyoji_npk as npk
+
+                    self.events.put(("log", "正在增量解包旧版 model1/model2/qmodel NPK……"))
+                    npk.extract_resources(
+                        old_root,
+                        model_folder.parent,
+                        include_textures=False,
+                        log=lambda text: self.events.put(("log", text)),
+                        progress=lambda stem, done, total: (
+                            self.events.put(("progress", done * 100 / total if total else 100)),
+                            self.events.put(("status", f"解包 {stem} {done}/{total}")),
+                        ),
+                    )
 
                 archive_groups = None
                 if source_root is not None:
@@ -16433,11 +17559,31 @@ class RiggedMeshApp(tk.Tk):
         selected_input = Path(self.input_var.get()).resolve()
         selected_output = Path(self.output_var.get()).resolve()
         fast_reuse = bool(self.fast_reuse_var.get())
-        source_root, model_folder = resolve_source_and_model_folder(selected_input)
-        if source_root is None and not (model_folder / "manifest.csv").exists():
+        old_mode = self.source_mode_var.get() == "npk"
+        old_root = None
+        if old_mode:
+            import onmyoji_npk as npk
+
+            old_root = npk.locate_old_npk_root(selected_input)
+            source_root = None
+            model_folder = Path(__file__).resolve().parent / "unpacked_npk" / "model"
+        else:
+            source_root, model_folder = resolve_source_and_model_folder(selected_input)
+        has_cache = (
+            (model_folder / "npk_manifest.json").exists()
+            if old_mode else (model_folder / "manifest.csv").exists()
+        )
+        if (old_mode and old_root is None and not has_cache) or (
+            not old_mode and source_root is None and not has_cache
+        ):
             messagebox.showerror(
                 APP_TITLE,
-                "请选择完整 yys 目录，或包含 model.idx、model*.wpk 的 res 目录。",
+                (
+                    "请选择包含 model1.npk、model2.npk、qmodel.npk 和 tex_res.npk "
+                    "的旧版阴阳师目录。"
+                    if old_mode else
+                    "请选择完整 yys 目录，或包含 model.idx、model*.wpk 的 res 目录。"
+                ),
             )
             return
 
@@ -16457,14 +17603,58 @@ class RiggedMeshApp(tk.Tk):
                 preflight_thd_dir = (
                     source_root.parent / "thd" if source_root is not None else None
                 )
-                preflight_apk_path = locate_nearby_onmyoji_apk(selected_input)
-                output_root = selected_output / "PMX输出"
-                source_fingerprint = one_click_source_fingerprint(
-                    source_root,
-                    model_folder,
-                    preflight_thd_dir,
-                    preflight_apk_path,
+                if old_mode and old_root is not None:
+                    old_thd_candidates = (
+                        old_root / "Documents" / "cloudfilesys3" / "thd",
+                        old_root / "Documents" / "cloudfilesys3" / "_check_preload_" / "thd",
+                        old_root / "thd",
+                    )
+                    preflight_thd_dir = next(
+                        (
+                            candidate
+                            for candidate in old_thd_candidates
+                            if (candidate / "model.thx").is_file()
+                            and (candidate / "model.thp").is_file()
+                        ),
+                        None,
+                    )
+                preflight_apk_path = (
+                    None if old_mode else locate_nearby_onmyoji_apk(selected_input)
                 )
+                output_root = selected_output / "PMX输出"
+                if old_mode:
+                    import onmyoji_npk as npk
+
+                    old_archive_fingerprint = (
+                        npk.source_fingerprint(old_root, True)
+                        if old_root is not None else
+                        hashlib.sha256((model_folder / "npk_manifest.json").read_bytes()).hexdigest()
+                    )
+                    old_thd_fingerprint = ""
+                    if preflight_thd_dir is not None:
+                        old_thd_fingerprint = ":".join(
+                            f"{path.name}:{path.stat().st_size}:{path.stat().st_mtime_ns}"
+                            for path in (
+                                preflight_thd_dir / "model.thx",
+                                preflight_thd_dir / "model.thp",
+                            )
+                        )
+                    source_fingerprint = hashlib.sha256(
+                        (
+                            f"old-npk-material-v3:{old_archive_fingerprint}:"
+                            f"{old_thd_fingerprint}:"
+                            f"{MATERIAL_RESOLVER_VERSION}:"
+                            f"{COMPOSITE_RESOLVER_VERSION}:"
+                            f"{PMX_OUTPUT_FORMAT_VERSION}"
+                        ).encode("utf-8")
+                    ).hexdigest()
+                else:
+                    source_fingerprint = one_click_source_fingerprint(
+                        source_root,
+                        model_folder,
+                        preflight_thd_dir,
+                        preflight_apk_path,
+                    )
                 if (
                     fast_reuse
                     and can_fast_reuse_one_click(output_root, source_fingerprint)
@@ -16485,6 +17675,25 @@ class RiggedMeshApp(tk.Tk):
                     self.events.put(("status", "资源未变化：已直接复用现有结果"))
                     self.events.put(("done_message", summary))
                     return
+
+                if old_mode and old_root is not None:
+                    import onmyoji_npk as npk
+
+                    self.events.put((
+                        "log",
+                        "正在增量解包旧版 model1/model2/qmodel/tex_res NPK；"
+                        "首次处理大包耗时较长，后续会按原包指纹直接复用。",
+                    ))
+                    npk.extract_resources(
+                        old_root,
+                        model_folder.parent,
+                        include_textures=True,
+                        log=lambda text: self.events.put(("log", text)),
+                        progress=lambda stem, done, total: (
+                            self.events.put(("progress", done * 100 / total if total else 100)),
+                            self.events.put(("status", f"解包 {stem} {done}/{total}")),
+                        ),
+                    )
 
                 if source_root is not None:
                     import onmyoji_wpk_gui as wpk
@@ -16548,8 +17757,17 @@ class RiggedMeshApp(tk.Tk):
                         self.events.put(
                             ("log", f"解包结果与当前 model.idx 一致（{expected_span} 条），直接复用。")
                         )
-                elif not (model_folder / "manifest.csv").exists():
-                    raise RuntimeError("缺少解包结果，也找不到 model.idx")
+                else:
+                    # 旧版 NPK 使用自己的 JSON 清单，不存在 WPK 的 manifest.csv。
+                    # 这里必须按当前来源检查对应清单，否则 NPK 已成功解包后仍会
+                    # 被误判为“找不到 model.idx”。
+                    expected_manifest = model_folder / (
+                        "npk_manifest.json" if old_mode else "manifest.csv"
+                    )
+                    if not expected_manifest.exists():
+                        if old_mode:
+                            raise RuntimeError("缺少旧版 NPK 解包清单 npk_manifest.json")
+                        raise RuntimeError("缺少解包结果，也找不到 model.idx")
 
                 thd_dir = preflight_thd_dir
                 apk_path = preflight_apk_path
@@ -16581,6 +17799,12 @@ class RiggedMeshApp(tk.Tk):
                             ),
                         ),
                     )
+                elif old_mode and thd_dir is not None:
+                    self.events.put((
+                        "log",
+                        f"发现旧版资源依赖表：{thd_dir}；"
+                        "将按 THX/THP 内容哈希精确关联 NPK 材质与 DDS。",
+                    ))
                 elif thd_dir is not None:
                     self.events.put(
                         (
@@ -16657,6 +17881,15 @@ class RiggedMeshApp(tk.Tk):
                         log=lambda text: self.events.put(("log", text)),
                     )
                     self.events.put(
+                        ("status", "正在闭合大白模官方材质依赖")
+                    )
+                    sync_large_white_model_dependencies(
+                        output_root,
+                        thd_dir,
+                        model_folder,
+                        log=lambda text: self.events.put(("log", text)),
+                    )
+                    self.events.put(
                         ("status", "正在定向补齐大白模主贴图")
                     )
                     sync_large_white_remote_textures(
@@ -16720,7 +17953,7 @@ class RiggedMeshApp(tk.Tk):
                     raise RuntimeError("没有发现带骨 mesh")
                 self.events.put(("scan_done", rows))
 
-                self.events.put(("log", "正在分析材质 XML 与 KTX 资源分组……"))
+                self.events.put(("log", "正在分析材质 XML 与贴图资源分组……"))
                 material_stage = {"label": "", "number": 1, "total": 1}
 
                 def report_material_stage(label: str, number: int, total: int) -> None:
@@ -16750,12 +17983,20 @@ class RiggedMeshApp(tk.Tk):
                         )
                     )
 
-                packages, by_mesh, variants_by_mesh = build_material_packages(
-                    model_folder,
-                    progress=report_thd_dependency,
-                    thd_dir=thd_dir,
-                    stage_progress=report_material_stage,
-                )
+                if old_mode and thd_dir is None:
+                    packages, by_mesh, variants_by_mesh = (
+                        build_old_npk_material_packages(
+                            model_folder,
+                            progress=report_thd_dependency,
+                        )
+                    )
+                else:
+                    packages, by_mesh, variants_by_mesh = build_material_packages(
+                        model_folder,
+                        progress=report_thd_dependency,
+                        thd_dir=thd_dir,
+                        stage_progress=report_material_stage,
+                    )
                 self.events.put(("progress", 100))
                 verified_packages = sum(
                     1 for item in packages
