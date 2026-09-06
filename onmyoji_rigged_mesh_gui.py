@@ -50,7 +50,7 @@ from tkinter import filedialog, messagebox, ttk
 APP_TITLE = "阴阳师 PMX 一键解包工具"
 # 这里只表示 PMX 文件本身的输出兼容版本。材质匹配规则、报告格式或 GUI
 # 调整不应修改它，否则所有 .build.json 会同时失效并触发一次全量重写。
-PMX_OUTPUT_FORMAT_VERSION = 33
+PMX_OUTPUT_FORMAT_VERSION = 34
 # 材质 resolver 的输入/规则兼容版本。只在匹配逻辑会改变最终材质包时递增；
 # GUI、报告和预览器调整不得递增。
 MATERIAL_RESOLVER_VERSION = 43
@@ -15173,8 +15173,8 @@ def save_pmx(
                 common.RGB(*diffuse_color[:3]),
                 diffuse_color[3],
                 1.0,
-                common.RGB(0.2, 0.2, 0.2),
-                common.RGB(0.5, 0.5, 0.5),
+                common.RGB(0.0, 0.0, 0.0),
+                common.RGB(1.0, 1.0, 1.0),
                 0,
                 common.RGBA(0.0, 0.0, 0.0, 1.0),
                 0.0,
