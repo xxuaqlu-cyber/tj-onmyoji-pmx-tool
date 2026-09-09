@@ -188,6 +188,7 @@ def discover_groups(
 
         invalid_ranges = 0
         total = len(records)
+        last_progress_at = time.monotonic()
         for number, record in enumerate(records, 1):
             if record_is_active(record):
                 package_size = package_sizes.get(record.package_id)
@@ -196,8 +197,15 @@ def discover_groups(
                     and record.offset + record_read_size(record) > package_size
                 ):
                     invalid_ranges += 1
-            if progress and (number % 2000 == 0 or number == total):
-                progress(stem, number, total)
+            if progress:
+                now = time.monotonic()
+                if (
+                    number % 2000 == 0
+                    or number == total
+                    or now - last_progress_at >= 0.75
+                ):
+                    progress(stem, number, total)
+                    last_progress_at = now
 
         groups.append(
             ArchiveGroup(
@@ -497,14 +505,54 @@ class ExtractorEngine:
             for group in groups
         )
         completed = 0
+        started_at = time.monotonic()
+        last_reported_at = started_at
 
-        for group in groups:
+        def report_progress(
+            group: ArchiveGroup,
+            group_number: int,
+            processed_in_group: int,
+            record_index: int,
+        ) -> None:
+            nonlocal last_reported_at
+            now = time.monotonic()
+            if (
+                completed % 100 != 0
+                and completed != total_records
+                and now - last_reported_at < 0.75
+            ):
+                return
+            last_reported_at = now
+            elapsed = max(0.001, now - started_at)
+            rate = completed / elapsed
+            group_target = (
+                min(group.active_count, trial_limit)
+                if trial_limit is not None
+                else group.active_count
+            )
+            self.progress(
+                completed,
+                total_records,
+                f"资源组 [{group_number}/{len(groups)}] {group.stem}；"
+                f"组内 {processed_in_group:,}/{group_target:,}；"
+                f"索引 #{record_index:,}；新增 {totals['ok']:,}；"
+                f"复用 {totals['exists']:,}；失败 {totals['failed']:,}；"
+                f"速度 {rate:,.1f} 条/秒",
+            )
+
+        for group_number, group in enumerate(groups, 1):
             if self.stop_event.is_set():
                 break
             group_limit = trial_limit
             self.log(
                 f"开始处理 {group.idx_path.name}："
                 f"{group.active_count:,} 条活动索引"
+            )
+            self.progress(
+                completed,
+                total_records,
+                f"资源组 [{group_number}/{len(groups)}] {group.stem}："
+                "读取已有清单并打开 WPK 分包",
             )
             group_root = output_root / group.stem
             group_root.mkdir(parents=True, exist_ok=True)
@@ -586,6 +634,12 @@ class ExtractorEngine:
                                     "",
                                 ]
                             )
+                            report_progress(
+                                group,
+                                group_number,
+                                processed_in_group,
+                                record.index,
+                            )
                             continue
 
                         existing = existing_by_hash.get(record.resource_hash)
@@ -612,15 +666,12 @@ class ExtractorEngine:
                                         "",
                                     ]
                                 )
-                                if (
-                                    completed % 100 == 0
-                                    or completed == total_records
-                                ):
-                                    self.progress(
-                                        completed,
-                                        total_records,
-                                        f"{group.stem}：{processed_in_group:,} 条",
-                                    )
+                                report_progress(
+                                    group,
+                                    group_number,
+                                    processed_in_group,
+                                    record.index,
+                                )
                                 continue
 
                         output_path = None
@@ -708,12 +759,12 @@ class ExtractorEngine:
                                     f"pkg={record.package_id}：{exc}"
                                 )
 
-                        if completed % 100 == 0 or completed == total_records:
-                            self.progress(
-                                completed,
-                                total_records,
-                                f"{group.stem}：{processed_in_group:,} 条",
-                            )
+                        report_progress(
+                            group,
+                            group_number,
+                            processed_in_group,
+                            record.index,
+                        )
             finally:
                 for handle in handles.values():
                     handle.close()
@@ -748,6 +799,10 @@ class WpkGui:
         self.status_var = tk.StringVar(value="等待扫描")
         self.progress_text_var = tk.StringVar(value="0 / 0")
         self.dependency_var = tk.StringVar(value="正在检查依赖…")
+        self.busy = False
+        self.task_started_at: float | None = None
+        self.status_updated_at: float | None = None
+        self.status_base_text = self.status_var.get()
 
         self._configure_style()
         self._build_ui()
@@ -966,14 +1021,23 @@ class WpkGui:
 
         progress_frame = ttk.Frame(content)
         progress_frame.pack(fill="x", pady=(14, 0))
-        ttk.Label(progress_frame, textvariable=self.status_var).pack(
-            side="left"
-        )
-        ttk.Label(progress_frame, textvariable=self.progress_text_var).pack(
-            side="right"
-        )
-        self.progress_bar = ttk.Progressbar(progress_frame, mode="determinate")
-        self.progress_bar.pack(fill="x", pady=(6, 0))
+        ttk.Label(
+            progress_frame,
+            textvariable=self.status_var,
+            anchor="w",
+            justify="left",
+            wraplength=1020,
+        ).pack(fill="x")
+        progress_row = ttk.Frame(progress_frame)
+        progress_row.pack(fill="x", pady=(6, 0))
+        self.progress_bar = ttk.Progressbar(progress_row, mode="determinate")
+        self.progress_bar.pack(fill="x", expand=True, side="left", padx=(0, 8))
+        ttk.Label(
+            progress_row,
+            textvariable=self.progress_text_var,
+            width=23,
+            anchor="e",
+        ).pack(side="right")
 
         log_frame = ttk.Frame(content)
         log_frame.pack(fill="both", expand=False, pady=(10, 0))
@@ -1037,6 +1101,13 @@ class WpkGui:
         self.events.put(("progress", current, total, label))
 
     def _set_busy(self, busy: bool) -> None:
+        self.busy = busy
+        if busy:
+            self.task_started_at = time.monotonic()
+            self.status_updated_at = self.task_started_at
+        else:
+            self.task_started_at = None
+            self.status_updated_at = None
         state = "disabled" if busy else "normal"
         for button in (
             self.scan_button,
@@ -1046,6 +1117,31 @@ class WpkGui:
         ):
             button.configure(state=state)
         self.stop_button.configure(state="normal" if busy else "disabled")
+
+    @staticmethod
+    def _elapsed_text(seconds: float) -> str:
+        seconds = max(0, int(seconds))
+        hours, remainder = divmod(seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        if hours:
+            return f"{hours:d}:{minutes:02d}:{seconds:02d}"
+        return f"{minutes:02d}:{seconds:02d}"
+
+    def _set_status(self, text: object) -> None:
+        self.status_base_text = str(text)
+        self.status_updated_at = time.monotonic()
+        self._refresh_live_status()
+
+    def _refresh_live_status(self) -> None:
+        if not self.busy or self.task_started_at is None:
+            self.status_var.set(self.status_base_text)
+            return
+        now = time.monotonic()
+        step_started = self.status_updated_at or self.task_started_at
+        self.status_var.set(
+            f"{self.status_base_text}  ｜ 本步 {self._elapsed_text(now - step_started)}"
+            f" ｜ 总计 {self._elapsed_text(now - self.task_started_at)}"
+        )
 
     def scan_folder(self) -> None:
         if self.worker and self.worker.is_alive():
@@ -1057,11 +1153,18 @@ class WpkGui:
             return
 
         self._set_busy(True)
-        self.status_var.set("正在扫描…")
+        self.progress_bar["value"] = 0
+        self.progress_text_var.set("索引扫描 0 / 0")
+        self._set_status("扫描 IDX 索引与核对 WPK 分包")
 
         def task():
             try:
-                groups = discover_groups(folder)
+                groups = discover_groups(
+                    folder,
+                    progress=lambda stem, done, total: self.events.put(
+                        ("scan_progress", stem, done, total)
+                    ),
+                )
                 self.events.put(("scan_result", groups))
             except Exception:
                 self.events.put(("error", traceback.format_exc()))
@@ -1073,7 +1176,7 @@ class WpkGui:
         if self.worker and self.worker.is_alive():
             return
         self._set_busy(True)
-        self.status_var.set("正在安装依赖…")
+        self._set_status("正在安装解密与解压依赖")
         self._log("执行：python -m pip install cryptography zstandard")
 
         def task():
@@ -1156,7 +1259,9 @@ class WpkGui:
 
         self.stop_event.clear()
         self._set_busy(True)
-        self.status_var.set("正在解包…")
+        self._set_status(
+            f"准备解包 {len(groups)} 个资源组：计算总记录数与读取已有清单"
+        )
         self.progress_bar["value"] = 0
         self.progress_text_var.set("0 / 0")
         mode_text = f"试解每组前 {trial_limit} 条" if trial_limit else "全量解包"
@@ -1184,7 +1289,7 @@ class WpkGui:
 
     def stop(self) -> None:
         self.stop_event.set()
-        self.status_var.set("正在停止…")
+        self._set_status("正在停止：等待当前资源处理完毕")
         self._log("已请求停止，将在当前资源处理完后结束。")
 
     def _poll_events(self) -> None:
@@ -1200,8 +1305,23 @@ class WpkGui:
                     _, current, total, label = event
                     self.progress_bar["maximum"] = max(1, total)
                     self.progress_bar["value"] = current
-                    self.progress_text_var.set(f"{current:,} / {total:,}")
-                    self.status_var.set(label)
+                    percent = current * 100 / total if total else 100.0
+                    self.progress_text_var.set(
+                        f"{current:,} / {total:,}  ({percent:.1f}%)"
+                    )
+                    self._set_status(label)
+                elif kind == "scan_progress":
+                    _, stem, current, total = event
+                    self.progress_bar["maximum"] = max(1, total)
+                    self.progress_bar["value"] = current
+                    percent = current * 100 / total if total else 100.0
+                    self.progress_text_var.set(
+                        f"索引 {current:,} / {total:,}  ({percent:.1f}%)"
+                    )
+                    self._set_status(
+                        f"扫描 {stem}.idx：核对记录范围与 WPK 分包 "
+                        f"{current:,}/{total:,}"
+                    )
                 elif kind == "scan_result":
                     self.groups = event[1]
                     for item in self.tree.get_children():
@@ -1229,7 +1349,7 @@ class WpkGui:
                                 status,
                             ),
                         )
-                    self.status_var.set(
+                    self._set_status(
                         f"扫描完成：识别到 {len(self.groups)} 组索引"
                     )
                     self._log(
@@ -1243,7 +1363,7 @@ class WpkGui:
                     if stderr:
                         self._log(stderr.strip())
                     self._check_dependencies()
-                    self.status_var.set(
+                    self._set_status(
                         "依赖安装完成" if returncode == 0 else "依赖安装失败"
                     )
                     self._set_busy(False)
@@ -1251,7 +1371,19 @@ class WpkGui:
                     _, result, output_root = event
                     self._set_busy(False)
                     stopped = self.stop_event.is_set()
-                    self.status_var.set("已停止" if stopped else "解包完成")
+                    result_text = "，".join(
+                        (
+                            f"新增 {result.get('ok', 0):,}",
+                            f"复用 {result.get('exists', 0):,}",
+                            f"失败 {result.get('failed', 0):,}",
+                            f"无效 {result.get('invalid', 0):,}",
+                        )
+                    )
+                    self._set_status(
+                        f"已停止：{result_text}"
+                        if stopped
+                        else f"解包完成：{result_text}"
+                    )
                     self._log(
                         "处理结束："
                         + ", ".join(
@@ -1262,11 +1394,11 @@ class WpkGui:
                     if not stopped:
                         messagebox.showinfo(
                             APP_TITLE,
-                            f"解包完成。\n输出目录：{output_root}",
+                            f"解包完成：{result_text}\n输出目录：{output_root}",
                         )
                 elif kind == "error":
                     self._set_busy(False)
-                    self.status_var.set("发生错误")
+                    self._set_status("发生错误")
                     self._log(event[1])
                     messagebox.showerror(
                         APP_TITLE,
@@ -1274,6 +1406,7 @@ class WpkGui:
                     )
         except queue.Empty:
             pass
+        self._refresh_live_status()
         self.root.after(100, self._poll_events)
 
 

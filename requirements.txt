@@ -6,3 +6,4 @@ zstandard
 numpy
 moderngl
 lz4
+imageio-ffmpeg

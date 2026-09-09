@@ -4,9 +4,12 @@
 from __future__ import annotations
 
 import math
+import os
 import queue
 import json
 import re
+import shutil
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -15,7 +18,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 import numpy as np
-from PIL import ImageTk
+from PIL import Image, ImageDraw, ImageTk
 
 import pmx_preview_gui as pmx_browser
 
@@ -29,11 +32,13 @@ from onmyoji_motion import (
     MotionHeader,
     compose_global_positions,
     compose_global_transforms,
-    decode_motion,
+    decode_motion_with_cache_info,
+    ensure_decoded_motion_cache,
     export_vmd,
     find_animation_metadata,
     inverse_affine_row_matrix4,
     matrix4_multiply,
+    motion_cache_path,
     neox_to_pmx_matrix4,
     normalized_bone_name,
     quaternion_delta,
@@ -111,6 +116,9 @@ class MotionPreviewApp(tk.Tk):
         self.bindings_loading = False
         self.pmx_source_meshes: dict[str, str] = {}
         self.pmx_catalog_loading = False
+        self.predecode_running = False
+        self.record_state: dict[str, object] | None = None
+        self.fbx_exporting = False
 
         self._build_ui()
         # ModernGL context creation is driver-dependent and can be expensive;
@@ -137,6 +145,10 @@ class MotionPreviewApp(tk.Tk):
         ttk.Entry(top, textvariable=self.root_var).pack(side="left", fill="x", expand=True, padx=6)
         ttk.Button(top, text="选择目录", command=self._choose_root).pack(side="left")
         ttk.Button(top, text="扫描动作", command=self._scan).pack(side="left", padx=(6, 0))
+        self.predecode_button = ttk.Button(
+            top, text="预解码全部", command=self._predecode_all
+        )
+        self.predecode_button.pack(side="left", padx=(6, 0))
         ttk.Button(top, text="打开单个动作", command=self._open_motion).pack(side="left", padx=(6, 0))
 
         pmx_row = ttk.Frame(self, padding=(8, 0, 8, 8))
@@ -147,6 +159,10 @@ class MotionPreviewApp(tk.Tk):
         ttk.Button(pmx_row, text="刷新模型", command=self._refresh_pmx_items).pack(side="left", padx=(6, 0))
         ttk.Button(pmx_row, text="打开单个 PMX", command=self._choose_pmx).pack(side="left", padx=(6, 0))
         ttk.Button(pmx_row, text="导出 VMD", command=self._export).pack(side="left", padx=(6, 0))
+        self.fbx_button = ttk.Button(
+            pmx_row, text="导出动画 FBX", command=self._export_fbx
+        )
+        self.fbx_button.pack(side="left", padx=(6, 0))
 
         pane = ttk.Panedwindow(self, orient="horizontal")
         pane.pack(fill="both", expand=True, padx=8)
@@ -274,6 +290,10 @@ class MotionPreviewApp(tk.Tk):
         self.play_button = ttk.Button(controls, text="播放", command=self._toggle_play)
         self.play_button.pack(side="left")
         ttk.Button(controls, text="回到开头", command=self._rewind).pack(side="left", padx=(6, 10))
+        self.record_button = ttk.Button(
+            controls, text="录制视频", command=self._record_video
+        )
+        self.record_button.pack(side="left", padx=(0, 10))
         ttk.Label(controls, text="速度").pack(side="left")
         ttk.Combobox(
             controls,
@@ -545,6 +565,9 @@ class MotionPreviewApp(tk.Tk):
             self._pmx_selected()
 
     def _pmx_selected(self, _event=None) -> None:
+        if self.record_state is not None or self.fbx_exporting:
+            self.status_var.set("正在输出当前预览，完成或停止后才能切换模型。")
+            return
         selected = self.pmx_tree.selection()
         if not selected:
             return
@@ -707,6 +730,58 @@ class MotionPreviewApp(tk.Tk):
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _predecode_all(self) -> None:
+        """Decode every supported clip once and retain the NANIM files on disk."""
+        if self.predecode_running:
+            return
+        root = Path(self.root_var.get())
+        if not root.is_dir():
+            messagebox.showerror(APP_TITLE, "动作资源目录不存在。")
+            return
+        self.predecode_running = True
+        self.predecode_button.configure(state="disabled")
+        self.status_var.set("正在收集待预解码动作……")
+
+        def worker() -> None:
+            paths = list(root.rglob("*.rawanimation"))
+            total = len(paths)
+            reused = 0
+            decoded = 0
+            failed = 0
+            lock = threading.Lock()
+            last_reported = 0.0
+
+            def prepare(path: Path) -> bool | None:
+                try:
+                    _header, _cache_path, cache_hit = ensure_decoded_motion_cache(path)
+                    return cache_hit
+                except (OSError, MotionFormatError):
+                    return None
+
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                for index, cache_hit in enumerate(executor.map(prepare, paths), 1):
+                    if cache_hit is None:
+                        failed += 1
+                    elif cache_hit:
+                        reused += 1
+                    else:
+                        decoded += 1
+                    now = time.monotonic()
+                    if index == total or index % 20 == 0 or now - last_reported >= 0.75:
+                        with lock:
+                            self.worker_queue.put(
+                                (
+                                    "predecode_progress",
+                                    (index, total, reused, decoded, failed),
+                                )
+                            )
+                        last_reported = now
+            self.worker_queue.put(
+                ("predecode_done", (total, reused, decoded, failed))
+            )
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def _apply_filter(self) -> None:
         query = self.search_var.get().strip().lower()
         self.visible_headers = [
@@ -730,9 +805,19 @@ class MotionPreviewApp(tk.Tk):
                 self._load_path(self.visible_headers[index].path)
 
     def _load_path(self, path: Path) -> None:
+        if self.record_state is not None or self.fbx_exporting:
+            self.status_var.set("正在输出当前预览，完成或停止后才能切换动作。")
+            return
         self.playing = False
         self.play_button.configure(text="播放")
-        self.status_var.set(f"正在解码：{path.name}")
+        try:
+            cached_hint = motion_cache_path(path).is_file()
+        except OSError:
+            cached_hint = False
+        self.status_var.set(
+            f"正在读取解码缓存：{path.name}"
+            if cached_hint else f"首次解码并保存缓存：{path.name}"
+        )
         if self.official_motion_bindings is None:
             self._load_official_motion_bindings()
         if not self.pmx_items:
@@ -740,7 +825,7 @@ class MotionPreviewApp(tk.Tk):
 
         def worker() -> None:
             try:
-                motion = decode_motion(path)
+                motion, cache_hit = decode_motion_with_cache_info(path)
                 parents = self._find_parents(motion)
                 metadata_root = Path(self.root_var.get())
                 metadata_key = (
@@ -763,7 +848,14 @@ class MotionPreviewApp(tk.Tk):
                 self.worker_queue.put(
                     (
                         "motion_done",
-                        (motion, parents, bind_transforms, metadata, clip_alignment),
+                        (
+                            motion,
+                            parents,
+                            bind_transforms,
+                            metadata,
+                            clip_alignment,
+                            cache_hit,
+                        ),
                     )
                 )
             except Exception as exc:
@@ -872,6 +964,22 @@ class MotionPreviewApp(tk.Tk):
                         self.status_var.set(
                             f"扫描完成：{len(headers):,} 个可用 v0 动作，跳过 {failed:,} 个异常/新版文件{display_note}。"
                         )
+                elif kind == "predecode_progress":
+                    done, total, reused, decoded, failed = payload
+                    percent = done * 100.0 / max(total, 1)
+                    self.status_var.set(
+                        f"正在预解码 {done:,}/{total:,}（{percent:.1f}%） · "
+                        f"复用 {reused:,} · 新增 {decoded:,} · 跳过 {failed:,}"
+                    )
+                elif kind == "predecode_done":
+                    total, reused, decoded, failed = payload
+                    self.predecode_running = False
+                    self.predecode_button.configure(state="normal")
+                    cache_root = Path(__file__).resolve().parent / ".motion_cache"
+                    self.status_var.set(
+                        f"预解码完成：检查 {total:,}，复用 {reused:,}，"
+                        f"新增 {decoded:,}，跳过 {failed:,}；缓存保存在 {cache_root}"
+                    )
                 elif kind == "motion_done":
                     (
                         self.motion,
@@ -879,6 +987,7 @@ class MotionPreviewApp(tk.Tk):
                         self.motion_bind_transforms,
                         self.animation_metadata,
                         self.motion_clip_alignment,
+                        cache_hit,
                     ) = payload
                     motion = self.motion
                     self.timeline.configure(to=max(motion.duration, 0.001))
@@ -896,7 +1005,11 @@ class MotionPreviewApp(tk.Tk):
                     if self.motion_clip_alignment is not None:
                         clipped = self.motion_clip_alignment.start_frame
                         suffix += f"；已按官方片段裁去 {clipped} 帧预滚（CachedPose 已验证）"
-                    self.status_var.set(f"动作载入完成{suffix}")
+                    cache_note = (
+                        "直接读取持久缓存"
+                        if cache_hit else "首次解码结果已保存"
+                    )
+                    self.status_var.set(f"动作载入完成（{cache_note}）{suffix}")
                     self.motion_filter_active = True
                     self._apply_pmx_filter()
                     self._select_best_motion_candidate()
@@ -935,6 +1048,28 @@ class MotionPreviewApp(tk.Tk):
                     except Exception as exc:
                         self.skin = None
                         messagebox.showerror(APP_TITLE, f"PMX 模型预览准备失败：\n{exc}")
+                elif kind == "fbx_progress":
+                    label, done, total = payload
+                    percent = done * 100.0 / max(total, 1)
+                    self.status_var.set(
+                        f"正在导出动画 FBX：{label} {done:,}/{total:,}（{percent:.1f}%）"
+                    )
+                elif kind == "fbx_done":
+                    path, frames, bones = payload
+                    self.fbx_exporting = False
+                    self.fbx_button.configure(state="normal")
+                    self.status_var.set(f"动画 FBX 导出完成：{path}")
+                    messagebox.showinfo(
+                        APP_TITLE,
+                        f"动画 FBX 导出完成：\n{path}\n\n"
+                        f"{frames:,} 帧 · {bones:,} 根骨骼\n"
+                        "已写入完整网格、蒙皮、Bind Pose、材质贴图路径和动画曲线。",
+                    )
+                elif kind == "fbx_error":
+                    self.fbx_exporting = False
+                    self.fbx_button.configure(state="normal")
+                    self.status_var.set("动画 FBX 导出失败")
+                    messagebox.showerror(APP_TITLE, f"动画 FBX 导出失败：\n{payload}")
                 elif kind == "error":
                     self.status_var.set("动作载入失败")
                     messagebox.showerror(APP_TITLE, str(payload))
@@ -943,6 +1078,8 @@ class MotionPreviewApp(tk.Tk):
         self.after(40, self._poll_workers)
 
     def _toggle_play(self) -> None:
+        if self.record_state is not None:
+            return
         if self.motion is None:
             return
         self.playing = not self.playing
@@ -952,12 +1089,16 @@ class MotionPreviewApp(tk.Tk):
         self.play_button.configure(text="暂停" if self.playing else "播放")
 
     def _rewind(self) -> None:
+        if self.record_state is not None:
+            return
         self.timeline_var.set(0.0)
         self.play_offset = 0.0
         self.play_started = time.perf_counter()
         self._render(0.0)
 
     def _timeline_changed(self, value: str) -> None:
+        if self.record_state is not None:
+            return
         if self.motion is None:
             return
         current = float(value)
@@ -1118,8 +1259,10 @@ class MotionPreviewApp(tk.Tk):
             vector, np.cross(vector, values) + quaternions[:, 3:4] * values
         )
 
-    def _matrix_skin_positions(self, frame: int) -> np.ndarray | None:
-        """Skin through the original NeoX bind matrices when they are available.
+    def _matrix_target_global_poses(
+        self, frame: int
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        """Build exact PMX-space bind/current globals from source Mesh matrices.
 
         PMX bone points are display aids.  They do not contain each bone's bind
         orientation or non-uniform scale, which is why they cannot correctly
@@ -1178,6 +1321,13 @@ class MotionPreviewApp(tk.Tk):
             visit(index)
         bind_pmx = neox_to_pmx_matrix4(target_bind)
         current_pmx = neox_to_pmx_matrix4(target_current)
+        return bind_pmx, current_pmx
+
+    def _matrix_skin_positions(self, frame: int) -> np.ndarray | None:
+        poses = self._matrix_target_global_poses(frame)
+        if poses is None or self.skin is None:
+            return None
+        bind_pmx, current_pmx = poses
         skin_matrices = matrix4_multiply(inverse_affine_row_matrix4(bind_pmx), current_pmx)
         base = np.asarray(self.skin["base"], dtype=np.float32)
         points = np.column_stack((base, np.ones(len(base), dtype=np.float32)))
@@ -1326,25 +1476,235 @@ class MotionPreviewApp(tk.Tk):
             visit(index)
         return positions, rotations, scales
 
-    def _render(self, seconds: float) -> None:
+    @staticmethod
+    def _global_to_local_matrices(
+        globals_: np.ndarray, parents: tuple[int, ...]
+    ) -> np.ndarray:
+        globals_ = np.asarray(globals_, dtype=np.float32)
+        result = np.empty_like(globals_)
+        for index in range(len(globals_)):
+            parent = parents[index] if index < len(parents) else -1
+            if 0 <= parent < len(globals_) and parent != index:
+                result[index] = matrix4_multiply(
+                    globals_[index], inverse_affine_row_matrix4(globals_[parent])
+                )
+            else:
+                result[index] = globals_[index]
+        return result
+
+    def _fbx_global_poses(self, frame: int) -> tuple[np.ndarray, np.ndarray]:
+        """Return the same bind/current bone transforms used by the preview."""
+        exact = self._matrix_target_global_poses(frame)
+        if exact is not None:
+            return exact
+        if self.skin is None:
+            raise MotionFormatError("尚未绑定 PMX")
+        bind_positions = np.asarray(self.skin["bind"], dtype=np.float32)
+        bind_globals = np.repeat(
+            np.eye(4, dtype=np.float32)[None, :, :], len(bind_positions), axis=0
+        )
+        bind_globals[:, 3, :3] = bind_positions
+        positions, rotations, scales = self._retarget_pose(frame)
+        current_globals = np.empty_like(bind_globals)
+        for index in range(len(bind_positions)):
+            transform = np.concatenate(
+                (positions[index], rotations[index], scales[index])
+            )
+            current_globals[index] = trs_row_matrix4(transform)
+        return bind_globals, current_globals
+
+    def _export_fbx(self) -> None:
+        if self.record_state is not None or self.fbx_exporting:
+            return
+        motion = self.motion
+        skin = self.skin
+        pmx_path = Path(self.pmx_var.get())
+        if motion is None:
+            messagebox.showinfo(APP_TITLE, "请先载入一个动作。")
+            return
+        if skin is None or not pmx_path.is_file():
+            messagebox.showinfo(APP_TITLE, "请先选择并载入当前动作绑定的 PMX。")
+            return
+        if skin.get("mapping") is None or skin.get("reference_pose") is None:
+            messagebox.showinfo(APP_TITLE, "当前 PMX 尚未完成动作骨骼绑定，不能导出动画 FBX。")
+            return
+        default = re.sub(
+            r"[^0-9A-Za-z_\-\u4e00-\u9fff]+",
+            "_",
+            f"{pmx_path.stem}_{motion.header.action}",
+        ).strip("_") or "动画模型"
+        value = filedialog.asksaveasfilename(
+            defaultextension=".fbx",
+            initialfile=f"{default}.fbx",
+            filetypes=(("FBX 动画模型", "*.fbx"),),
+            title="导出当前绑定动作的 PMX",
+        )
+        if not value:
+            return
+        output_path = Path(value).resolve()
+        self.playing = False
+        self.play_button.configure(text="播放")
+        self.fbx_exporting = True
+        self.fbx_button.configure(state="disabled")
+        self.status_var.set("正在准备动画 FBX：读取完整 PMX……")
+
+        def report(label: str, done: int, total: int) -> None:
+            self.worker_queue.put(("fbx_progress", (label, done, total)))
+
+        def worker() -> None:
+            try:
+                import pymeshio.pmx.reader
+                from onmyoji_fbx import decompose_row_matrices, write_animated_fbx
+
+                model = pymeshio.pmx.reader.read_from_file(str(pmx_path))
+                bone_names = list(skin["bone_names"])
+                parents = tuple(int(value) for value in skin["parents"])
+                frame_count = motion.sample_count
+                bone_count = len(bone_names)
+                bind_globals, _ = self._fbx_global_poses(0)
+                bind_local = self._global_to_local_matrices(bind_globals, parents)
+                bind_t, bind_r, bind_s = decompose_row_matrices(bind_local)
+                frame_t = np.empty((frame_count, bone_count, 3), dtype=np.float32)
+                frame_r = np.empty_like(frame_t)
+                frame_s = np.empty_like(frame_t)
+                for frame in range(frame_count):
+                    _bind, current_globals = self._fbx_global_poses(frame)
+                    current_local = self._global_to_local_matrices(
+                        current_globals, parents
+                    )
+                    translation, rotation, scaling = decompose_row_matrices(
+                        current_local
+                    )
+                    frame_t[frame] = translation
+                    frame_r[frame] = rotation
+                    frame_s[frame] = scaling
+                    if frame % 5 == 0 or frame + 1 == frame_count:
+                        report("烘焙骨骼动画", frame + 1, frame_count)
+                frame_r = np.degrees(
+                    np.unwrap(np.radians(frame_r.astype(np.float64)), axis=0)
+                ).astype(np.float32)
+                frame_r += (
+                    360.0
+                    * np.rint((bind_r - frame_r[0]) / 360.0)[None, :, :]
+                ).astype(np.float32)
+
+                positions = np.asarray(
+                    [(v.position.x, v.position.y, v.position.z) for v in model.vertices],
+                    dtype=np.float32,
+                )
+                normals = np.asarray(
+                    [(v.normal.x, v.normal.y, v.normal.z) for v in model.vertices],
+                    dtype=np.float32,
+                )
+                uvs = np.asarray(
+                    [(v.uv.x, v.uv.y) for v in model.vertices], dtype=np.float32
+                )
+                raw_indices = np.asarray(model.indices, dtype=np.int32)
+                triangles = raw_indices[: len(raw_indices) - len(raw_indices) % 3].reshape(-1, 3)
+                face_materials: list[int] = []
+                remaining = len(triangles)
+                for material_index, material in enumerate(model.materials):
+                    count = min(remaining, max(0, int(material.vertex_count) // 3))
+                    face_materials.extend([material_index] * count)
+                    remaining -= count
+                if remaining:
+                    face_materials.extend([0] * remaining)
+
+                texture_dir = output_path.parent / f"{output_path.stem}_textures"
+                copied_textures: dict[int, Path] = {}
+                material_defs: list[dict[str, object]] = []
+                for index, material in enumerate(model.materials):
+                    texture_index = int(getattr(material, "texture_index", -1))
+                    texture_target = None
+                    if 0 <= texture_index < len(model.textures):
+                        source = pmx_path.parent / str(model.textures[texture_index]).replace(
+                            "\\", os.sep
+                        ).replace("/", os.sep)
+                        if source.is_file():
+                            texture_target = copied_textures.get(texture_index)
+                            if texture_target is None:
+                                texture_dir.mkdir(parents=True, exist_ok=True)
+                                texture_target = texture_dir / f"{texture_index:03d}_{source.name}"
+                                if (
+                                    not texture_target.is_file()
+                                    or texture_target.stat().st_size != source.stat().st_size
+                                ):
+                                    temporary = texture_target.with_suffix(
+                                        texture_target.suffix + ".tmp"
+                                    )
+                                    shutil.copyfile(source, temporary)
+                                    temporary.replace(texture_target)
+                                copied_textures[texture_index] = texture_target
+                    color = getattr(material, "diffuse_color", None)
+                    diffuse = (
+                        float(getattr(color, "r", 0.8)),
+                        float(getattr(color, "g", 0.8)),
+                        float(getattr(color, "b", 0.8)),
+                        float(getattr(material, "alpha", 1.0)),
+                    )
+                    material_defs.append(
+                        {
+                            "name": str(getattr(material, "name", "") or f"Material_{index:03d}"),
+                            "diffuse": diffuse,
+                            "texture": texture_target,
+                            "relative_texture": (
+                                str(texture_target.relative_to(output_path.parent)).replace("\\", "/")
+                                if texture_target is not None else ""
+                            ),
+                        }
+                    )
+
+                if len(positions) != len(skin["joints"]):
+                    raise MotionFormatError("当前 PMX 已变化，请重新载入模型后再导出 FBX。")
+                write_animated_fbx(
+                    output_path,
+                    model_name=pmx_path.stem,
+                    positions=positions,
+                    normals=normals,
+                    uvs=uvs,
+                    triangles=triangles,
+                    face_materials=np.asarray(face_materials, dtype=np.int32),
+                    material_defs=material_defs,
+                    joints=np.asarray(skin["joints"], dtype=np.int32),
+                    weights=np.asarray(skin["weights"], dtype=np.float32),
+                    bone_names=bone_names,
+                    parents=parents,
+                    bind_globals=bind_globals,
+                    bind_translation=bind_t,
+                    bind_rotation=bind_r,
+                    bind_scaling=bind_s,
+                    frame_translation=frame_t,
+                    frame_rotation=frame_r,
+                    frame_scaling=frame_s,
+                    fps=motion.sample_rate,
+                    progress=report,
+                )
+                self.worker_queue.put(
+                    ("fbx_done", (output_path, frame_count, bone_count))
+                )
+            except Exception as exc:
+                self.worker_queue.put(
+                    ("fbx_error", f"{type(exc).__name__}: {exc}")
+                )
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _render_frame_image(
+        self, seconds: float, width: int, height: int
+    ) -> tuple[Image.Image, int]:
+        """Render one preview frame for both the canvas and video recorder."""
         motion = self.motion
         if motion is None or motion.sample_count == 0:
-            return
+            raise MotionFormatError("尚未载入可录制动作")
         frame = min(motion.sample_count - 1, max(0, int(round(seconds * motion.sample_rate))))
         skinned = self._skin_positions(frame)
         if skinned is not None and self.gpu_renderer is not None:
             try:
                 self.gpu_renderer.update_positions(skinned)
-                width = max(100, self.canvas.winfo_width())
-                height = max(100, self.canvas.winfo_height())
                 image = self.gpu_renderer.render(
                     width, height, self.yaw, self.pitch, self.zoom, 0.0, 0.0, False
                 )
-                self.preview_image = ImageTk.PhotoImage(image)
-                self.canvas.delete("all")
-                self.canvas.create_image(0, 0, anchor="nw", image=self.preview_image)
-                self.time_label.configure(text=f"{seconds:.2f} / {motion.duration:.2f} 秒  ·  帧 {frame}")
-                return
+                return image.convert("RGB"), frame
             except Exception as exc:
                 self.status_var.set(f"模型动画预览失败，已切回骨架：{exc}")
                 self.skin["offset"] = None
@@ -1358,8 +1718,6 @@ class MotionPreviewApp(tk.Tk):
         y = cp * points[:, 1] - sp * z
         depth = sp * points[:, 1] + cp * z
         projected = np.column_stack((x, y, depth))
-        width = max(100, self.canvas.winfo_width())
-        height = max(100, self.canvas.winfo_height())
         fit_points = projected[visible] if visible.any() else projected
         span = np.ptp(fit_points[:, :2], axis=0)
         scale = 0.82 * min(width / max(span[0], 1.0), height / max(span[1], 1.0)) * self.zoom
@@ -1368,23 +1726,204 @@ class MotionPreviewApp(tk.Tk):
         screen[:, 0] = (projected[:, 0] - center[0]) * scale + width * 0.5
         screen[:, 1] = height * 0.5 - (projected[:, 1] - center[1]) * scale
 
-        self.canvas.delete("all")
+        image = Image.new("RGB", (width, height), (16, 20, 27))
+        painter = ImageDraw.Draw(image)
         lines = []
         for index, parent in enumerate(self.parents):
             if 0 <= parent < len(screen) and visible[index] and visible[parent]:
                 lines.append((float((depth[index] + depth[parent]) * 0.5), parent, index))
         for _, parent, child in sorted(lines):
-            self.canvas.create_line(*screen[parent], *screen[child], fill="#75b9ff", width=2)
+            painter.line(
+                (*screen[parent], *screen[child]), fill="#75b9ff", width=2
+            )
         for index in (index for index in np.argsort(depth) if visible[index]):
             px, py = screen[index]
             radius = 2.5
-            self.canvas.create_oval(px-radius, py-radius, px+radius, py+radius, fill="#f4d35e", outline="")
+            painter.ellipse(
+                (px-radius, py-radius, px+radius, py+radius),
+                fill="#f4d35e",
+            )
+        return image, frame
+
+    def _render(self, seconds: float) -> None:
+        motion = self.motion
+        if motion is None or motion.sample_count == 0:
+            return
+        width = max(100, self.canvas.winfo_width())
+        height = max(100, self.canvas.winfo_height())
+        image, frame = self._render_frame_image(seconds, width, height)
+        self.preview_image = ImageTk.PhotoImage(image)
+        self.canvas.delete("all")
+        self.canvas.create_image(0, 0, anchor="nw", image=self.preview_image)
         self.time_label.configure(text=f"{seconds:.2f} / {motion.duration:.2f} 秒  ·  帧 {frame}")
 
+    def _record_video(self) -> None:
+        """Record the complete current preview as quickly as rendering permits."""
+        if self.record_state is not None:
+            self.record_state["cancelled"] = True
+            self.record_button.configure(state="disabled", text="正在停止……")
+            return
+        motion = self.motion
+        if motion is None or motion.sample_count == 0:
+            messagebox.showinfo(APP_TITLE, "请先载入一个动作。")
+            return
+        try:
+            import imageio_ffmpeg
+        except ImportError:
+            messagebox.showerror(
+                APP_TITLE,
+                "缺少视频编码组件 imageio-ffmpeg。请先在主工具点击“安装依赖”。",
+            )
+            return
+
+        model_name = Path(self.pmx_var.get()).stem if self.pmx_var.get() else "骨架"
+        safe_name = re.sub(
+            r"[^0-9A-Za-z_\-\u4e00-\u9fff]+",
+            "_",
+            f"{model_name}_{motion.header.action}",
+        ).strip("_") or "动作预览"
+        value = filedialog.asksaveasfilename(
+            defaultextension=".mp4",
+            initialfile=f"{safe_name}.mp4",
+            filetypes=(("MP4 视频", "*.mp4"),),
+            title="保存当前预览动画",
+        )
+        if not value:
+            return
+        target = Path(value)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        width = max(320, self.canvas.winfo_width())
+        height = max(240, self.canvas.winfo_height())
+        width -= width % 2
+        height -= height % 2
+        fps = motion.sample_rate if motion.sample_rate > 0 else 30.0
+        file_handle, temporary_name = tempfile.mkstemp(
+            prefix=f".{target.stem}_", suffix=".recording.mp4", dir=target.parent
+        )
+        os.close(file_handle)
+        temporary = Path(temporary_name)
+        try:
+            writer = imageio_ffmpeg.write_frames(
+                str(temporary),
+                (width, height),
+                fps=fps,
+                codec="libx264",
+                pix_fmt_in="rgb24",
+                pix_fmt_out="yuv420p",
+                quality=7,
+                output_params=["-movflags", "+faststart"],
+            )
+            writer.send(None)
+        except Exception as exc:
+            temporary.unlink(missing_ok=True)
+            messagebox.showerror(APP_TITLE, f"无法启动视频编码：\n{exc}")
+            return
+
+        self.playing = False
+        self.play_button.configure(text="播放")
+        self.record_state = {
+            "writer": writer,
+            "target": target,
+            "temporary": temporary,
+            "width": width,
+            "height": height,
+            "fps": fps,
+            "frame": 0,
+            "total": motion.sample_count,
+            "old_time": float(self.timeline_var.get()),
+            "cancelled": False,
+        }
+        self.record_button.configure(text="停止录制")
+        self.status_var.set(
+            f"开始快速录制：{motion.sample_count:,} 帧 @ {fps:g} FPS · {width}×{height}"
+        )
+        self.after(1, self._record_video_step)
+
+    def _record_video_step(self) -> None:
+        state = self.record_state
+        motion = self.motion
+        if state is None or motion is None:
+            return
+        try:
+            # Small batches keep the UI responsive while avoiding one Tk event per frame.
+            for _ in range(2):
+                if state["cancelled"] or state["frame"] >= state["total"]:
+                    break
+                frame = int(state["frame"])
+                seconds = frame / float(state["fps"])
+                image, _ = self._render_frame_image(
+                    seconds, int(state["width"]), int(state["height"])
+                )
+                state["writer"].send(image.convert("RGB").tobytes())
+                state["frame"] = frame + 1
+            done = int(state["frame"])
+            total = int(state["total"])
+            if done >= total or state["cancelled"]:
+                self._finish_video_recording(bool(state["cancelled"]))
+                return
+            if done % 10 < 2:
+                percent = done * 100.0 / max(total, 1)
+                self.status_var.set(
+                    f"正在快速录制 {done:,}/{total:,} 帧（{percent:.1f}%）"
+                )
+                seconds = done / float(state["fps"])
+                self.time_label.configure(
+                    text=f"录制 {seconds:.2f} / {motion.duration:.2f} 秒  ·  帧 {done}"
+                )
+            self.after(1, self._record_video_step)
+        except Exception as exc:
+            self._finish_video_recording(False, exc)
+
+    def _finish_video_recording(
+        self, cancelled: bool, error: Exception | None = None
+    ) -> None:
+        state = self.record_state
+        if state is None:
+            return
+        self.record_state = None
+        close_error = None
+        try:
+            state["writer"].close()
+        except Exception as exc:
+            close_error = exc
+        temporary = Path(state["temporary"])
+        target = Path(state["target"])
+        self.record_button.configure(state="normal", text="录制视频")
+        old_time = float(state["old_time"])
+        self.timeline_var.set(old_time)
+        self._render(old_time)
+        failure = error or close_error
+        if cancelled or failure is not None:
+            temporary.unlink(missing_ok=True)
+            if cancelled:
+                self.status_var.set("视频录制已停止，未保存未完成文件。")
+            else:
+                self.status_var.set("视频录制失败")
+                messagebox.showerror(APP_TITLE, f"视频录制失败：\n{failure}")
+            return
+        try:
+            temporary.replace(target)
+        except OSError as exc:
+            temporary.unlink(missing_ok=True)
+            self.status_var.set("视频保存失败")
+            messagebox.showerror(APP_TITLE, f"视频保存失败：\n{exc}")
+            return
+        self.status_var.set(f"视频录制完成：{target}")
+        messagebox.showinfo(
+            APP_TITLE,
+            f"视频录制完成：\n{target}\n\n"
+            f"{int(state['total']):,} 帧 · {float(state['fps']):g} FPS · "
+            f"{int(state['width'])}×{int(state['height'])}",
+        )
+
     def _drag_start(self, event) -> None:
+        if self.record_state is not None:
+            return
         self.drag = (event.x, event.y, self.yaw, self.pitch)
 
     def _drag_move(self, event) -> None:
+        if self.record_state is not None:
+            return
         if self.drag is None:
             return
         x, y, yaw, pitch = self.drag
@@ -1393,6 +1932,8 @@ class MotionPreviewApp(tk.Tk):
         self._render(self.timeline_var.get())
 
     def _wheel(self, event) -> None:
+        if self.record_state is not None:
+            return
         self.zoom = max(0.25, min(6.0, self.zoom * (1.1 if event.delta > 0 else 1 / 1.1)))
         self._render(self.timeline_var.get())
 

@@ -5,9 +5,90 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 import onmyoji_rigged_mesh_gui as rigged
 import pmx_preview_gui as preview
+
+
+class SupplementalMaterialCacheTests(unittest.TestCase):
+    def test_unchanged_sources_skip_material_hash_rebuild(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_root = root / "res"
+            model_folder = root / "unpacked" / "model"
+            thd_dir = root / "thd"
+            source_root.mkdir()
+            model_folder.mkdir(parents=True)
+            thd_dir.mkdir()
+            idx_path = source_root / "fx_model.idx"
+            wpk_path = source_root / "fx_model0.wpk"
+            thx_path = thd_dir / "fx_model.thx"
+            for path in (idx_path, wpk_path, thx_path):
+                path.write_bytes(b"test")
+            group = SimpleNamespace(
+                stem="fx_model",
+                idx_path=idx_path,
+                packages={0: wpk_path},
+                records=[],
+            )
+            loader_patches = (
+                mock.patch.object(
+                    rigged, "load_res_asset_paths", return_value=[]
+                ),
+                mock.patch.object(
+                    rigged,
+                    "load_script3_gim_paths",
+                    return_value=["fx/model/example.gim"],
+                ),
+                mock.patch.object(
+                    rigged, "load_fx_asset_paths", return_value=[]
+                ),
+                mock.patch(
+                    "thd_resource_index.read_model_thx",
+                    return_value=[],
+                ),
+                mock.patch(
+                    "thd_resource_index.read_thx_namehash_seeds",
+                    return_value=(1,),
+                ),
+            )
+            with loader_patches[0], loader_patches[1], loader_patches[2], \
+                    loader_patches[3], loader_patches[4], mock.patch(
+                        "onmyoji_wpk_gui.load_zstandard", return_value=object()
+                    ):
+                rigged.sync_supplemental_material_resources(
+                    source_root,
+                    model_folder,
+                    thd_dir,
+                    archive_groups=[group],
+                )
+
+            logs: list[str] = []
+            progress: list[tuple[str, int, int]] = []
+            with loader_patches[0], loader_patches[1], loader_patches[2], \
+                    mock.patch(
+                        "onmyoji_wpk_gui.load_zstandard",
+                        side_effect=AssertionError("cache miss"),
+                    ):
+                added = rigged.sync_supplemental_material_resources(
+                    source_root,
+                    model_folder,
+                    thd_dir,
+                    archive_groups=[group],
+                    log=logs.append,
+                    progress=lambda label, done, total: progress.append(
+                        (label, done, total)
+                    ),
+                )
+
+            self.assertEqual(added, 0)
+            self.assertTrue(any("跳过全量路径哈希" in item for item in logs))
+            self.assertEqual(
+                progress[-1],
+                ("资源未变化，直接复用额外包材质索引", 1, 1),
+            )
 
 
 class PreviewSourceMetadataTests(unittest.TestCase):

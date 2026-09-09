@@ -27,6 +27,7 @@ import io
 import json
 import math
 import os
+import posixpath
 import queue
 import re
 import shutil
@@ -35,6 +36,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import traceback
 import xml.etree.ElementTree as ET
 import zipfile
@@ -55,7 +57,25 @@ PMX_OUTPUT_FORMAT_VERSION = 34
 # GUI、报告和预览器调整不得递增。
 MATERIAL_RESOLVER_VERSION = 43
 # 主体/附件组合发现规则版本；只影响“完整组合”，不抬高 PMX 文件格式版本。
-COMPOSITE_RESOLVER_VERSION = 6
+COMPOSITE_RESOLVER_VERSION = 7
+# Skeleton 的面部控制器参考布局不一定是 Mesh 的闭嘴中性表情。这个版本只
+# 写入实际带面部根骨且显式使用 Skeleton 的组合模型指纹，避免小范围姿态
+# 修正抬高 PMX_OUTPUT_FORMAT_VERSION 后让所有角色和场景一起全量重建。
+FACIAL_NEUTRAL_POSE_VERSION = 1
+FACIAL_BONE_ROOT_KEYS = frozenset(
+    {
+        "kk_face",
+        "facial_master",
+        "facial_master_skinjnt",
+        "face_master",
+        "face_master_skinjnt",
+        "facial_root",
+        "face_root",
+    }
+)
+# 额外包材质同步的缓存格式。只有路径哈希/筛选规则发生变化时才递增；
+# GUI 文案和普通 PMX 输出规则不应让数万条补充路径重新计算。
+SUPPLEMENTAL_MATERIAL_SYNC_VERSION = 1
 # 场景 PMX 的布局烘焙版本。只在 SCN 层级、坐标变换、分块或场景材质
 # 规则变化时递增；普通角色模型规则变化不应让场景缓存全部失效。
 SCENE_PMX_PIPELINE_VERSION = 3
@@ -319,6 +339,10 @@ class CompositeModel:
     # NeoX Socket 的 MatrixToBone，仍按源坐标系的 row-vector 4x4 存储。
     # None 表示组件顶点已经处在主模型空间，无需额外变换。
     static_matrices: list[tuple[float, ...] | None] | None = None
+    # GIM/THP 精确指定的 Skeleton；与 mesh_paths 对齐。同一 Socket
+    # 组件共用官方 Skeleton 时，先将局部 Mesh 骨表扩展到完整
+    # Skeleton，再合并权重；这比按 Mesh 骨名猜配属更可靠。
+    skeleton_paths: list[Path | None] | None = None
     # 用于审计自动组合为什么成立；不会参与 PMX 数据结构。
     evidence: str = ""
     # True 表示关系唯一且为模型固有组成：成品清单只保留合并结果，隐藏独立件。
@@ -2006,6 +2030,7 @@ def sync_supplemental_material_resources(
     thd_dir: Path,
     archive_groups: list[object] | None = None,
     log: Callable[[str], None] | None = None,
+    progress: Callable[[str, int, int], None] | None = None,
 ) -> int:
     """Extract only XML/KTX resources referenced by supplemental logical paths.
 
@@ -2027,6 +2052,8 @@ def sync_supplemental_material_resources(
             stems=SUPPLEMENTAL_RIGGED_GROUPS,
         )
     groups = {group.stem: group for group in archive_groups}
+    if progress:
+        progress("读取 res/script3/fx 路径缓存", 0, 1)
     try:
         references = set(load_res_asset_paths(thd_dir, model_folder))
         references.update(load_script3_gim_paths(thd_dir, model_folder))
@@ -2039,21 +2066,102 @@ def sync_supplemental_material_resources(
         "static": ("static/",),
         "res": ("res/", "model/", "levelsets/", "static/", "fx/", "natural/", "npcmodel/"),
     }
+
+    state_root = model_folder.parent / "extra_rigged"
+    state_path = state_root / "material_sync_state.json"
+
+    def build_fingerprint() -> str:
+        package_inputs: list[dict[str, object]] = []
+        for stem in package_prefixes:
+            group = groups.get(stem)
+            if group is None:
+                continue
+            package_inputs.append(
+                {
+                    "stem": stem,
+                    "thx": _file_build_stamp(thd_dir / f"{stem}.thx"),
+                    "idx": _file_build_stamp(group.idx_path),
+                    "wpk": [
+                        _file_build_stamp(path)
+                        for _, path in sorted(group.packages.items())
+                    ],
+                    "manifest": _file_build_stamp(
+                        state_root / stem / "material_manifest.csv"
+                    ),
+                }
+            )
+        references_hash = hashlib.sha256(
+            "\0".join(sorted(references)).encode("utf-8")
+        ).hexdigest()
+        payload = {
+            "version": SUPPLEMENTAL_MATERIAL_SYNC_VERSION,
+            "references_hash": references_hash,
+            "reference_count": len(references),
+            "packages": package_inputs,
+        }
+        return hashlib.sha256(
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+
+    source_fingerprint = build_fingerprint()
+    try:
+        old_state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        old_state = {}
+    if (
+        old_state.get("version") == SUPPLEMENTAL_MATERIAL_SYNC_VERSION
+        and old_state.get("fingerprint") == source_fingerprint
+    ):
+        cached_total = int(old_state.get("cached_resources") or 0)
+        if progress:
+            progress("资源未变化，直接复用额外包材质索引", 1, 1)
+        if log:
+            log(
+                "额外包材质：THX、IDX/WPK 和逻辑路径均未变化，"
+                f"直接复用 {cached_total:,} 个 XML/KTX；跳过全量路径哈希。"
+            )
+        return 0
+
     total_added = 0
     zstandard_module = wpk.load_zstandard()
+    eligible_references = {
+        stem: [
+            reference
+            for reference in references
+            if reference.startswith(prefixes)
+        ]
+        for stem, prefixes in package_prefixes.items()
+    }
+    total_reference_checks = sum(
+        len(items) for items in eligible_references.values()
+    )
+    checked_references = 0
+    last_progress_at = time.monotonic()
+    cached_by_package: dict[str, int] = {}
+    sync_complete = True
     for stem, prefixes in package_prefixes.items():
         group = groups.get(stem)
         thx_path = thd_dir / f"{stem}.thx"
         if group is None or not thx_path.is_file():
+            checked_references += len(eligible_references[stem])
             continue
         try:
             records = read_model_thx(thx_path)
             seeds = read_thx_namehash_seeds(thx_path)
         except Exception:
+            sync_complete = False
+            if log:
+                log(f"额外包 {stem} 材质：THX 索引读取失败，下次将重试。")
             continue
         record_by_hash = {record.name_hash: record for record in records}
         archive_by_digest = {record.resource_hash.lower(): record for record in group.records}
         cache_root = model_folder.parent / "extra_rigged" / stem
+        cache_root.mkdir(parents=True, exist_ok=True)
         manifest = cache_root / "material_manifest.csv"
         known: dict[str, str] = {}
         if manifest.is_file():
@@ -2065,9 +2173,7 @@ def sync_supplemental_material_resources(
             except OSError:
                 known = {}
         wanted: dict[str, object] = {}
-        for reference in references:
-            if not reference.startswith(prefixes):
-                continue
+        for reference in eligible_references[stem]:
             for variant in _package_reference_variants(reference, stem):
                 for seed in seeds:
                     name_hash = cloudfilesys_name_hash(variant, stem, seed)
@@ -2075,10 +2181,43 @@ def sync_supplemental_material_resources(
                     if record is not None:
                         wanted.setdefault(record.content_md5.lower(), record)
                         break
+            checked_references += 1
+            now = time.monotonic()
+            if progress and (
+                checked_references % 1000 == 0
+                or checked_references == total_reference_checks
+                or now - last_progress_at >= 0.75
+            ):
+                progress(
+                    f"匹配 {stem} 材质路径（已找到 {len(wanted):,} 项）",
+                    checked_references,
+                    total_reference_checks,
+                )
+                last_progress_at = now
         handles = {package_id: path.open("rb") for package_id, path in group.packages.items()}
+        group_added = 0
+        wanted_total = len(wanted)
+        wanted_done = 0
         try:
             for digest, record in wanted.items():
-                if digest in known and (cache_root / known[digest]).is_file():
+                wanted_done += 1
+                now = time.monotonic()
+                if progress and (
+                    wanted_done % 500 == 0
+                    or wanted_done == wanted_total
+                    or now - last_progress_at >= 0.75
+                ):
+                    progress(
+                        f"核对 {stem} 材质缓存",
+                        wanted_done,
+                        wanted_total,
+                    )
+                    last_progress_at = now
+                # material_manifest.csv 与主 model 清单使用同一约定：只有文件
+                # 成功落盘后才写 ok。这里按内容 MD5 直接信任清单，避免每次
+                # 对一万多个缓存文件逐个发起随机 is_file() 元数据查询；真正
+                # 遇到外部手工删除的陈旧行时，后续解析器会安全跳过。
+                if digest in known:
                     continue
                 archive_record = archive_by_digest.get(digest)
                 if archive_record is None or archive_record.package_id not in handles:
@@ -2100,7 +2239,9 @@ def sync_supplemental_material_resources(
                     target.write_bytes(decoded)
                     known[digest] = str(target.relative_to(cache_root))
                     total_added += 1
+                    group_added += 1
                 except Exception:
+                    sync_complete = False
                     continue
         finally:
             for stream in handles.values():
@@ -2110,8 +2251,44 @@ def sync_supplemental_material_resources(
             writer.writerow(["resource_hash", "output_path", "status"])
             for digest, relative in sorted(known.items()):
                 writer.writerow([digest, relative, "ok"])
-        if log and total_added:
-            log(f"额外包 {stem}：新增材质 XML/KTX {total_added:,} 个。")
+        cached_by_package[stem] = len(known)
+        if log:
+            log(
+                f"额外包 {stem} 材质：匹配 {wanted_total:,} 项，"
+                f"缓存 {len(known):,} 项，本次新增 {group_added:,} 项。"
+            )
+
+    # 清单是同步过程的输出，必须在全部清单写完后重新计算指纹；下次运行
+    # 才能用同一份输出状态命中，而不会因为首次创建清单而额外重跑一次。
+    if sync_complete:
+        final_fingerprint = build_fingerprint()
+        state_root.mkdir(parents=True, exist_ok=True)
+        state_payload = {
+            "version": SUPPLEMENTAL_MATERIAL_SYNC_VERSION,
+            "fingerprint": final_fingerprint,
+            "reference_count": len(references),
+            "cached_resources": sum(cached_by_package.values()),
+            "packages": cached_by_package,
+        }
+        temporary_state = state_path.with_suffix(".json.tmp")
+        try:
+            temporary_state.write_text(
+                json.dumps(state_payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            temporary_state.replace(state_path)
+        except OSError:
+            temporary_state.unlink(missing_ok=True)
+    else:
+        state_path.unlink(missing_ok=True)
+        if log:
+            log("额外包材质同步存在未完成项，未写入完成缓存；下次会自动重试。")
+    if progress:
+        progress(
+            f"额外包材质同步完成（新增 {total_added:,} 项）",
+            1,
+            1,
+        )
     return total_added
 
 
@@ -3300,6 +3477,35 @@ def parse_gim_mesh_reference(path: Path) -> str | None:
             if reference.lower().endswith(".mesh"):
                 return reference
     return None
+
+
+def parse_gim_skeleton_reference(path: Path) -> str | None:
+    """读取 GIM 明文指定的 Skeleton 逻辑路径。
+
+    拆分头发/衣物等 Mesh 常只保留实际受权重的局部骨表；
+    SkeletonFile 才是引擎组装时使用的完整骨架身份。
+    """
+    try:
+        root = ET.parse(path).getroot()
+    except (OSError, ET.ParseError, UnicodeError):
+        return None
+    for node in root.findall(".//SkeletonFile/FileName"):
+        reference = (node.get("Value") or "").strip().replace("\\", "/")
+        if reference.lower().endswith(".skeleton"):
+            return reference
+    return None
+
+
+def resolve_gim_relative_reference(
+    logical_gim: str,
+    reference: str,
+) -> str:
+    """按 GIM 所在的逻辑目录解析 ../ 和同目录资源路径。"""
+    owner = logical_gim.strip().replace("\\", "/").lstrip("/")
+    child = reference.strip().replace("\\", "/")
+    if child.lower().startswith("model/"):
+        return posixpath.normpath(child)
+    return posixpath.normpath(posixpath.join(posixpath.dirname(owner), child))
 
 
 def parse_gim_submeshes(path: Path) -> list[GimSubmesh]:
@@ -7143,6 +7349,20 @@ def build_material_packages(
     packages: list[MaterialPackage] = []
     by_mesh: dict[Path, MaterialPackage] = {}
     total = len(gim_paths)
+    last_dependency_progress_at = time.monotonic()
+
+    def report_dependency(number: int, total: int) -> None:
+        nonlocal last_dependency_progress_at
+        if not progress:
+            return
+        now = time.monotonic()
+        if (
+            number % 100 == 0
+            or number == total
+            or now - last_dependency_progress_at >= 0.75
+        ):
+            progress(number, total)
+            last_dependency_progress_at = now
 
     begin_stage(stage_names[1])
     for number, gim_path in enumerate(gim_paths, 1):
@@ -7155,8 +7375,7 @@ def build_material_packages(
             None,
         )
         if parent is None:
-            if progress and (number % 100 == 0 or number == total):
-                progress(number, total)
+            report_dependency(number, total)
             continue
 
         dependency_paths: list[Path] = []
@@ -7597,8 +7816,7 @@ def build_material_packages(
                 packages.append(package)
                 by_mesh[mesh_path] = package
 
-        if progress and (number % 100 == 0 or number == total):
-            progress(number, total)
+        report_dependency(number, total)
 
     # Current THP intentionally drops some old parents while their exact Mesh
     # files remain in the local WPK cache.  Reuse the preceding official online
@@ -12567,50 +12785,23 @@ def build_composite_models(
     dependencies = read_model_thp(thd_dir / "model.thp")
     namehash_seeds = read_thx_namehash_seeds(thd_dir / "model.thx")
     trusted = TRUSTED_MATERIAL_CONFIDENCE
+    last_reported_at = time.monotonic()
+    last_reported_label = ""
 
     def report(label: str, done: int, total: int) -> None:
-        if progress and (done % 100 == 0 or done == total):
+        nonlocal last_reported_at, last_reported_label
+        now = time.monotonic()
+        if progress and (
+            label != last_reported_label
+            or done % 100 == 0
+            or done == total
+            or now - last_reported_at >= 0.75
+        ):
             progress(label, done, total)
+            last_reported_at = now
+            last_reported_label = label
 
-    candidates: dict[
-        frozenset[Path], tuple[str, list[Path]]
-    ] = {}
     dependency_items = list(dependencies.items())
-    for dependency_number, (parent_hash, dependency_hashes) in enumerate(
-        dependency_items, 1
-    ):
-        report("收集主体与附件候选", dependency_number, len(dependency_items))
-        ordered: list[Path] = []
-        for dependency_hash in dependency_hashes:
-            record = record_by_hash.get(dependency_hash)
-            path = by_md5.get(record.content_md5) if record else None
-            resolved = path.resolve() if path and path.suffix.lower() == ".mesh" else None
-            package = by_mesh.get(resolved) if resolved else None
-            if (
-                resolved is not None
-                and package is not None
-                and package.confidence in trusted
-                and resolved not in ordered
-            ):
-                ordered.append(resolved)
-        if len(ordered) < 2:
-            continue
-        parent_record = record_by_hash.get(parent_hash)
-        parent_path = (
-            by_md5.get(parent_record.content_md5)
-            if parent_record is not None else None
-        )
-        label = extracted_resource_label(parent_path) if parent_path else "组合模型"
-        candidates[frozenset(ordered)] = (label or "组合模型", ordered)
-
-    # 先处理组件更多的集合；只需和已保留的极大集合比较，不再让每个
-    # 候选和所有候选做一次平方级比较。
-    keys = sorted(candidates, key=len, reverse=True)
-    maximal: list[frozenset[Path]] = []
-    for key_number, key in enumerate(keys, 1):
-        if not any(key < other for other in maximal):
-            maximal.append(key)
-        report("去重组合候选", key_number, len(keys))
     bone_layout_cache: dict[Path, tuple[tuple[str, ...], tuple[int, ...], int]] = {}
 
     def cached_bone_layout(
@@ -12622,58 +12813,32 @@ def build_composite_models(
             bone_layout_cache[path] = layout
         return layout
 
+    # THP 只说明“父资源依赖这些内容”，其中会同时平铺 LOD、
+    # Show 版、材质变体与嵌套 GIM 的 Mesh。因此不再把“同一 THP
+    # 父项+同骨架”当成组合证据；只接受后续的 GIM Socket、精确逻辑
+    # 路径或经多重唯一性校验的组件关系。
     seen_clusters: set[frozenset[Path]] = set()
     result: list[CompositeModel] = []
-    for maximal_number, key in enumerate(maximal, 1):
-        label, ordered = candidates[key]
-        clusters: dict[
-            tuple[tuple[str, ...], tuple[int, ...]], list[Path]
-        ] = {}
-        static_paths: list[Path] = []
-        for path in ordered:
-            try:
-                bone_names, bone_parents, _ = cached_bone_layout(path)
-            except Exception:
-                continue
-            if bone_names == ("__static_root__",):
-                static_paths.append(path)
-                continue
-            signature = (bone_names, bone_parents)
-            clusters.setdefault(signature, []).append(path)
-
-        grouped_paths = list(clusters.values())
-        if static_paths and len(grouped_paths) == 1:
-            # 同一父 GIM 只有一套角色骨架时，静态道具归属无歧义：
-            # 直接并入该角色组合，后续统一挂到角色根骨。
-            grouped_paths = [grouped_paths[0] + static_paths]
-        elif static_paths and not grouped_paths:
-            # 纯静态父 GIM 仍可按原始依赖顺序合成一个独立道具 PMX。
-            grouped_paths = [static_paths]
-        elif len(static_paths) >= 2:
-            # 多套角色骨架并存时无法判断静态件属于哪一套，不强行挂角色；
-            # 但同一父 GIM 下的静态件仍可彼此组合。
-            grouped_paths.append(static_paths)
-
-        cluster_number = 0
-        for paths in grouped_paths:
-            frozen = frozenset(paths)
-            if len(paths) < 2 or frozen in seen_clusters:
-                continue
-            seen_clusters.add(frozen)
-            cluster_number += 1
-            name = label if cluster_number == 1 else f"{label}_组合{cluster_number}"
-            result.append(
-                CompositeModel(
-                    name=name,
-                    mesh_paths=paths,
-                    packages=[by_mesh[path] for path in paths],
-                    direct_merge=True,
-                )
-            )
-        report("核对组合骨架", maximal_number, len(maximal))
 
     # Socket 静态挂件：基础主 PMX 不变，每种 Socket 道具额外生成一个组合变体。
     # 只接受能通过精确逻辑路径哈希解析到“静态 Mesh + 可信材质”的 BoundObject。
+    logical_resource_cache: dict[str, Path | None] = {}
+
+    def resolve_logical_resource(reference: str) -> Path | None:
+        key = reference.strip().replace("\\", "/").lower()
+        if key in logical_resource_cache:
+            return logical_resource_cache[key]
+        for seed in namehash_seeds:
+            name_hash = cloudfilesys_name_hash(key, "model", seed)
+            record = record_by_hash.get(name_hash)
+            path = by_md5.get(record.content_md5) if record else None
+            if path is not None:
+                resolved = path.resolve()
+                logical_resource_cache[key] = resolved
+                return resolved
+        logical_resource_cache[key] = None
+        return None
+
     logical_mesh_cache: dict[str, Path | None] = {}
 
     def resolve_logical_mesh(reference: str) -> Path | None:
@@ -12685,30 +12850,89 @@ def build_composite_models(
         if key.endswith(".gim"):
             candidate_references.insert(0, key[:-4] + ".mesh")
         for candidate in candidate_references:
-            for seed in namehash_seeds:
-                name_hash = cloudfilesys_name_hash(candidate, "model", seed)
-                record = record_by_hash.get(name_hash)
-                path = by_md5.get(record.content_md5) if record else None
-                if path is None:
-                    continue
-                if path.suffix.lower() == ".mesh":
-                    resolved = path.resolve()
+            path = resolve_logical_resource(candidate)
+            if path is None:
+                continue
+            if path.suffix.lower() == ".mesh":
+                logical_mesh_cache[key] = path
+                return path
+            if path.suffix.lower() == ".xml":
+                declared = parse_gim_mesh_reference(path)
+                if declared:
+                    resolved = resolve_logical_mesh(declared)
                     logical_mesh_cache[key] = resolved
                     return resolved
-                if path.suffix.lower() == ".xml":
-                    declared = parse_gim_mesh_reference(path)
-                    if declared:
-                        resolved = resolve_logical_mesh(declared)
-                        logical_mesh_cache[key] = resolved
-                        return resolved
         logical_mesh_cache[key] = None
         return None
+
+    def resolve_gim_skeleton(
+        logical_gim: str,
+        gim_path: Path | None = None,
+    ) -> Path | None:
+        path = gim_path or resolve_logical_resource(logical_gim)
+        if path is None or path.suffix.lower() != ".xml":
+            return None
+        reference = parse_gim_skeleton_reference(path)
+        if not reference:
+            return None
+        logical_skeleton = resolve_gim_relative_reference(logical_gim, reference)
+        skeleton_path = resolve_logical_resource(logical_skeleton)
+        if skeleton_path is None or skeleton_path.suffix.lower() != ".skeleton":
+            return None
+        return skeleton_path
+
+    def unique_dependency_skeleton(
+        dependency_hashes: list[int],
+    ) -> Path | None:
+        paths: set[Path] = set()
+        for dependency_hash in dependency_hashes:
+            record = record_by_hash.get(dependency_hash)
+            path = by_md5.get(record.content_md5) if record else None
+            if path is not None and path.suffix.lower() == ".skeleton":
+                paths.add(path.resolve())
+        return next(iter(paths)) if len(paths) == 1 else None
+
+    def dependency_has_available_mesh(dependency_hashes: list[int]) -> bool:
+        """跳过不可能产生组合的 THP 父项，避免全库反复解析 XML。"""
+        for dependency_hash in dependency_hashes:
+            record = record_by_hash.get(dependency_hash)
+            path = by_md5.get(record.content_md5) if record else None
+            if (
+                path is not None
+                and path.suffix.lower() == ".mesh"
+                and path in by_mesh
+            ):
+                return True
+        return False
+
+    # script3 保留了角色入口 GIM 的明文路径。建立反向索引后，
+    # 即使 THP 没有平铺外部 Skeleton，也能按 GIM 内的 ../
+    # SkeletonFile 找回官方骨架。
+    logical_gim_by_hash: dict[int, str] = {}
+    try:
+        script3_cache = json.loads(
+            (model_folder.parent / "script3_gim_paths.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        cached_gim_paths = script3_cache.get("paths", [])
+        for logical_gim in cached_gim_paths:
+            if not isinstance(logical_gim, str):
+                continue
+            for seed in namehash_seeds:
+                name_hash = cloudfilesys_name_hash(logical_gim, "model", seed)
+                if name_hash in record_by_hash:
+                    logical_gim_by_hash.setdefault(name_hash, logical_gim)
+    except Exception:
+        logical_gim_by_hash = {}
 
     socket_composite_signatures: set[tuple[object, ...]] = set()
     for dependency_number, (parent_hash, dependency_hashes) in enumerate(
         dependency_items, 1
     ):
         report("分析静态 Socket", dependency_number, len(dependency_items))
+        if not dependency_has_available_mesh(dependency_hashes):
+            continue
         parent_record = record_by_hash.get(parent_hash)
         parent_path = (
             by_md5.get(parent_record.content_md5)
@@ -12859,6 +13083,12 @@ def build_composite_models(
             tuple[tuple[float, ...], ...],
         ],
     ] = {}
+    identity_matrix = (
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    )
 
     def cached_bind_layout(
         path: Path,
@@ -12890,6 +13120,8 @@ def build_composite_models(
         dependency_items, 1
     ):
         report("分析默认显示组件", dependency_number, len(dependency_items))
+        if not dependency_has_available_mesh(dependency_hashes):
+            continue
         parent_record = record_by_hash.get(parent_hash)
         parent_path = (
             by_md5.get(parent_record.content_md5)
@@ -12902,7 +13134,7 @@ def build_composite_models(
             continue
 
         resolved_children: list[
-            tuple[Path, MaterialPackage, str]
+            tuple[Path, MaterialPackage, str, Path | None]
         ] = []
         child_paths: set[Path] = set()
         for object_gim, socket_name, _ in sockets:
@@ -12918,7 +13150,11 @@ def build_composite_models(
                 continue
             if child_bones == ("__static_root__",):
                 continue
-            resolved_children.append((child_path, child_package, socket_name))
+            child_gim_path = resolve_logical_resource(object_gim)
+            child_skeleton = resolve_gim_skeleton(object_gim, child_gim_path)
+            resolved_children.append(
+                (child_path, child_package, socket_name, child_skeleton)
+            )
             child_paths.add(child_path)
         if not resolved_children:
             continue
@@ -12951,47 +13187,61 @@ def build_composite_models(
         if not main_candidates:
             continue
         _, _, main_path, main_package = max(main_candidates)
+        main_skeleton = unique_dependency_skeleton(dependency_hashes)
+        parent_logical_gim = logical_gim_by_hash.get(parent_hash)
+        if parent_logical_gim:
+            main_skeleton = (
+                resolve_gim_skeleton(parent_logical_gim, parent_path)
+                or main_skeleton
+            )
         label = extracted_resource_label(parent_path) or "组合模型"
         safe_default_by_socket: dict[
-            str, dict[Path, MaterialPackage]
+            str, dict[Path, tuple[MaterialPackage, Path | None]]
         ] = {}
 
-        for child_path, child_package, socket_name in resolved_children:
+        for (
+            child_path,
+            child_package,
+            socket_name,
+            child_skeleton,
+        ) in resolved_children:
             signature = (main_path, child_path)
-            try:
-                main_layout = cached_bind_layout(main_path)
-                child_layout = cached_bind_layout(child_path)
-                alignment = _rigged_subset_bind_alignment(
-                    child_layout, main_layout
-                )
-                # 完全同骨架的组件在 merge_parsed_meshes 中不会额外变换，
-                # 因此这里只接受 bind 也一致的情况。子骨架则会在写出阶段
-                # 再按有效权重骨做一次严格校验并应用同一对齐变换。
-                if (
-                    child_layout[0],
-                    child_layout[1],
-                ) == (
-                    main_layout[0],
-                    main_layout[1],
-                ) and max(
-                    abs(value - expected)
-                    for value, expected in zip(
-                        alignment,
-                        (
-                            1.0, 0.0, 0.0, 0.0,
-                            0.0, 1.0, 0.0, 0.0,
-                            0.0, 0.0, 1.0, 0.0,
-                            0.0, 0.0, 0.0, 1.0,
-                        ),
-                    )
-                ) > 1e-4:
+            shared_skeleton = (
+                main_skeleton
+                if main_skeleton is not None
+                and child_skeleton is not None
+                and main_skeleton.resolve() == child_skeleton.resolve()
+                else None
+            )
+            if shared_skeleton is not None:
+                if not _shared_skeleton_component_positions_safe(
+                    main_path, child_path, shared_skeleton
+                ):
                     continue
-            except Exception:
-                continue
+            else:
+                try:
+                    main_layout = cached_bind_layout(main_path)
+                    child_layout = cached_bind_layout(child_path)
+                    alignment = _rigged_subset_bind_alignment(
+                        child_layout, main_layout
+                    )
+                    # 没有精确 Skeleton 共享证据时，继续使用严格的
+                    # 骨架父链/Bind 刚体对齐校验。
+                    if (
+                        child_layout[0], child_layout[1]
+                    ) == (
+                        main_layout[0], main_layout[1]
+                    ) and max(
+                        abs(value - expected)
+                        for value, expected in zip(alignment, identity_matrix)
+                    ) > 1e-4:
+                        continue
+                except Exception:
+                    continue
 
             safe_default_by_socket.setdefault(
                 socket_name.strip().lower(), {}
-            )[child_path] = child_package
+            )[child_path] = (child_package, shared_skeleton)
             if signature in default_rigged_signatures:
                 continue
             pair = frozenset((main_path, child_path))
@@ -13004,22 +13254,29 @@ def build_composite_models(
                     name=f"{label}_默认组件_{socket_name}",
                     mesh_paths=[main_path, child_path],
                     packages=[main_package, child_package],
+                    skeleton_paths=[shared_skeleton, shared_skeleton],
+                    evidence=(
+                        "GIM MustShow Socket精确指向；"
+                        "父子GIM共用同一Skeleton"
+                        if shared_skeleton is not None
+                        else "GIM MustShow Socket精确指向；骨架/Bind通过"
+                    ),
                     direct_merge=True,
                 )
             )
 
         # 同一父 GIM 下若多个不同 Socket 都只有一个安全默认对象，则再生成
         # 一个“默认完整”变体。一个 Socket 对应多个物理对象时保持歧义，不选边。
-        full_children: list[tuple[Path, MaterialPackage]] = []
+        full_children: list[tuple[Path, MaterialPackage, Path | None]] = []
         full_seen_paths: set[Path] = set()
         for items in safe_default_by_socket.values():
             if len(items) != 1:
                 continue
-            child_path, child_package = next(iter(items.items()))
+            child_path, (child_package, child_skeleton) = next(iter(items.items()))
             if child_path in full_seen_paths:
                 continue
             full_seen_paths.add(child_path)
-            full_children.append((child_path, child_package))
+            full_children.append((child_path, child_package, child_skeleton))
         if len(full_children) >= 2:
             full_paths = [main_path] + [item[0] for item in full_children]
             frozen = frozenset(full_paths)
@@ -13029,6 +13286,8 @@ def build_composite_models(
                         name=f"{label}_默认完整",
                         mesh_paths=full_paths,
                         packages=[main_package] + [item[1] for item in full_children],
+                        skeleton_paths=[main_skeleton] + [item[2] for item in full_children],
+                        evidence="GIM MustShow Socket精确默认组装",
                         direct_merge=True,
                     )
                 )
@@ -13698,6 +13957,31 @@ def _transpose_row_normal_matrix4(
     )
 
 
+def _facial_bone_indices(mesh: ParsedMesh) -> set[int]:
+    """找出应保留 Mesh 自带中性表情的官方面部骨子树。
+
+    NeoX 的独立 Skeleton 对部分角色保存的是面部控制器参考布局，并不等于
+    Mesh 文件实际采用的闭嘴中性表情。身体骨仍可用于识别并还原动作烘焙，
+    但面部子树若强行套回 Skeleton bind，会把嘴唇和牙齿拉成张嘴状态。
+    """
+    roots = {
+        index
+        for index, name in enumerate(mesh.bone_names)
+        if _normalized_bone_key(name) in FACIAL_BONE_ROOT_KEYS
+    }
+    if not roots:
+        return set()
+    result = set(roots)
+    changed = True
+    while changed:
+        changed = False
+        for index, parent in enumerate(mesh.bone_parents):
+            if index not in result and parent in result:
+                result.add(index)
+                changed = True
+    return result
+
+
 def _restore_mesh_bind_pose(
     mesh: ParsedMesh,
     skeleton: SkeletonHierarchy,
@@ -13729,18 +14013,28 @@ def _restore_mesh_bind_pose(
     }
     if not weighted_bones:
         return False
+    preserved_face_bones = _facial_bone_indices(mesh)
     changed = any(
         _matrix4_max_delta(
             current_globals[index], bind_globals[mesh_to_skeleton[index]]
         ) > 1.0e-3
-        for index in weighted_bones
+        for index in weighted_bones - preserved_face_bones
     )
     if not changed:
         return False
 
     skin_matrices: list[tuple[float, ...]] = []
+    identity = (
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    )
     try:
         for mesh_index, skeleton_index in enumerate(mesh_to_skeleton):
+            if mesh_index in preserved_face_bones:
+                skin_matrices.append(identity)
+                continue
             current = current_globals[mesh_index]
             bind = bind_globals[skeleton_index]
             skin_matrices.append(
@@ -13778,12 +14072,68 @@ def _restore_mesh_bind_pose(
         return False
 
 
-def parse_mesh_for_pmx(path: Path) -> ParsedMesh:
+def _expand_mesh_to_skeleton(
+    mesh: ParsedMesh,
+    skeleton: SkeletonHierarchy,
+) -> bool:
+    """将 Mesh 的局部骨表扩展为 GIM 指定的完整 Skeleton。
+
+    这不增加或修改顶点，只重映射权重骨索引。因此两个分开
+    存储、但在 GIM Socket 中共用同一 Skeleton 的 Mesh 可以无损合并。
+    """
+    bind_globals = _skeleton_bind_global_matrices(skeleton)
+    if bind_globals is None:
+        return False
+    skeleton_indices = {
+        key: index for index, key in enumerate(skeleton.bone_keys)
+    }
+    old_to_new: list[int] = []
+    for name in mesh.bone_names:
+        index = skeleton_indices.get(_normalized_bone_key(name))
+        if index is None:
+            return False
+        old_to_new.append(index)
+    root_index = next(
+        (index for index, parent in enumerate(skeleton.bone_parents) if parent < 0),
+        0,
+    )
+    remapped: list[tuple[int, int, int, int]] = []
+    for joints in mesh.joints:
+        remapped.append(tuple(
+            old_to_new[joint] if 0 <= joint < len(old_to_new) else root_index
+            for joint in joints
+        ))
+    mesh.joints = remapped
+    mesh.bone_names = list(skeleton.bone_names)
+    mesh.bone_parents = list(skeleton.bone_parents)
+    mesh.bone_matrices = list(bind_globals)
+    return True
+
+
+def parse_mesh_for_pmx(
+    path: Path,
+    skeleton_path: Path | None = None,
+    *,
+    expand_skeleton: bool = False,
+) -> ParsedMesh:
     mesh = parse_mesh(path)
-    skeleton = _match_skeleton_hierarchy(mesh, path)
+    skeleton = (
+        read_skeleton_hierarchy(skeleton_path)
+        if skeleton_path is not None
+        else _match_skeleton_hierarchy(mesh, path)
+    )
     if skeleton is not None:
-        restore_mesh_hierarchy_from_skeleton(mesh, path)
+        parents = _project_skeleton_parents(
+            tuple(_normalized_bone_key(name) for name in mesh.bone_names),
+            skeleton,
+        )
+        if parents is not None:
+            mesh.bone_parents = list(parents)
         _restore_mesh_bind_pose(mesh, skeleton)
+        if expand_skeleton and not _expand_mesh_to_skeleton(mesh, skeleton):
+            raise MeshFormatError(
+                f"{path.name}: 无法扩展到 GIM 指定的 Skeleton"
+            )
     return mesh
 
 
@@ -14096,6 +14446,53 @@ def _matches_full_body_alternative_bounds(
     return True
 
 
+def _component_geometry_positions_safe(
+    main_positions: list[tuple[float, float, float]],
+    child_positions: list[tuple[float, float, float]],
+) -> bool:
+    """检查已对齐到同一模型空间的组件是否合理。"""
+    try:
+        main_min, main_max = _mesh_position_bounds(main_positions)
+        child_min, child_max = _mesh_position_bounds(child_positions)
+    except MeshFormatError:
+        return False
+    if any(not math.isfinite(value) for value in (*child_min, *child_max)):
+        return False
+    if _matches_full_body_alternative_bounds(main_positions, child_positions):
+        return False
+    main_diagonal = max(
+        math.sqrt(sum((high - low) ** 2 for low, high in zip(main_min, main_max))),
+        1e-6,
+    )
+    separation = [
+        max(main_min[axis] - child_max[axis], child_min[axis] - main_max[axis], 0.0)
+        for axis in range(3)
+    ]
+    gap_ratio = math.sqrt(sum(value * value for value in separation)) / main_diagonal
+    child_diagonal = math.sqrt(
+        sum((high - low) ** 2 for low, high in zip(child_min, child_max))
+    )
+    return gap_ratio <= 2.0 and child_diagonal / main_diagonal <= 5.0
+
+
+def _shared_skeleton_component_positions_safe(
+    main_path: Path,
+    child_path: Path,
+    skeleton_path: Path,
+) -> bool:
+    """GIM 父子共用 Skeleton 时，在官方 bind 空间排除 LOD。"""
+    try:
+        main = parse_mesh_for_pmx(
+            main_path, skeleton_path, expand_skeleton=True
+        )
+        child = parse_mesh_for_pmx(
+            child_path, skeleton_path, expand_skeleton=True
+        )
+        return _component_geometry_positions_safe(main.positions, child.positions)
+    except Exception:
+        return False
+
+
 def _shared_texture_component_positions_safe(
     main_path: Path,
     child_paths: list[Path],
@@ -14103,11 +14500,6 @@ def _shared_texture_component_positions_safe(
     """拒绝错位组件，以及与主体同边界的完整高低精度替代模型。"""
     try:
         main = parse_mesh(main_path)
-        main_min, main_max = _mesh_position_bounds(main.positions)
-        main_diagonal = max(
-            math.sqrt(sum((high - low) ** 2 for low, high in zip(main_min, main_max))),
-            1e-6,
-        )
         main_signature = (main.bone_names, main.bone_parents)
         for child_path in child_paths:
             child = parse_mesh(child_path)
@@ -14118,23 +14510,7 @@ def _shared_texture_component_positions_safe(
                     _transform_row_position(value, alignment)
                     for value in child.positions
                 ]
-            child_min, child_max = _mesh_position_bounds(positions)
-            values = (*child_min, *child_max)
-            if any(not math.isfinite(value) for value in values):
-                return False
-            if _matches_full_body_alternative_bounds(
-                main.positions, positions
-            ):
-                return False
-            separation = [
-                max(main_min[axis] - child_max[axis], child_min[axis] - main_max[axis], 0.0)
-                for axis in range(3)
-            ]
-            gap_ratio = math.sqrt(sum(value * value for value in separation)) / main_diagonal
-            child_diagonal = math.sqrt(
-                sum((high - low) ** 2 for low, high in zip(child_min, child_max))
-            )
-            if gap_ratio > 2.0 or child_diagonal / main_diagonal > 5.0:
+            if not _component_geometry_positions_safe(main.positions, positions):
                 return False
         return True
     except Exception:
@@ -14487,6 +14863,7 @@ def one_click_source_fingerprint(
         "schema": 2,
         "material_resolver": MATERIAL_RESOLVER_VERSION,
         "composite_resolver": COMPOSITE_RESOLVER_VERSION,
+        "facial_neutral_pose": FACIAL_NEUTRAL_POSE_VERSION,
         "pmx_output": PMX_OUTPUT_FORMAT_VERSION,
         "inputs": inputs,
     }
@@ -14523,6 +14900,7 @@ def write_one_click_state(output_root: Path, fingerprint: str) -> None:
                 "report_stamp": list(_file_build_stamp(report_path)),
                 "material_resolver": MATERIAL_RESOLVER_VERSION,
                 "composite_resolver": COMPOSITE_RESOLVER_VERSION,
+                "facial_neutral_pose": FACIAL_NEUTRAL_POSE_VERSION,
                 "pmx_output": PMX_OUTPUT_FORMAT_VERSION,
             },
             ensure_ascii=False,
@@ -14561,6 +14939,26 @@ def pmx_build_fingerprint(
         payload, ensure_ascii=False, sort_keys=True
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _composite_geometry_revisions(composite: CompositeModel) -> dict[str, int]:
+    """返回只属于当前组合几何的修订项，不污染无关 PMX 的增量键。"""
+    revisions: dict[str, int] = {}
+    skeleton_paths = composite.skeleton_paths or []
+    for mesh_path, skeleton_path in zip(composite.mesh_paths, skeleton_paths):
+        if skeleton_path is None:
+            continue
+        try:
+            bone_names, _, _ = read_mesh_bone_layout(mesh_path)
+        except Exception:
+            continue
+        if any(
+            _normalized_bone_key(name) in FACIAL_BONE_ROOT_KEYS
+            for name in bone_names
+        ):
+            revisions["facial_neutral_pose"] = FACIAL_NEUTRAL_POSE_VERSION
+            break
+    return revisions
 
 
 def _pmx_build_output_index(category_root: Path) -> dict[str, list[Path]]:
@@ -15210,6 +15608,10 @@ def save_composite_pmx(
             ),
             "static_bone_names": composite.static_bone_names,
             "static_matrices": composite.static_matrices,
+            "skeletons": [
+                path.stem.rsplit("_", 1)[-1] if path is not None else None
+                for path in (composite.skeleton_paths or [])
+            ],
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -15265,16 +15667,22 @@ def save_composite_pmx(
         pmx_build_fingerprint(path, package)
         for path, package in zip(composite.mesh_paths, composite.packages)
     ]
+    fingerprint_payload: dict[str, object] = {
+        "pipeline": PMX_OUTPUT_FORMAT_VERSION,
+        "composite_resolver": COMPOSITE_RESOLVER_VERSION,
+        "components": fingerprints,
+        "static_bone_names": composite.static_bone_names,
+        "static_matrices": composite.static_matrices,
+        "skeletons": [
+            _file_build_stamp(path) if path is not None else None
+            for path in (composite.skeleton_paths or [])
+        ],
+    }
+    # 局部几何规则必须按命中对象写入。未命中的组合保持旧指纹不变，因而
+    # 下一次一键运行只补做受影响模型，不再把几个小时的全量结果推倒重来。
+    fingerprint_payload.update(_composite_geometry_revisions(composite))
     fingerprint = hashlib.sha256(
-        json.dumps(
-            {
-                "pipeline": PMX_OUTPUT_FORMAT_VERSION,
-                "components": fingerprints,
-                "static_bone_names": composite.static_bone_names,
-                "static_matrices": composite.static_matrices,
-            },
-            sort_keys=True,
-        ).encode("utf-8")
+        json.dumps(fingerprint_payload, sort_keys=True).encode("utf-8")
     ).hexdigest()
     meta_path = model_output / ".build.json"
     if meta_path.is_file() and pmx_path.is_file():
@@ -15294,7 +15702,20 @@ def save_composite_pmx(
         return reusable[0], True
 
     # 骨骼管线升级时保留组合模型已有贴图，只重写 PMX。
-    meshes = [parse_mesh_for_pmx(path) for path in composite.mesh_paths]
+    if (
+        composite.skeleton_paths is not None
+        and len(composite.skeleton_paths) != len(composite.mesh_paths)
+    ):
+        raise MeshFormatError("GIM Skeleton 数量与 Mesh 数量不一致")
+    skeleton_paths = composite.skeleton_paths or [None] * len(composite.mesh_paths)
+    meshes = [
+        parse_mesh_for_pmx(
+            path,
+            skeleton_path,
+            expand_skeleton=skeleton_path is not None,
+        )
+        for path, skeleton_path in zip(composite.mesh_paths, skeleton_paths)
+    ]
     merged = merge_parsed_meshes(
         meshes,
         composite.static_bone_names,
@@ -16609,6 +17030,7 @@ def install_pmx_dependency() -> None:
             sys.executable, "-m", "pip", "install", "--upgrade",
             "pymeshio", "Pillow", "astc-encoder-py",
             "cryptography", "zstandard", "numpy", "moderngl",
+            "imageio-ffmpeg",
             "lz4",
         ]
     )
@@ -16731,11 +17153,15 @@ class RiggedMeshApp(tk.Tk):
         self.fast_reuse_var = tk.BooleanVar(value=True)
         self.status_var = tk.StringVar(value="选择阴阳师目录，然后选择一种一键解包方式。")
         self.progress_var = tk.DoubleVar(value=0.0)
+        self.progress_text_var = tk.StringVar(value="0.0%")
 
         self.rows: list[MeshSummary] = []
         self.visible_rows: list[MeshSummary] = []
         self.events: queue.Queue[tuple[str, object]] = queue.Queue()
         self.busy = False
+        self.task_started_at: float | None = None
+        self.status_updated_at: float | None = None
+        self.status_base_text = self.status_var.get()
         self.action_buttons: list[ttk.Button] = []
 
         self._build_ui()
@@ -16806,10 +17232,26 @@ class RiggedMeshApp(tk.Tk):
 
         status = ttk.Frame(self)
         status.pack(fill="x", **pad)
-        ttk.Progressbar(status, variable=self.progress_var, maximum=100).pack(
+        progress_row = ttk.Frame(status)
+        progress_row.pack(fill="x")
+        ttk.Progressbar(
+            progress_row, variable=self.progress_var, maximum=100
+        ).pack(
             fill="x", expand=True, side="left", padx=(0, 8)
         )
-        ttk.Label(status, textvariable=self.status_var, width=48).pack(side="right")
+        ttk.Label(
+            progress_row,
+            textvariable=self.progress_text_var,
+            width=7,
+            anchor="e",
+        ).pack(side="right")
+        ttk.Label(
+            status,
+            textvariable=self.status_var,
+            anchor="w",
+            justify="left",
+            wraplength=920,
+        ).pack(fill="x", pady=(5, 0))
 
         log_frame = ttk.LabelFrame(self, text="日志")
         log_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
@@ -16840,7 +17282,7 @@ class RiggedMeshApp(tk.Tk):
         if current in {path.resolve() for path in known_defaults}:
             self.output_var.set(str(self._default_output_for_mode()))
         mode_label = "旧版桌面 NPK" if self.source_mode_var.get() == "npk" else "新版移动端 WPK"
-        self.status_var.set(f"已选择{mode_label}；请确认游戏目录。")
+        self._set_status(f"已选择{mode_label}；请确认游戏目录。")
 
     def choose_input(self):
         old_mode = self.source_mode_var.get() == "npk"
@@ -16895,9 +17337,40 @@ class RiggedMeshApp(tk.Tk):
 
     def _set_busy(self, value: bool):
         self.busy = value
+        if value:
+            self.task_started_at = time.monotonic()
+            self.status_updated_at = self.task_started_at
+        else:
+            self.task_started_at = None
+            self.status_updated_at = None
         state = "disabled" if value else "normal"
         for button in self.action_buttons:
             button.configure(state=state)
+
+    @staticmethod
+    def _elapsed_text(seconds: float) -> str:
+        seconds = max(0, int(seconds))
+        hours, remainder = divmod(seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        if hours:
+            return f"{hours:d}:{minutes:02d}:{seconds:02d}"
+        return f"{minutes:02d}:{seconds:02d}"
+
+    def _set_status(self, text: object) -> None:
+        self.status_base_text = str(text)
+        self.status_updated_at = time.monotonic()
+        self._refresh_live_status()
+
+    def _refresh_live_status(self) -> None:
+        if not self.busy or self.task_started_at is None:
+            self.status_var.set(self.status_base_text)
+            return
+        now = time.monotonic()
+        step_started = self.status_updated_at or self.task_started_at
+        self.status_var.set(
+            f"{self.status_base_text}  ｜ 本步 {self._elapsed_text(now - step_started)}"
+            f" ｜ 总计 {self._elapsed_text(now - self.task_started_at)}"
+        )
 
     def _run_worker(self, target):
         if self.busy:
@@ -16905,6 +17378,7 @@ class RiggedMeshApp(tk.Tk):
             return
         self._set_busy(True)
         self.progress_var.set(0)
+        self.progress_text_var.set("0.0%")
         threading.Thread(target=target, daemon=True).start()
 
     def start_scan(self):
@@ -17026,7 +17500,7 @@ class RiggedMeshApp(tk.Tk):
                     row.status,
                 ),
             )
-        self.status_var.set(
+        self._set_status(
             f"带骨总数 {len(self.rows)}；当前显示 {len(self.visible_rows)}"
         )
 
@@ -17590,14 +18064,25 @@ class RiggedMeshApp(tk.Tk):
         def worker():
             wpk_reader = None
             archive_groups = None
+            phase_total = 13
+
+            def phase_status(number: int, detail: str) -> None:
+                self.events.put(
+                    (
+                        "status",
+                        f"总流程 [{number}/{phase_total}] {detail}",
+                    )
+                )
+
             try:
+                phase_status(1, "检查运行环境与资源变化")
                 try:
                     import pymeshio  # noqa: F401
                     import astc_encoder.pil_codec  # noqa: F401
                     from PIL import Image  # noqa: F401
                 except ImportError:
                     self.events.put(("log", "首次运行：正在自动安装 PMX 与贴图解码依赖……"))
-                    self.events.put(("status", "正在安装依赖"))
+                    phase_status(1, "首次运行，正在安装 PMX 与贴图依赖")
                     install_pmx_dependency()
 
                 preflight_thd_dir = (
@@ -17645,6 +18130,7 @@ class RiggedMeshApp(tk.Tk):
                             f"{old_thd_fingerprint}:"
                             f"{MATERIAL_RESOLVER_VERSION}:"
                             f"{COMPOSITE_RESOLVER_VERSION}:"
+                            f"{FACIAL_NEUTRAL_POSE_VERSION}:"
                             f"{PMX_OUTPUT_FORMAT_VERSION}"
                         ).encode("utf-8")
                     ).hexdigest()
@@ -17679,6 +18165,7 @@ class RiggedMeshApp(tk.Tk):
                 if old_mode and old_root is not None:
                     import onmyoji_npk as npk
 
+                    phase_status(2, "增量解包旧版 NPK 模型与贴图")
                     self.events.put((
                         "log",
                         "正在增量解包旧版 model1/model2/qmodel/tex_res NPK；"
@@ -17691,24 +18178,22 @@ class RiggedMeshApp(tk.Tk):
                         log=lambda text: self.events.put(("log", text)),
                         progress=lambda stem, done, total: (
                             self.events.put(("progress", done * 100 / total if total else 100)),
-                            self.events.put(("status", f"解包 {stem} {done}/{total}")),
+                            phase_status(2, f"解包 {stem} {done}/{total}"),
                         ),
                     )
 
                 if source_root is not None:
                     import onmyoji_wpk_gui as wpk
 
+                    phase_status(2, "读取新版 IDX/WPK 资源目录")
                     archive_groups = wpk.discover_groups(
                         source_root,
                         progress=lambda stem, done, total: (
                             self.events.put(
                                 ("progress", done * 100 / total if total else 100)
                             ),
-                            self.events.put(
-                                (
-                                    "status",
-                                    f"校验资源索引 {stem} {done}/{total}",
-                                )
+                            phase_status(
+                                2, f"校验资源索引 {stem} {done}/{total}"
                             ),
                         ),
                         stems={"model", *SUPPLEMENTAL_RIGGED_GROUPS},
@@ -17744,9 +18229,7 @@ class RiggedMeshApp(tk.Tk):
                                 self.events.put(
                                     ("progress", done * 100 / total if total else 100)
                                 ),
-                                self.events.put(
-                                    ("status", f"解包 {done}/{total}：{text}")
-                                ),
+                                phase_status(2, f"解包 {done}/{total}：{text}"),
                             ),
                             threading.Event(),
                         )
@@ -17781,7 +18264,7 @@ class RiggedMeshApp(tk.Tk):
                     self.events.put(
                         ("log", f"发现 APK 基础资源：{apk_path.name}，正在补齐模型 XML/KTX……")
                     )
-                    self.events.put(("status", "正在从 APK 补齐缺失模型资源"))
+                    phase_status(3, "从 APK 补齐缺失模型资源")
                     sync_apk_parent_resources(
                         apk_path,
                         model_folder,
@@ -17794,9 +18277,7 @@ class RiggedMeshApp(tk.Tk):
                                     done * 100 / total if total else 100,
                                 )
                             ),
-                            self.events.put(
-                                ("status", f"APK 补全 {done}/{total}")
-                            ),
+                            phase_status(3, f"APK 补全 {done}/{total}"),
                         ),
                     )
                 elif old_mode and thd_dir is not None:
@@ -17817,6 +18298,7 @@ class RiggedMeshApp(tk.Tk):
                 loose_model_folder = None
                 supplemental_mesh_paths: list[Path] = []
                 if source_root is not None:
+                    phase_status(3, "同步热更新散文件与额外资源包")
                     loose_model_folder = sync_loose_model_resources(
                         source_root,
                         model_folder,
@@ -17841,21 +18323,32 @@ class RiggedMeshApp(tk.Tk):
                                     done * 100 / total if total else 100,
                                 )
                             ),
-                            self.events.put(
-                                (
-                                    "status",
-                                    f"识别额外包 {stem} {done}/{total}",
-                                )
+                            phase_status(
+                                3, f"识别额外包 {stem} {done}/{total}"
                             ),
                         ),
                     )
-                    self.events.put(("status", "正在补齐额外资源包材质"))
+                    phase_status(3, "补齐额外资源包材质")
+                    self.events.put(("progress", 0))
+
+                    def report_supplemental_material(
+                        label: str, done: int, total: int
+                    ) -> None:
+                        self.events.put(
+                            ("progress", done * 100 / total if total else 100)
+                        )
+                        phase_status(
+                            3,
+                            f"额外包材质：{label} {done:,}/{total:,}",
+                        )
+
                     sync_supplemental_material_resources(
                         source_root,
                         model_folder,
                         thd_dir,
                         archive_groups=archive_groups,
                         log=lambda text: self.events.put(("log", text)),
+                        progress=report_supplemental_material,
                     )
 
                 # loose_model 先同步，随后 ZIP 只补其它来源仍缺失的内容 MD5；
@@ -17864,34 +18357,26 @@ class RiggedMeshApp(tk.Tk):
                     thd_dir is not None
                     and (thd_dir / "model.thx").is_file()
                 ):
-                    self.events.put(
-                        ("status", "正在增量读取热更新 ZIP 资源")
-                    )
+                    phase_status(3, "增量读取热更新 ZIP 资源")
                     hot_update_mesh_paths = sync_hot_update_zip_resources(
                         thd_dir,
                         model_folder,
                         log=lambda text: self.events.put(("log", text)),
                     )
-                    self.events.put(
-                        ("status", "正在保存并复用历史模型索引")
-                    )
+                    phase_status(3, "保存并复用历史模型索引")
                     sync_historical_model_indexes(
                         thd_dir,
                         model_folder,
                         log=lambda text: self.events.put(("log", text)),
                     )
-                    self.events.put(
-                        ("status", "正在闭合大白模官方材质依赖")
-                    )
+                    phase_status(3, "闭合大白模官方材质依赖")
                     sync_large_white_model_dependencies(
                         output_root,
                         thd_dir,
                         model_folder,
                         log=lambda text: self.events.put(("log", text)),
                     )
-                    self.events.put(
-                        ("status", "正在定向补齐大白模主贴图")
-                    )
+                    phase_status(3, "定向补齐大白模主贴图")
                     sync_large_white_remote_textures(
                         output_root,
                         thd_dir,
@@ -17899,7 +18384,7 @@ class RiggedMeshApp(tk.Tk):
                         log=lambda text: self.events.put(("log", text)),
                     )
 
-                self.events.put(("status", "正在扫描带骨模型"))
+                phase_status(4, "扫描全部带骨 Mesh")
 
                 def report_mesh_scan(label: str):
                     def callback(done: int, total: int) -> None:
@@ -17907,7 +18392,11 @@ class RiggedMeshApp(tk.Tk):
                             ("progress", done * 100 / total if total else 100)
                         )
                         self.events.put(
-                            ("status", f"扫描{label} Mesh {done}/{total}")
+                            (
+                                "status",
+                                f"总流程 [4/{phase_total}] 扫描{label} Mesh "
+                                f"{done}/{total}",
+                            )
                         )
 
                     return callback
@@ -17962,7 +18451,11 @@ class RiggedMeshApp(tk.Tk):
                     )
                     self.events.put(("progress", (number - 1) * 100 / total))
                     self.events.put(
-                        ("status", f"材质匹配 [{number}/{total}]：{label}")
+                        (
+                            "status",
+                            f"总流程 [5/{phase_total}] 材质匹配 "
+                            f"[{number}/{total}]：{label}",
+                        )
                     )
 
                 def report_thd_dependency(done: int, total: int) -> None:
@@ -17978,7 +18471,8 @@ class RiggedMeshApp(tk.Tk):
                     self.events.put(
                         (
                             "status",
-                            f"材质匹配 [{stage_number}/{stage_total}]："
+                            f"总流程 [5/{phase_total}] 材质匹配 "
+                            f"[{stage_number}/{stage_total}]："
                             f"THD 精确依赖 {done}/{total}",
                         )
                     )
@@ -18047,7 +18541,7 @@ class RiggedMeshApp(tk.Tk):
                     if len(variants_by_mesh.get(path.resolve(), [])) <= 1
                 }
                 self.events.put(("progress", 0))
-                self.events.put(("status", "正在分析主体与附件组合关系"))
+                phase_status(6, "分析主体与附件组合关系")
 
                 def report_composite_analysis(
                     label: str, done: int, total: int
@@ -18056,7 +18550,11 @@ class RiggedMeshApp(tk.Tk):
                         ("progress", done * 100 / total if total else 100)
                     )
                     self.events.put(
-                        ("status", f"组合分析：{label} {done}/{total}")
+                        (
+                            "status",
+                            f"总流程 [6/{phase_total}] 组合分析："
+                            f"{label} {done}/{total}",
+                        )
                     )
 
                 composite_models = build_composite_models(
@@ -18075,7 +18573,7 @@ class RiggedMeshApp(tk.Tk):
 
                 if source_root is not None:
                     self.events.put(("progress", 0))
-                    self.events.put(("status", "正在校验 model.idx / WPK 原包"))
+                    phase_status(7, "校验 model.idx / WPK 原包")
 
                     def report_wpk_validation(
                         stem: str, done: int, total: int
@@ -18086,7 +18584,8 @@ class RiggedMeshApp(tk.Tk):
                         self.events.put(
                             (
                                 "status",
-                                f"校验 {stem}.idx / WPK {done}/{total}",
+                                f"总流程 [7/{phase_total}] 校验 "
+                                f"{stem}.idx / WPK {done}/{total}",
                             )
                         )
 
@@ -18100,6 +18599,7 @@ class RiggedMeshApp(tk.Tk):
                 try:
                     import pmx_role_classifier as role_classifier
 
+                    phase_status(8, "准备角色名称与稀有度目录")
                     character_catalog, catalog_refreshed = (
                         role_classifier.prepare_character_catalog(
                             output_root, refresh=True
@@ -18141,6 +18641,7 @@ class RiggedMeshApp(tk.Tk):
                 output_categories = ("带贴图", "纯色材质", "未匹配贴图")
                 indexed_directory_count = 0
                 self.events.put(("progress", 0))
+                phase_status(9, "索引已有 PMX 输出，准备增量复用")
                 for category_number, category in enumerate(output_categories, 1):
                     category_root = output_root / category
                     if not category_root.is_dir():
@@ -18154,7 +18655,8 @@ class RiggedMeshApp(tk.Tk):
                     self.events.put(
                         (
                             "status",
-                            f"索引已有输出 [{category_number}/{len(output_categories)}]："
+                            f"总流程 [9/{phase_total}] 索引已有输出 "
+                            f"[{category_number}/{len(output_categories)}]："
                             f"{category}（已检查 {indexed_directory_count:,} 个目录）",
                         )
                     )
@@ -18168,7 +18670,7 @@ class RiggedMeshApp(tk.Tk):
                                 self.events.put(
                                     (
                                         "status",
-                                        f"索引已有输出 "
+                                        f"总流程 [9/{phase_total}] 索引已有输出 "
                                         f"[{category_number}/{len(output_categories)}]："
                                         f"{category}（已检查 "
                                         f"{indexed_directory_count:,} 个目录）",
@@ -18216,6 +18718,8 @@ class RiggedMeshApp(tk.Tk):
                 )
                 report_rows: list[list[object]] = []
                 ok = failed = textured = reused = 0
+                self.events.put(("progress", 0))
+                phase_status(10, f"生成独立 PMX 0/{len(rows)}")
                 for number, row in enumerate(rows, 1):
                     row_had_failure = False
                     desired_outputs: set[Path] = set()
@@ -18369,7 +18873,8 @@ class RiggedMeshApp(tk.Tk):
                     self.events.put(
                         (
                             "status",
-                            f"生成源 Mesh {number}/{len(rows)}；PMX {ok}；"
+                            f"总流程 [10/{phase_total}] 生成源 Mesh "
+                            f"{number}/{len(rows)}；PMX {ok}；"
                             f"带主贴图 {textured}；复用 {reused}；失败 {failed}",
                         )
                     )
@@ -18377,6 +18882,10 @@ class RiggedMeshApp(tk.Tk):
                 composite_ok = composite_reused = composite_failed = 0
                 composite_report_rows: list[list[object]] = []
                 successful_direct_components: set[Path] = set()
+                self.events.put(("progress", 0))
+                phase_status(
+                    11, f"生成主体与附件合并成品 0/{len(composite_models)}"
+                )
                 for composite_number, composite in enumerate(
                     composite_models, 1
                 ):
@@ -18431,9 +18940,19 @@ class RiggedMeshApp(tk.Tk):
                             )
                     self.events.put(
                         (
+                            "progress",
+                            composite_number * 100 / len(composite_models)
+                            if composite_models
+                            else 100,
+                        )
+                    )
+                    self.events.put(
+                        (
                             "status",
-                            f"生成合并成品 {composite_number}/"
-                            f"{len(composite_models)}",
+                            f"总流程 [11/{phase_total}] 生成合并成品 "
+                            f"{composite_number}/{len(composite_models)}；"
+                            f"成功 {composite_ok}；复用 {composite_reused}；"
+                            f"失败 {composite_failed}",
                         )
                     )
                 self.events.put(
@@ -18450,6 +18969,7 @@ class RiggedMeshApp(tk.Tk):
                     for composite in composite_models
                     if composite.direct_merge
                 }
+                phase_status(11, "清理已失效的旧组合输出")
                 removed_stale_composites = 0
                 for component_set, old_dirs in existing_direct_composite_dirs.items():
                     if component_set in desired_direct_component_sets:
@@ -18471,6 +18991,7 @@ class RiggedMeshApp(tk.Tk):
                 replaced_names = {
                     path.name for path in successful_direct_components
                 }
+                phase_status(11, "用确定组合替换对应独立部件")
                 removed_independent_dirs = 0
                 for component_path in successful_direct_components:
                     component_hash = component_path.stem.rsplit("_", 1)[-1][
@@ -18491,6 +19012,8 @@ class RiggedMeshApp(tk.Tk):
                         f"清理旧独立输出目录 {removed_independent_dirs} 个。",
                     )
                 )
+                self.events.put(("progress", 0))
+                phase_status(12, "写入组合、纹理与成品检查报告")
                 composite_report_path = output_root / "完整组合报告.csv"
                 with composite_report_path.open(
                     "w", newline="", encoding="utf-8-sig"
@@ -18627,18 +19150,19 @@ class RiggedMeshApp(tk.Tk):
                 try:
                     import pmx_role_classifier as role_classifier
 
-                    self.events.put(
-                        ("status", "正在按稀有度和中文角色名整理成品")
-                    )
+                    self.events.put(("progress", 0))
+                    phase_status(13, "按稀有度和中文角色名整理成品")
                     role_entries = role_classifier.scan_entries(
                         output_root,
                         progress=lambda done, total: self.events.put(
                             (
                                 "status",
                                 (
-                                    f"读取角色分类元数据 {done}/{total}"
+                                    f"总流程 [13/{phase_total}] 读取角色分类元数据 "
+                                    f"{done}/{total}"
                                     if total
-                                    else f"读取角色分类元数据：已发现 {done} 个"
+                                    else f"总流程 [13/{phase_total}] "
+                                    f"读取角色分类元数据：已发现 {done} 个"
                                 ),
                             )
                         ),
@@ -18656,7 +19180,8 @@ class RiggedMeshApp(tk.Tk):
                             self.events.put(
                                 (
                                     "status",
-                                    f"整理角色目录 {done}/{total}",
+                                    f"总流程 [13/{phase_total}] 整理角色目录 "
+                                    f"{done}/{total}",
                                 )
                             ),
                         ),
@@ -18676,7 +19201,9 @@ class RiggedMeshApp(tk.Tk):
                             f"{type(exc).__name__}: {exc}",
                         )
                     )
+                phase_status(13, "保存本次增量状态")
                 write_one_click_state(output_root, source_fingerprint)
+                self.events.put(("progress", 100))
                 summary = (
                     f"一键处理完成：PMX {ok}，其中已绑定主贴图 {textured}，"
                     f"增量复用 {reused}，失败 {failed}；"
@@ -18938,9 +19465,11 @@ class RiggedMeshApp(tk.Tk):
             while True:
                 kind, payload = self.events.get_nowait()
                 if kind == "status":
-                    self.status_var.set(str(payload))
+                    self._set_status(payload)
                 elif kind == "progress":
-                    self.progress_var.set(float(payload))
+                    percent = min(100.0, max(0.0, float(payload)))
+                    self.progress_var.set(percent)
+                    self.progress_text_var.set(f"{percent:.1f}%")
                 elif kind == "log":
                     self._log(str(payload))
                 elif kind == "scan_done":
@@ -18968,6 +19497,7 @@ class RiggedMeshApp(tk.Tk):
                     self._set_busy(bool(payload))
         except queue.Empty:
             pass
+        self._refresh_live_status()
         self.after(100, self._drain_events)
 
 

@@ -161,24 +161,57 @@ def decoder_path() -> Path:
     return Path(__file__).resolve().parent / "tools" / "onmyoji_acl_decode.exe"
 
 
-def decode_motion(path: Path, cache_root: Path | None = None) -> DecodedMotion:
+def motion_cache_path(path: Path, cache_root: Path | None = None) -> Path:
+    """Return the persistent decoded-file path without decoding the motion."""
+    path = Path(path)
+    stat = path.stat()
+    key = hashlib.sha1(
+        f"{path.resolve()}|{stat.st_size}|{stat.st_mtime_ns}".encode("utf-8")
+    ).hexdigest()
+    root = cache_root or (Path(__file__).resolve().parent / ".motion_cache")
+    return root / f"{key}.nanim"
+
+
+def _decoded_cache_header(
+    decoded_path: Path, header: MotionHeader
+) -> tuple[int, int, float, float, bool] | None:
+    """Validate a NANIM cache using only its 24-byte header and file size."""
+    try:
+        with decoded_path.open("rb") as stream:
+            raw_header = stream.read(24)
+        if len(raw_header) != 24 or raw_header[:8] != b"NANIM001":
+            return None
+        bone_count, flags, sample_count, sample_rate, duration = struct.unpack_from(
+            "<HHIff", raw_header, 8
+        )
+        expected = 24 + bone_count * sample_count * 10 * 4
+        if expected != decoded_path.stat().st_size:
+            return None
+        if bone_count != len(header.bone_names):
+            return None
+        return bone_count, sample_count, sample_rate, duration, bool(flags & 1)
+    except OSError:
+        return None
+
+
+def ensure_decoded_motion_cache(
+    path: Path, cache_root: Path | None = None
+) -> tuple[MotionHeader, Path, bool]:
+    """Persistently decode one RAWANIMA and report whether an old cache was reused."""
     header = read_motion_header(path)
     if header.version != 0:
         raise MotionFormatError(
             f"{Path(path).name}: RAWANIMA v{header.version} 暂不支持（当前支持 v0）"
         )
-    decoder = decoder_path()
-    if not decoder.is_file():
-        raise MotionFormatError("缺少 ACL 解码器：tools/onmyoji_acl_decode.exe")
-    stat = Path(path).stat()
-    key = hashlib.sha1(
-        f"{Path(path).resolve()}|{stat.st_size}|{stat.st_mtime_ns}".encode("utf-8")
-    ).hexdigest()
-    cache_root = cache_root or (Path(__file__).resolve().parent / ".motion_cache")
-    cache_root.mkdir(parents=True, exist_ok=True)
-    decoded_path = cache_root / f"{key}.nanim"
-    if not decoded_path.is_file():
+    decoded_path = motion_cache_path(path, cache_root)
+    decoded_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_hit = _decoded_cache_header(decoded_path, header) is not None
+    if not cache_hit:
+        decoder = decoder_path()
+        if not decoder.is_file():
+            raise MotionFormatError("缺少 ACL 解码器：tools/onmyoji_acl_decode.exe")
         temporary = decoded_path.with_suffix(".tmp")
+        temporary.unlink(missing_ok=True)
         completed = subprocess.run(
             [str(decoder), str(Path(path).resolve()), str(temporary)],
             capture_output=True,
@@ -191,26 +224,38 @@ def decode_motion(path: Path, cache_root: Path | None = None) -> DecodedMotion:
             temporary.unlink(missing_ok=True)
             detail = (completed.stderr or completed.stdout).strip()
             raise MotionFormatError(detail or f"ACL 解码失败（{completed.returncode}）")
+        if _decoded_cache_header(temporary, header) is None:
+            temporary.unlink(missing_ok=True)
+            raise MotionFormatError("ACL 解码结果格式异常")
         temporary.replace(decoded_path)
-    raw = decoded_path.read_bytes()
-    if len(raw) < 24 or raw[:8] != b"NANIM001":
+    return header, decoded_path, cache_hit
+
+
+def decode_motion_with_cache_info(
+    path: Path, cache_root: Path | None = None
+) -> tuple[DecodedMotion, bool]:
+    """Load a motion through the persistent cache without copying every frame."""
+    header, decoded_path, cache_hit = ensure_decoded_motion_cache(path, cache_root)
+    decoded_header = _decoded_cache_header(decoded_path, header)
+    if decoded_header is None:
         raise MotionFormatError("解码缓存格式异常")
-    bone_count, flags, sample_count, sample_rate, duration = struct.unpack_from(
-        "<HHIff", raw, 8
+    bone_count, sample_count, sample_rate, duration, has_scale = decoded_header
+    frames = np.memmap(
+        decoded_path,
+        dtype="<f4",
+        mode="r",
+        offset=24,
+        shape=(sample_count, bone_count, 10),
     )
-    expected = 24 + bone_count * sample_count * 10 * 4
-    if expected != len(raw):
-        raise MotionFormatError(
-            f"解码帧长度异常：应为 {expected}，实际 {len(raw)}"
-        )
-    if bone_count != len(header.bone_names):
-        raise MotionFormatError(
-            f"骨骼名称 {len(header.bone_names)} 个，ACL 轨道 {bone_count} 个"
-        )
-    frames = np.frombuffer(raw, dtype="<f4", offset=24).reshape(
-        sample_count, bone_count, 10
-    ).copy()
-    return DecodedMotion(header, frames, sample_rate, duration, bool(flags & 1))
+    return (
+        DecodedMotion(header, frames, sample_rate, duration, has_scale),
+        cache_hit,
+    )
+
+
+def decode_motion(path: Path, cache_root: Path | None = None) -> DecodedMotion:
+    motion, _cache_hit = decode_motion_with_cache_info(path, cache_root)
+    return motion
 
 
 def normalized_bone_name(name: str) -> str:

@@ -4,6 +4,7 @@ import struct
 import tempfile
 import unittest
 import base64
+import gc
 from pathlib import Path
 
 import numpy as np
@@ -16,8 +17,10 @@ from onmyoji_motion import (
     compose_global_row_matrices,
     cp932_field,
     find_animation_metadata,
+    decode_motion_with_cache_info,
     inverse_affine_row_matrix4,
     matrix4_multiply,
+    motion_cache_path,
     normalized_bone_name,
     trs_row_matrix4,
     quaternion_delta,
@@ -29,6 +32,51 @@ from onmyoji_rigged_mesh_gui import read_skeleton_hierarchy
 
 
 class MotionHeaderTests(unittest.TestCase):
+    def test_persistent_motion_cache_is_memory_mapped_and_reused(self) -> None:
+        skeleton = b"hero.skeleton"
+        names = (b"idle", b"root", b"child")
+        name_payload = struct.pack("<I", len(names)) + b"".join(
+            struct.pack("<I", len(value)) + value for value in names
+        )
+        source = (
+            b"RAWANIMA"
+            + b"\0" * 8
+            + struct.pack("<II", 0, 32)
+            + b"\0" * 16
+            + struct.pack("<I", len(skeleton))
+            + skeleton
+            + b"HEAD"
+            + struct.pack("<Iff", 32, 30.0, 1.0 / 30.0)
+            + b"\0" * 24
+            + b"DATA\0\0\0\0"
+            + b"NAME"
+            + struct.pack("<I", len(name_payload))
+            + name_payload
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "test.rawanimation"
+            path.write_bytes(source)
+            cache_root = root / "cache"
+            cache_path = motion_cache_path(path, cache_root)
+            cache_path.parent.mkdir(parents=True)
+            frames = np.zeros((2, 2, 10), dtype="<f4")
+            frames[:, :, 6] = 1.0
+            frames[:, :, 7:10] = 1.0
+            cache_path.write_bytes(
+                b"NANIM001"
+                + struct.pack("<HHIff", 2, 0, 2, 30.0, 1.0 / 30.0)
+                + frames.tobytes()
+            )
+
+            motion, cache_hit = decode_motion_with_cache_info(path, cache_root)
+            self.assertTrue(cache_hit)
+            self.assertIsInstance(motion.frames, np.memmap)
+            self.assertEqual(motion.frames.shape, (2, 2, 10))
+            self.assertEqual(float(motion.frames[0, 0, 6]), 1.0)
+            del motion
+            gc.collect()
+
     def test_reads_rawanima_v0_metadata_and_names(self) -> None:
         skeleton = b"../hero_test.skeleton"
         names = (b"idle", b"root", b"child")
