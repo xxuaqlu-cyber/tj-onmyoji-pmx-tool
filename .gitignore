@@ -1,9 +1,12 @@
 # Game assets and generated data (never publish these)
 /yys/
+/moba/
 /unpacked/
 /unpacked_npk/
+/unpacked_moba/
 /rigged_models/
 /rigged_models_npk/
+/rigged_models_moba/
 /backup/
 /tj-tool-lite/
 *.apk
@@ -19,6 +22,7 @@ __pycache__/
 tools/*.nanim
 tools/test_*.vmd
 /.resource_pull_settings.json
+/.resource_pull_settings_moba.json
 /.agents/
 /nul
 

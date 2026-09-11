@@ -9,13 +9,14 @@ from __future__ import annotations
 
 import csv
 import json
-from dataclasses import dataclass
+import os
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from thd_resource_index import read_model_thp, read_model_thx
 
 
-CACHE_SCHEMA = 3
+CACHE_SCHEMA = 5
 CACHE_FILENAME = "official_motion_bindings_v1.json"
 
 
@@ -34,6 +35,7 @@ class OfficialMotionBindings:
     motion_to_meshes: dict[str, frozenset[str]]
     mesh_paths: dict[str, tuple[Path, ...]]
     package_count: int
+    mesh_bone_names: dict[str, frozenset[str]] = field(default_factory=dict)
 
     @classmethod
     def load_or_build(cls, workspace: Path) -> "OfficialMotionBindings":
@@ -88,7 +90,11 @@ class OfficialMotionBindings:
                 str(name): tuple(Path(value) for value in values)
                 for name, values in payload["mesh_paths"].items()
             }
-            return cls(motions, meshes, int(payload["package_count"]))
+            mesh_bones = {
+                str(name): frozenset(str(value) for value in values)
+                for name, values in payload.get("mesh_bone_names", {}).items()
+            }
+            return cls(motions, meshes, int(payload["package_count"]), mesh_bones)
         except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
             return None
 
@@ -111,6 +117,10 @@ class OfficialMotionBindings:
                     key: [str(value) for value in values]
                     for key, values in result.mesh_paths.items()
                 },
+                "mesh_bone_names": {
+                    key: sorted(values)
+                    for key, values in result.mesh_bone_names.items()
+                },
                 "package_count": result.package_count,
             }
             temporary = path.with_suffix(".tmp")
@@ -124,6 +134,9 @@ class OfficialMotionBindings:
 
     @classmethod
     def _build(cls, model_root: Path, thd_root: Path) -> "OfficialMotionBindings":
+        from onmyoji_motion import normalized_bone_name, read_motion_header
+        from onmyoji_rigged_mesh_gui import read_mesh_bone_layout
+
         manifest = model_root / "manifest.csv"
         thx_path = thd_root / "model.thx"
         thp_path = thd_root / "model.thp"
@@ -164,6 +177,41 @@ class OfficialMotionBindings:
         record_by_hash = {record.name_hash: record for record in records}
         dependencies = read_model_thp(thp_path)
         motion_to_meshes: dict[str, set[str]] = {}
+        motion_bones: dict[str, frozenset[str]] = {}
+        mesh_bones: dict[str, frozenset[str]] = {}
+
+        def motion_signature(relative: str) -> frozenset[str]:
+            cached = motion_bones.get(relative)
+            if cached is not None:
+                return cached
+            try:
+                header = read_motion_header(model_root / relative)
+                cached = frozenset(
+                    normalized_bone_name(name) for name in header.bone_names
+                )
+            except Exception:
+                cached = frozenset()
+            motion_bones[relative] = cached
+            return cached
+
+        def mesh_signature(name: str) -> frozenset[str]:
+            cached = mesh_bones.get(name)
+            if cached is not None:
+                return cached
+            signatures: set[frozenset[str]] = set()
+            for path in mesh_paths.get(name, ()):
+                try:
+                    bone_names, _parents, _matrices = read_mesh_bone_layout(path)
+                    signature = frozenset(
+                        normalized_bone_name(value) for value in bone_names
+                    )
+                    if signature:
+                        signatures.add(signature)
+                except Exception:
+                    continue
+            cached = next(iter(signatures)) if len(signatures) == 1 else frozenset()
+            mesh_bones[name] = cached
+            return cached
 
         # A parent is the game's own package-level dependency list.  Mapping an
         # animation to its mesh children preserves exactly that relation.
@@ -183,18 +231,37 @@ class OfficialMotionBindings:
             if not motions or not meshes:
                 continue
             for motion in motions:
-                motion_to_meshes.setdefault(motion, set()).update(meshes)
+                animation_bones = motion_signature(motion)
+                if len(animation_bones) < 4:
+                    continue
+                compatible = {
+                    mesh
+                    for mesh in meshes
+                    if animation_bones.issubset(mesh_signature(mesh))
+                }
+                if compatible:
+                    motion_to_meshes.setdefault(motion, set()).update(compatible)
 
         return cls(
             {key: frozenset(value) for key, value in motion_to_meshes.items()},
             {key: tuple(value) for key, value in mesh_paths.items()},
             len(dependencies),
+            {key: value for key, value in mesh_bones.items() if value},
         )
 
     def candidate_meshes_for_motion(self, motion_path: Path, model_root: Path) -> frozenset[str]:
+        # This runs once per catalogue entry when exporting all model actions.
+        # Path.resolve() touches the filesystem and turns 37k in-memory lookups
+        # into tens of seconds on Windows, so calculate the relative key purely
+        # lexically after both paths have already been supplied as absolute or
+        # workspace-relative values.
+        motion_absolute = os.path.abspath(os.fspath(motion_path))
+        root_absolute = os.path.abspath(os.fspath(model_root))
         try:
-            relative = motion_path.resolve().relative_to(model_root.resolve())
-        except ValueError:
+            relative = os.path.relpath(motion_absolute, root_absolute)
+        except ValueError:  # Different Windows drive.
+            return frozenset()
+        if relative == os.pardir or relative.startswith(os.pardir + os.sep):
             return frozenset()
         return self.motion_to_meshes.get(_path_key(relative), frozenset())
 
@@ -205,3 +272,7 @@ class OfficialMotionBindings:
 
     def source_mesh_paths(self, source_mesh: str) -> tuple[Path, ...]:
         return self.mesh_paths.get(_resource_name(source_mesh), ())
+
+    def bone_names_for_mesh(self, source_mesh: str) -> frozenset[str]:
+        """Return the unpack-time bone signature for a logical source Mesh."""
+        return self.mesh_bone_names.get(_resource_name(source_mesh), frozenset())

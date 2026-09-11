@@ -16,6 +16,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
+import onmyoji_local_catalog as local_catalog
+
 
 RULES_NAME = "角色分类规则.json"
 CATALOG_NAME = "角色分类清单.csv"
@@ -55,6 +57,10 @@ class RoleEntry:
     fingerprint: str
     size_bucket: str
     manual: bool = False
+    hero_id: str = ""
+    skin_name: str = ""
+    skin_model: str = ""
+    index_source: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,6 +75,9 @@ class CharacterMetadata:
 
 
 _CHARACTER_CACHE: dict[str, tuple[int, list[CharacterMetadata]]] = {}
+_LOCAL_CATALOG_CACHE: dict[
+    str, tuple[int, local_catalog.LocalCatalog]
+] = {}
 
 
 def clean_token(value: str) -> str:
@@ -126,10 +135,93 @@ def _read_character_cache(path: Path) -> list[CharacterMetadata]:
         return []
 
 
+def _contains_cjk(value: str) -> bool:
+    return bool(re.search(r"[\u3400-\u9fff]", value))
+
+
+def prepare_local_resource_catalog(
+    output_root: Path | None = None,
+    force: bool = False,
+    progress: Callable[[int, int], None] | None = None,
+) -> tuple[local_catalog.LocalCatalog, bool, Path | None]:
+    """Load the game-internal hero/skin/model index near this PMX output."""
+    unpacked_root = local_catalog.find_unpacked_root(output_root)
+    if unpacked_root is None:
+        return local_catalog.LocalCatalog({}, {}, {}), False, None
+    cache_path = unpacked_root / local_catalog.INDEX_NAME
+    try:
+        stamp = cache_path.stat().st_mtime_ns
+    except OSError:
+        stamp = -1
+    memory = _LOCAL_CATALOG_CACHE.get(str(cache_path))
+    if memory and memory[0] == stamp and not force:
+        return memory[1], False, cache_path
+    try:
+        catalog, rebuilt, cache_path = local_catalog.load_or_build_catalog(
+            unpacked_root, force=force, progress=progress
+        )
+    except Exception:
+        # Local-table parsing is an enhancement.  An older official cache must
+        # remain usable if a future client changes its compiled table format.
+        return local_catalog.LocalCatalog({}, {}, {}, str(unpacked_root)), False, cache_path
+    try:
+        stamp = cache_path.stat().st_mtime_ns
+    except OSError:
+        stamp = -1
+    _LOCAL_CATALOG_CACHE[str(cache_path)] = (stamp, catalog)
+    return catalog, rebuilt, cache_path
+
+
+def _local_character_metadata(
+    catalog: local_catalog.LocalCatalog,
+) -> list[CharacterMetadata]:
+    return [
+        CharacterMetadata(
+            hero_id=item.hero_id,
+            name=item.name,
+            rarity=item.rarity,
+            rarity_value=item.rarity_value,
+            icon=item.icon,
+            material_type=item.material_type,
+        )
+        for item in catalog.heroes.values()
+    ]
+
+
+def _merge_character_catalogs(
+    local_rows: list[CharacterMetadata],
+    supplemental_rows: list[CharacterMetadata],
+) -> list[CharacterMetadata]:
+    """Prefer client data, using the API for staged/missing Chinese labels."""
+    merged = {item.hero_id: item for item in local_rows}
+    for item in supplemental_rows:
+        current = merged.get(item.hero_id)
+        if current is None:
+            merged[item.hero_id] = item
+        elif not _contains_cjk(current.name) and _contains_cjk(item.name):
+            merged[item.hero_id] = CharacterMetadata(
+                hero_id=current.hero_id,
+                name=item.name,
+                rarity=current.rarity or item.rarity,
+                rarity_value=current.rarity_value or item.rarity_value,
+                icon=current.icon or item.icon,
+                material_type=current.material_type or item.material_type,
+                interactive=item.interactive,
+            )
+    return sorted(merged.values(), key=lambda row: (_integer_sort_key(row.hero_id), row.name))
+
+
+def _integer_sort_key(value: str) -> tuple[int, str]:
+    try:
+        return int(value), value
+    except ValueError:
+        return 10**9, value
+
+
 def prepare_character_catalog(
     output_root: Path,
     refresh: bool = False,
-    max_age_seconds: int = 24 * 60 * 60,
+    max_age_seconds: int = 6 * 60 * 60,
 ) -> tuple[list[CharacterMetadata], bool]:
     """Load/cache the official id -> Chinese name/rarity/icon catalog.
 
@@ -137,6 +229,8 @@ def prepare_character_catalog(
     and unresolved resources stay under ``其他资源`` instead of being guessed.
     """
     output_root = output_root.resolve()
+    internal_catalog, _, _ = prepare_local_resource_catalog(output_root)
+    internal_rows = _local_character_metadata(internal_catalog)
     path = output_root / CHARACTER_CACHE_NAME
     try:
         stamp = path.stat().st_mtime_ns
@@ -151,9 +245,14 @@ def prepare_character_catalog(
         path.is_file()
         and time.time() - path.stat().st_mtime <= max_age_seconds
     )
-    if cached and (not refresh or fresh_enough):
+    # ``refresh`` means a real forced refresh.  Previously this condition was
+    # reversed: ordinary callers reused a cache forever, while forced refreshes
+    # still skipped the download for up to 24 hours.  That left newly released
+    # characters under their internal resource names until the cache happened
+    # to be old enough during a full export.
+    if cached and not refresh and fresh_enough:
         _CHARACTER_CACHE[str(path)] = (stamp, cached)
-        return cached, False
+        return _merge_character_catalogs(internal_rows, cached), False
 
     downloaded: list[dict[str, object]] = []
     try:
@@ -206,11 +305,11 @@ def prepare_character_catalog(
         temporary.replace(path)
         stamp = path.stat().st_mtime_ns
         _CHARACTER_CACHE[str(path)] = (stamp, parsed)
-        return parsed, True
+        return _merge_character_catalogs(internal_rows, parsed), True
     except Exception:
         if cached:
             _CHARACTER_CACHE[str(path)] = (stamp, cached)
-        return cached, False
+        return _merge_character_catalogs(internal_rows, cached), False
 
 
 def _compact_role_token(value: str) -> str:
@@ -474,6 +573,32 @@ def role_path_for_export(
     material_variant: str = "",
     component_labels: list[str] | None = None,
 ) -> Path | None:
+    rules = load_rules(output_root)
+    automatic, _ = infer_role(
+        model_name, texture_paths, material_names, material_variant, component_labels
+    )
+    identity_rules = rules.get("identity_rules", {})
+    family_rules = rules.get("family_rules", {})
+    manual = identity_rules.get(identity) if isinstance(identity_rules, dict) else None
+    family = family_rules.get(automatic) if isinstance(family_rules, dict) else None
+    if not manual and not family:
+        internal_catalog, _, _ = prepare_local_resource_catalog(output_root)
+        exact = internal_catalog.resolve([
+            model_name,
+            *(component_labels or []),
+            material_variant,
+            *texture_paths,
+        ])
+        if exact is not None:
+            characters, _ = prepare_character_catalog(output_root)
+            metadata = next(
+                (item for item in characters if item.hero_id == exact.hero_id), None
+            )
+            rarity = metadata.rarity if metadata is not None else exact.rarity
+            name = metadata.name if metadata is not None else exact.hero_name
+            return Path(safe_folder_name(rarity, "其他资源")) / safe_folder_name(
+                name, exact.source_model
+            )
     role = role_for_export(
         output_root,
         identity,
@@ -525,6 +650,8 @@ def scan_entries(
     if not category_root.is_dir():
         return entries
     character_catalog, _ = prepare_character_catalog(output_root)
+    internal_catalog, _, _ = prepare_local_resource_catalog(output_root)
+    characters_by_id = {item.hero_id: item for item in character_catalog}
     scanned = 0
     for metadata_path in category_root.rglob(".build.json"):
         scanned += 1
@@ -552,10 +679,29 @@ def scan_entries(
         family_key = automatic
         manual_role = identity_rules.get(identity)
         family_role = family_rules.get(family_key)
-        internal_role = normalize_role(str(manual_role or family_role or automatic))
-        rarity, display_role, metadata_match = classification_destination(
-            output_root, internal_role, character_catalog
-        )
+        local_match = None
+        if not manual_role and not family_role:
+            local_match = internal_catalog.resolve([
+                model_name,
+                str(metadata.get("source_mesh", "")),
+                *components,
+                variant,
+                *textures,
+            ])
+        if local_match is not None:
+            internal_role = normalize_role(local_match.source_model)
+            metadata_match = characters_by_id.get(local_match.hero_id)
+            if metadata_match is not None:
+                rarity = safe_folder_name(metadata_match.rarity, "其他资源")
+                display_role = safe_folder_name(metadata_match.name, internal_role)
+            else:
+                rarity = safe_folder_name(local_match.rarity, "其他资源")
+                display_role = safe_folder_name(local_match.hero_name, internal_role)
+        else:
+            internal_role = normalize_role(str(manual_role or family_role or automatic))
+            rarity, display_role, metadata_match = classification_destination(
+                output_root, internal_role, character_catalog
+            )
         relative = output_dir.relative_to(category_root.resolve())
         if relative.parts and relative.parts[0] == CLASSIFIED_FOLDER and len(relative.parts) >= 3:
             size_bucket = relative.parts[-2]
@@ -573,9 +719,14 @@ def scan_entries(
             evidence=(
                 evidence
                 + (
-                    f"；官方角色表:{metadata_match.icon}"
-                    if metadata_match is not None
-                    else "；未命中官方角色表"
+                    f"；游戏内角色/皮肤表:{local_match.model_id}→"
+                    f"{display_role}/{local_match.skin_name}"
+                    if local_match is not None
+                    else (
+                        f"；角色元数据:{metadata_match.icon}"
+                        if metadata_match is not None
+                        else "；未命中角色元数据"
+                    )
                 )
             ),
             output_dir=output_dir,
@@ -583,6 +734,18 @@ def scan_entries(
             fingerprint=str(metadata.get("fingerprint", "")),
             size_bucket=size_bucket,
             manual=bool(manual_role or family_role),
+            hero_id=(
+                local_match.hero_id
+                if local_match is not None
+                else metadata_match.hero_id if metadata_match is not None else ""
+            ),
+            skin_name=local_match.skin_name if local_match is not None else "",
+            skin_model=local_match.model_id if local_match is not None else "",
+            index_source=(
+                "游戏内角色/皮肤表"
+                if local_match is not None
+                else "角色元数据" if metadata_match is not None else ""
+            ),
         ))
     entries.sort(
         key=lambda item: (
@@ -602,13 +765,15 @@ def write_catalog(output_root: Path, entries: list[RoleEntry]) -> Path:
     with path.open("w", encoding="utf-8-sig", newline="") as stream:
         writer = csv.writer(stream)
         writer.writerow([
-            "稀有度", "角色分类", "内部分类", "自动分类", "人工规则",
+            "稀有度", "角色分类", "皮肤名称", "皮肤模型", "角色ID",
+            "索引来源", "内部分类", "自动分类", "人工规则",
             "模型名", "源Mesh", "组件列表", "分类依据", "PMX", "构建指纹",
             "稳定身份",
         ])
         for item in entries:
             writer.writerow([
-                item.rarity, item.role, item.internal_role, item.automatic_role,
+                item.rarity, item.role, item.skin_name, item.skin_model,
+                item.hero_id, item.index_source, item.internal_role, item.automatic_role,
                 "是" if item.manual else "否", item.model_name, item.source_mesh,
                 "|".join(item.components), item.evidence, str(item.pmx_path),
                 item.fingerprint, item.identity,

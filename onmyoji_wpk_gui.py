@@ -1280,6 +1280,29 @@ class WpkGui:
                     trial_limit,
                     self.skip_existing_var.get(),
                 )
+                if (
+                    trial_limit is None
+                    and any(group.stem.lower() == "script3" for group in groups)
+                    and not self.stop_event.is_set()
+                ):
+                    try:
+                        import onmyoji_local_catalog
+
+                        catalog, rebuilt, index_path = (
+                            onmyoji_local_catalog.load_or_build_catalog(output_root)
+                        )
+                        self.events.put((
+                            "log",
+                            f"游戏内角色索引{'已重建' if rebuilt else '已复用'}："
+                            f"式神 {len(catalog.heroes)}、皮肤模型 {len(catalog.models)}，"
+                            f"保存到 {index_path}",
+                        ))
+                    except Exception as exc:
+                        self.events.put((
+                            "log",
+                            "角色/皮肤索引暂未生成（不影响资源解包）："
+                            f"{type(exc).__name__}: {exc}",
+                        ))
                 self.events.put(("done", result, str(output_root)))
             except Exception:
                 self.events.put(("error", traceback.format_exc()))

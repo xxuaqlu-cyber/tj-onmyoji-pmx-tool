@@ -132,26 +132,32 @@ int wmain(int argc, wchar_t** argv) {
     Context context;
     context.initialize(clip);
     std::vector<acl::Transform_32> transforms(bone_count);
+    // One buffered write per frame is substantially faster than issuing one
+    // tiny ostream write for every bone, especially on antivirus-scanned disks.
+    std::vector<float> frame_values(static_cast<size_t>(bone_count) * 10);
     acl::DefaultOutputWriter writer(transforms.data(), bone_count);
     for (uint32_t sample_index = 0; sample_index < sample_count; ++sample_index) {
         const float sample_time = std::min(float(sample_index) / sample_rate, duration);
         context.seek(sample_time, acl::SampleRoundingPolicy::Nearest);
         context.decompress_pose(writer);
-        for (const acl::Transform_32& transform : transforms) {
-            const float values[10] = {
-                acl::vector_get_x(transform.translation),
-                acl::vector_get_y(transform.translation),
-                acl::vector_get_z(transform.translation),
-                acl::quat_get_x(transform.rotation),
-                acl::quat_get_y(transform.rotation),
-                acl::quat_get_z(transform.rotation),
-                acl::quat_get_w(transform.rotation),
-                acl::vector_get_x(transform.scale),
-                acl::vector_get_y(transform.scale),
-                acl::vector_get_z(transform.scale),
-            };
-            output.write(reinterpret_cast<const char*>(values), sizeof(values));
+        for (uint16_t bone_index = 0; bone_index < bone_count; ++bone_index) {
+            const acl::Transform_32& transform = transforms[bone_index];
+            float* values = frame_values.data() + static_cast<size_t>(bone_index) * 10;
+            values[0] = acl::vector_get_x(transform.translation);
+            values[1] = acl::vector_get_y(transform.translation);
+            values[2] = acl::vector_get_z(transform.translation);
+            values[3] = acl::quat_get_x(transform.rotation);
+            values[4] = acl::quat_get_y(transform.rotation);
+            values[5] = acl::quat_get_z(transform.rotation);
+            values[6] = acl::quat_get_w(transform.rotation);
+            values[7] = acl::vector_get_x(transform.scale);
+            values[8] = acl::vector_get_y(transform.scale);
+            values[9] = acl::vector_get_z(transform.scale);
         }
+        output.write(
+            reinterpret_cast<const char*>(frame_values.data()),
+            static_cast<std::streamsize>(frame_values.size() * sizeof(float))
+        );
     }
     if (!output.good()) {
         std::wcerr << L"failed while writing output\n";

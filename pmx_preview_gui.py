@@ -15,9 +15,10 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 import pmx_role_classifier as role_classifier
+from game_profiles import get_game_profile
 
 try:
     import numpy as np
@@ -34,7 +35,8 @@ except ImportError:  # pragma: no cover - software fallback remains available
     moderngl = None
 
 
-APP_TITLE = "PMX 批量预览器"
+GAME_PROFILE = get_game_profile()
+APP_TITLE = f"{GAME_PROFILE.display_name} PMX 批量预览器"
 MAX_GPU_PREVIEW_FACES = 200_000
 MAX_SOFTWARE_PREVIEW_FACES = 4_000
 MAX_TEXTURE_EDGE = 1024
@@ -353,7 +355,10 @@ def _add_dds_copies(target: Path) -> int:
 
 
 def copy_model_folder(
-    source: Path, destination_root: Path, texture_format: str = "default"
+    source: Path,
+    destination_root: Path,
+    texture_format: str = "default",
+    folder_name: str | None = None,
 ) -> tuple[Path, int]:
     """Copy a model folder and optionally add exact DDS texture companions."""
     source = source.resolve()
@@ -363,14 +368,32 @@ def copy_model_folder(
     if destination_root == source or destination_root.is_relative_to(source):
         raise ValueError("导出目录不能选在当前模型文件夹内部。")
     destination_root.mkdir(parents=True, exist_ok=True)
-    target = destination_root / source.name
+    export_name = validate_export_folder_name(folder_name or source.name)
+    target = destination_root / export_name
     suffix = 2
     while target.exists():
-        target = destination_root / f"{source.name}_{suffix}"
+        target = destination_root / f"{export_name}_{suffix}"
         suffix += 1
     shutil.copytree(source, target)
     dds_count = _add_dds_copies(target) if texture_format == "dds" else 0
     return target, dds_count
+
+
+def validate_export_folder_name(value: str) -> str:
+    """Validate one editable Windows folder name used by model export."""
+    value = value.strip().rstrip(" .")
+    if not value:
+        raise ValueError("导出文件夹名称不能为空。")
+    if value in {".", ".."} or re.search(r'[<>:"/\\|?*\x00-\x1f]', value):
+        raise ValueError("导出文件夹名称不能包含 \\ / : * ? \" < > | 等字符。")
+    reserved = {
+        "CON", "PRN", "AUX", "NUL",
+        *(f"COM{number}" for number in range(1, 10)),
+        *(f"LPT{number}" for number in range(1, 10)),
+    }
+    if value.split(".", 1)[0].upper() in reserved:
+        raise ValueError(f"“{value}”是 Windows 保留名称，请换一个名称。")
+    return value
 
 
 def _read_report_items(
@@ -663,8 +686,7 @@ class GpuPreviewRenderer:
         if moderngl is None:
             raise RuntimeError("未安装 ModernGL")
         self.ctx = moderngl.create_standalone_context(require=330)
-        self.program = self.ctx.program(
-            vertex_shader="""
+        camera_vertex_shader = """
                 #version 330
                 in vec3 in_position;
                 in vec2 in_uv;
@@ -691,8 +713,63 @@ class GpuPreviewRenderer:
                                        prot.z * depth_scale, 1.0);
                     v_uv = in_uv;
                 }
-            """,
-            fragment_shader="""
+            """
+        skinned_vertex_shader = """
+                #version 330
+                in vec3 in_position;
+                in vec2 in_uv;
+                in vec4 in_joints;
+                in vec4 in_weights;
+                uniform sampler2D u_bone_matrices;
+                uniform vec3 u_center;
+                uniform float u_radius;
+                uniform float u_yaw;
+                uniform float u_pitch;
+                uniform float u_zoom;
+                uniform vec2 u_fit;
+                uniform vec2 u_pan;
+                out vec2 v_uv;
+
+                vec3 transform_position(vec3 position, int bone_index) {
+                    vec4 p = vec4(position, 1.0);
+                    vec4 row0 = texelFetch(u_bone_matrices, ivec2(0, bone_index), 0);
+                    vec4 row1 = texelFetch(u_bone_matrices, ivec2(1, bone_index), 0);
+                    vec4 row2 = texelFetch(u_bone_matrices, ivec2(2, bone_index), 0);
+                    vec4 row3 = texelFetch(u_bone_matrices, ivec2(3, bone_index), 0);
+                    return vec3(
+                        dot(p, vec4(row0.x, row1.x, row2.x, row3.x)),
+                        dot(p, vec4(row0.y, row1.y, row2.y, row3.y)),
+                        dot(p, vec4(row0.z, row1.z, row2.z, row3.z))
+                    );
+                }
+
+                void main() {
+                    vec3 skinned = vec3(0.0);
+                    float total_weight = 0.0;
+                    for (int slot = 0; slot < 4; ++slot) {
+                        float weight = in_weights[slot];
+                        if (weight > 0.0) {
+                            skinned += transform_position(
+                                in_position, int(in_joints[slot] + 0.5)
+                            ) * weight;
+                            total_weight += weight;
+                        }
+                    }
+                    vec3 p = (total_weight > 0.0 ? skinned / total_weight : in_position)
+                        - u_center;
+                    float cy = cos(u_yaw), sy = sin(u_yaw);
+                    float cp = cos(u_pitch), sp = sin(u_pitch);
+                    vec3 yrot = vec3(cy * p.x + sy * p.z, p.y, -sy * p.x + cy * p.z);
+                    vec3 prot = vec3(yrot.x, cp * yrot.y - sp * yrot.z,
+                                     sp * yrot.y + cp * yrot.z);
+                    float screen_scale = 0.92 * u_zoom / u_radius;
+                    float depth_scale = 0.92 / u_radius;
+                    gl_Position = vec4(prot.xy * screen_scale * u_fit + u_pan,
+                                       prot.z * depth_scale, 1.0);
+                    v_uv = in_uv;
+                }
+            """
+        fragment_shader = """
                 #version 330
                 uniform sampler2D u_texture;
                 uniform int u_has_texture;
@@ -709,11 +786,22 @@ class GpuPreviewRenderer:
                     // through order-dependent depth writes.
                     frag_color = vec4(texel.rgb * u_base_color, 1.0);
                 }
-            """,
+            """
+        self.program = self.ctx.program(
+            vertex_shader=camera_vertex_shader,
+            fragment_shader=fragment_shader,
+        )
+        self.skin_program = self.ctx.program(
+            vertex_shader=skinned_vertex_shader,
+            fragment_shader=fragment_shader,
         )
         self.vbo = None
+        self.skin_vbo = None
         self.ibo = None
         self.vao = None
+        self.skin_vao = None
+        self.bone_texture = None
+        self.skin_bone_count = 0
         self.fbo = None
         self.color_target = None
         self.depth_target = None
@@ -724,11 +812,14 @@ class GpuPreviewRenderer:
         self.texture_cache_bytes = 0
 
     def _release_mesh(self) -> None:
-        for resource_name in ("vao", "ibo", "vbo"):
+        for resource_name in (
+            "skin_vao", "bone_texture", "skin_vbo", "vao", "ibo", "vbo"
+        ):
             resource = getattr(self, resource_name)
             if resource is not None:
                 resource.release()
                 setattr(self, resource_name, None)
+        self.skin_bone_count = 0
 
     @staticmethod
     def _texture_key(path: Path) -> tuple[str, int, int]:
@@ -804,6 +895,66 @@ class GpuPreviewRenderer:
         )
         self.vbo.write(packed.tobytes())
 
+    def prepare_skinning(
+        self, joints: np.ndarray, weights: np.ndarray, bone_count: int
+    ) -> None:
+        """Upload fixed skin weights once; animation then updates bone matrices only."""
+        if self.data is None or self.vbo is None or self.ibo is None:
+            raise RuntimeError("GPU 模型尚未准备")
+        joints = np.asarray(joints, dtype=np.float32)
+        weights = np.asarray(weights, dtype=np.float32)
+        expected = (len(self.data.positions), 4)
+        if joints.shape != expected or weights.shape != expected:
+            raise ValueError("蒙皮权重数量与模型顶点不一致")
+        if bone_count <= 0 or bone_count > int(self.ctx.info["GL_MAX_TEXTURE_SIZE"]):
+            raise ValueError(f"GPU 不支持该骨骼数量：{bone_count}")
+        for resource_name in ("skin_vao", "bone_texture", "skin_vbo"):
+            resource = getattr(self, resource_name)
+            if resource is not None:
+                resource.release()
+                setattr(self, resource_name, None)
+        packed_skin = np.ascontiguousarray(
+            np.column_stack((joints, weights)), dtype=np.float32
+        )
+        self.skin_vbo = self.ctx.buffer(packed_skin.tobytes())
+        self.skin_vao = self.ctx.vertex_array(
+            self.skin_program,
+            [
+                (self.vbo, "3f 2f", "in_position", "in_uv"),
+                (self.skin_vbo, "4f 4f", "in_joints", "in_weights"),
+            ],
+            self.ibo,
+            index_element_size=4,
+        )
+        identity = np.repeat(
+            np.eye(4, dtype=np.float32)[None, :, :], bone_count, axis=0
+        )
+        self.bone_texture = self.ctx.texture(
+            (4, bone_count), 4, np.ascontiguousarray(identity).tobytes(), dtype="f4"
+        )
+        self.bone_texture.filter = (moderngl.NEAREST, moderngl.NEAREST)
+        self.bone_texture.repeat_x = False
+        self.bone_texture.repeat_y = False
+        self.skin_bone_count = bone_count
+
+    def disable_skinning(self) -> None:
+        """Render the static mesh until a compatible animation is connected."""
+        for resource_name in ("skin_vao", "bone_texture", "skin_vbo"):
+            resource = getattr(self, resource_name)
+            if resource is not None:
+                resource.release()
+                setattr(self, resource_name, None)
+        self.skin_bone_count = 0
+
+    def update_bone_matrices(self, matrices: np.ndarray) -> None:
+        """Upload compact per-bone transforms for vertex-shader skinning."""
+        if self.bone_texture is None or self.skin_vao is None:
+            raise RuntimeError("GPU 蒙皮尚未准备")
+        matrices = np.asarray(matrices, dtype=np.float32)
+        if matrices.shape != (self.skin_bone_count, 4, 4):
+            raise ValueError("动画骨骼矩阵数量与模型不一致")
+        self.bone_texture.write(np.ascontiguousarray(matrices).tobytes())
+
     def _ensure_fbo(self, width: int, height: int) -> None:
         if self.fbo_size == (width, height):
             return
@@ -822,7 +973,9 @@ class GpuPreviewRenderer:
         pan_x: float, pan_y: float, wireframe: bool,
     ) -> Image.Image:
         data = self.data
-        if data is None or self.vao is None:
+        vao = self.skin_vao or self.vao
+        program = self.skin_program if self.skin_vao is not None else self.program
+        if data is None or vao is None:
             raise RuntimeError("GPU 模型尚未准备")
         self._ensure_fbo(width, height)
         self.fbo.use()
@@ -832,24 +985,27 @@ class GpuPreviewRenderer:
         self.ctx.wireframe = wireframe
         aspect = width / max(1, height)
         fit = (1.0 / max(1.0, aspect), min(1.0, aspect))
-        self.program["u_center"].value = tuple(float(value) for value in data.center)
-        self.program["u_radius"].value = data.radius
-        self.program["u_yaw"].value = yaw
-        self.program["u_pitch"].value = pitch
-        self.program["u_zoom"].value = zoom
-        self.program["u_fit"].value = fit
-        self.program["u_pan"].value = (
+        program["u_center"].value = tuple(float(value) for value in data.center)
+        program["u_radius"].value = data.radius
+        program["u_yaw"].value = yaw
+        program["u_pitch"].value = pitch
+        program["u_zoom"].value = zoom
+        program["u_fit"].value = fit
+        program["u_pan"].value = (
             2.0 * pan_x / max(1, width),
             -2.0 * pan_y / max(1, height),
         )
-        self.program["u_texture"].value = 0
+        program["u_texture"].value = 0
+        if self.skin_vao is not None and self.bone_texture is not None:
+            program["u_bone_matrices"].value = 1
+            self.bone_texture.use(location=1)
         for first, count, texture_index, color in data.material_batches:
             texture = self.active_textures.get(texture_index)
-            self.program["u_has_texture"].value = int(texture is not None)
-            self.program["u_base_color"].value = tuple(channel / 255.0 for channel in color)
+            program["u_has_texture"].value = int(texture is not None)
+            program["u_base_color"].value = tuple(channel / 255.0 for channel in color)
             if texture is not None:
                 texture.use(location=0)
-            self.vao.render(mode=moderngl.TRIANGLES, vertices=count, first=first)
+            vao.render(mode=moderngl.TRIANGLES, vertices=count, first=first)
         self.ctx.wireframe = False
         raw = self.fbo.read(components=3, alignment=1)
         return Image.frombytes("RGB", (width, height), raw).transpose(
@@ -968,6 +1124,9 @@ class PmxPreviewApp(tk.Tk):
         self.gpu_error = ""
         self.last_export_dir: Path | None = None
         self.last_export_texture_format = "default"
+        self.last_export_folder_name = ""
+        self.last_export_source: Path | None = None
+        self.classification_refreshing = False
 
         self._build_ui()
         try:
@@ -993,6 +1152,12 @@ class PmxPreviewApp(tk.Tk):
             side="left", padx=(6, 0)
         )
         ttk.Button(top, text="刷新", command=self.refresh_items).pack(side="left", padx=(6, 0))
+        if GAME_PROFILE.enable_role_classification:
+            ttk.Button(
+                top,
+                text="更新式神名称与分类",
+                command=self.refresh_character_classification,
+            ).pack(side="left", padx=(6, 0))
 
         filters = ttk.Frame(self, padding=(8, 0, 8, 8))
         filters.pack(fill="x")
@@ -1149,7 +1314,7 @@ class PmxPreviewApp(tk.Tk):
         scene_root = _scene_root_from(current)
         if scene_root is None:
             scene_root = _scene_root_from(
-                Path(__file__).resolve().parent / "rigged_models"
+                Path(__file__).resolve().parent / GAME_PROFILE.rigged_output_dir
             )
         if scene_root is None:
             messagebox.showinfo(
@@ -1176,6 +1341,76 @@ class PmxPreviewApp(tk.Tk):
                 self.after(0, lambda: messagebox.showerror(APP_TITLE, str(exc)))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def refresh_character_classification(self) -> None:
+        """Force-refresh official names and immediately rebuild role folders."""
+        if self.classification_refreshing:
+            return
+        root = Path(self.root_var.get()).resolve()
+        if not (root / "带贴图").is_dir():
+            messagebox.showinfo(
+                APP_TITLE,
+                "当前目录不是带贴图 PMX 输出目录，无法更新式神分类。",
+                parent=self,
+            )
+            return
+        self.classification_refreshing = True
+        self.status_var.set("正在读取游戏内式神与中文皮肤索引……")
+
+        def worker() -> None:
+            try:
+                local_data, _, _ = role_classifier.prepare_local_resource_catalog(root)
+                catalog, downloaded = role_classifier.prepare_character_catalog(
+                    root, refresh=True
+                )
+                entries = role_classifier.scan_entries(root)
+                moved, reports = role_classifier.apply_classification(root, entries)
+                self.after(
+                    0,
+                    lambda: self._finish_character_classification(
+                        len(catalog), len(local_data.models), downloaded,
+                        len(entries), moved, reports
+                    ),
+                )
+            except Exception as exc:
+                message = f"更新式神名称与分类失败：\n{type(exc).__name__}: {exc}"
+                self.after(0, lambda: self._character_classification_error(message))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_character_classification(
+        self,
+        character_count: int,
+        skin_count: int,
+        downloaded: bool,
+        model_count: int,
+        moved: int,
+        reports: int,
+    ) -> None:
+        self.classification_refreshing = False
+        source_note = (
+            "游戏内索引已更新，外部新角色资料已补充"
+            if downloaded else "已使用游戏内角色/皮肤索引与现有补充资料"
+        )
+        self.status_var.set(
+            f"{source_note}；式神 {character_count}，模型 {model_count}，调整分类 {moved}"
+        )
+        self.refresh_items()
+        messagebox.showinfo(
+            APP_TITLE,
+            f"{source_note}。\n\n"
+            f"式神资料：{character_count} 条\n"
+            f"中文皮肤模型索引：{skin_count} 条\n"
+            f"重新核对模型：{model_count} 个\n"
+            f"调整分类目录：{moved} 个\n"
+            f"同步报告：{reports} 份",
+            parent=self,
+        )
+
+    def _character_classification_error(self, message: str) -> None:
+        self.classification_refreshing = False
+        self.status_var.set("更新式神名称与分类失败")
+        messagebox.showerror(APP_TITLE, message, parent=self)
 
     def _finish_refresh(self, items: list[PreviewItem]) -> None:
         self.items = items
@@ -1643,6 +1878,9 @@ class PmxPreviewApp(tk.Tk):
         if not value:
             return
         self.last_export_dir = Path(value).resolve()
+        folder_name = self._ask_export_folder_name(item.path.parent)
+        if folder_name is None:
+            return
         use_dds = messagebox.askyesno(
             APP_TITLE,
             "导出贴图格式？\n\n是：在 textures 中额外生成无压缩 DDS（保留原 PNG）\n否：保持模型目录原有贴图格式",
@@ -1650,13 +1888,42 @@ class PmxPreviewApp(tk.Tk):
         )
         self.last_export_texture_format = "dds" if use_dds else "default"
         self.item_menu.entryconfigure("导出到上次选择目录", state="normal")
-        self._export_current_model_folder(self.last_export_dir)
+        self._export_current_model_folder(self.last_export_dir, folder_name)
 
     def export_to_last_folder(self) -> None:
-        if self.last_export_dir is not None:
-            self._export_current_model_folder(self.last_export_dir)
+        item = self.current_item()
+        if self.last_export_dir is not None and item is not None:
+            folder_name = self._ask_export_folder_name(item.path.parent)
+            if folder_name is not None:
+                self._export_current_model_folder(self.last_export_dir, folder_name)
 
-    def _export_current_model_folder(self, destination_root: Path) -> None:
+    def _ask_export_folder_name(self, source: Path) -> str | None:
+        initial = (
+            self.last_export_folder_name
+            if self.last_export_source == source.resolve()
+            and self.last_export_folder_name
+            else source.name
+        )
+        value = simpledialog.askstring(
+            APP_TITLE,
+            "请输入导出文件夹名称：",
+            initialvalue=initial,
+            parent=self,
+        )
+        if value is None:
+            return None
+        try:
+            value = validate_export_folder_name(value)
+        except ValueError as exc:
+            messagebox.showerror(APP_TITLE, str(exc), parent=self)
+            return None
+        self.last_export_source = source.resolve()
+        self.last_export_folder_name = value
+        return value
+
+    def _export_current_model_folder(
+        self, destination_root: Path, folder_name: str | None = None
+    ) -> None:
         item = self.current_item()
         if item is None:
             return
@@ -1673,12 +1940,16 @@ class PmxPreviewApp(tk.Tk):
             messagebox.showerror(APP_TITLE, str(exc), parent=self)
             return
 
-        self.status_var.set(f"正在复制整个模型文件夹：{source.name}……")
+        export_name = folder_name or source.name
+        self.status_var.set(f"正在导出模型文件夹：{export_name}……")
 
         def worker() -> None:
             try:
                 target, dds_count = copy_model_folder(
-                    source, destination_root, self.last_export_texture_format
+                    source,
+                    destination_root,
+                    self.last_export_texture_format,
+                    folder_name=folder_name,
                 )
                 self.after(0, lambda: self._finish_folder_export(target, dds_count))
             except Exception as exc:
@@ -1709,7 +1980,7 @@ class PmxPreviewApp(tk.Tk):
 
 
 def default_root() -> Path:
-    root = Path(__file__).resolve().parent / "rigged_models" / "PMX输出"
+    root = Path(__file__).resolve().parent / GAME_PROFILE.rigged_output_dir / "PMX输出"
     return root
 
 

@@ -3,21 +3,35 @@ from __future__ import annotations
 import json
 import os
 import queue
+import re
 import shlex
 import shutil
 import subprocess
 import sys
+import tarfile
 import threading
 import tkinter as tk
 from pathlib import Path, PurePosixPath
 from tkinter import filedialog, messagebox, ttk
 
+from game_profiles import get_game_profile
+
 
 APP_DIR = Path(__file__).resolve().parent
-SETTINGS_PATH = APP_DIR / ".resource_pull_settings.json"
+GAME_PROFILE = get_game_profile()
+APP_TITLE = f"{GAME_PROFILE.display_name}资源拉取工具"
+SETTINGS_PATH = APP_DIR / GAME_PROFILE.settings_filename
 DEFAULT_DEVICE = "127.0.0.1:7555"
-DEFAULT_REMOTE = "/sdcard/Android/data/com.netease.onmyoji.wyzymnqsd_cps"
-SYNC_MANIFEST_NAME = ".yys_sync_manifest.json"
+DEFAULT_REMOTE = (
+    f"package:{GAME_PROFILE.default_package}"
+    if GAME_PROFILE.key == "moba"
+    else f"/sdcard/Android/data/{GAME_PROFILE.default_package}"
+)
+SYNC_MANIFEST_NAME = GAME_PROFILE.manifest_filename
+MOBA_APK_ASSET_MANIFEST = ".moba_apk_assets.json"
+MOBA_FULL_SYNC_MANIFEST = ".moba_full_sync_manifest.json"
+MOBA_ROOT_ANDROID_DATA = "/data/media/0/Android/data"
+MOBA_MODEL_ASSET_RE = re.compile(r"^assets/(?:hero\d+|res)\.npk$", re.I)
 PULL_BATCH_FILES = 100
 PULL_BATCH_CHARS = 24_000
 
@@ -84,7 +98,7 @@ def format_device_label(device: dict[str, str]) -> str:
     return f"{serial}（{model}）" if model else serial
 
 
-def onmyoji_package_candidates(package_output: str) -> list[str]:
+def game_package_candidates(package_output: str) -> list[str]:
     packages: list[str] = []
     excluded = {
         "com.netease.yysbwp",  # 阴阳师：百闻牌，不是阴阳师本体
@@ -98,14 +112,14 @@ def onmyoji_package_candidates(package_output: str) -> list[str]:
         lowered = name.lower()
         if name in excluded:
             continue
-        if "onmyoji" in lowered:
+        if any(keyword in lowered for keyword in GAME_PROFILE.package_keywords):
             packages.append(name)
-    known = [
-        "com.netease.onmyoji.wyzymnqsd_cps",
-        "com.netease.onmyoji.wyzymnqsd",
-        "com.netease.onmyoji",
-    ]
-    return list(dict.fromkeys([*packages, *known]))
+    return list(dict.fromkeys([*packages, *GAME_PROFILE.package_names]))
+
+
+def onmyoji_package_candidates(package_output: str) -> list[str]:
+    """兼容旧调用；实际按当前游戏配置筛选包名。"""
+    return game_package_candidates(package_output)
 
 
 def subprocess_flags() -> int:
@@ -118,7 +132,7 @@ def load_settings() -> dict[str, str]:
         "mumu_dir": "",
         "device": DEFAULT_DEVICE,
         "remote": DEFAULT_REMOTE,
-        "output": str(APP_DIR / "yys"),
+        "output": str(APP_DIR / GAME_PROFILE.local_resource_dir),
     }
     try:
         saved = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
@@ -129,6 +143,8 @@ def load_settings() -> dict[str, str]:
             value = saved.get(key)
             if isinstance(value, str) and value.strip():
                 defaults[key] = value.strip()
+    if GAME_PROFILE.key == "moba" and not defaults["remote"].startswith("package:"):
+        defaults["remote"] = DEFAULT_REMOTE
     return defaults
 
 
@@ -260,7 +276,7 @@ def pull_batches(
 class ResourcePullApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("阴阳师资源拉取工具")
+        self.root.title(APP_TITLE)
         self.root.geometry("860x620")
         self.root.minsize(720, 520)
 
@@ -314,7 +330,8 @@ class ResourcePullApp:
             row=2, column=2, sticky="ew", pady=5
         )
 
-        ttk.Label(outer, text="Android 源目录").grid(row=3, column=0, sticky="w", pady=5)
+        source_label = "游戏包名" if GAME_PROFILE.key == "moba" else "Android 源目录"
+        ttk.Label(outer, text=source_label).grid(row=3, column=0, sticky="w", pady=5)
         ttk.Entry(outer, textvariable=self.remote_var).grid(
             row=3, column=1, columnspan=2, sticky="ew", padx=(10, 0), pady=5
         )
@@ -327,12 +344,21 @@ class ResourcePullApp:
             row=4, column=2, sticky="ew", pady=5
         )
 
-        note = (
-            "先选择 MuMu 目录并检测设备，再从下拉框选择实例；工具会自动查找阴阳师目录。"
-            "默认保存到本工具所在目录下的 yys；所有字段均可修改并会保存在本机。"
-            "增量模式只下载新增、变化或本地缺失的文件；完整模式会重新下载全部文件。"
-            "拉取前请先在模拟器内完成游戏更新。"
-        )
+        if GAME_PROFILE.key == "moba":
+            note = (
+                "决战平安京完整模式会通过 MuMu root 视角镜像 APK、Android/data、"
+                "应用私有目录与 OBB；其中 Documents\\extend\\hero 的按式神 NPK 会完整保留。"
+                "不会再使用 /storage/emulated/0 的受限视图，避免漏掉大资源。"
+                f"默认保存到 {GAME_PROFILE.local_resource_dir}\\com.netease.moba；"
+                "增量模式只更新新增、变化或本地缺失文件。"
+            )
+        else:
+            note = (
+                f"先选择 MuMu 目录并检测设备，再从下拉框选择实例；工具会自动查找{GAME_PROFILE.display_name}目录。"
+                f"默认保存到本工具所在目录下的 {GAME_PROFILE.local_resource_dir}；所有字段均可修改并会保存在本机。"
+                "增量模式只下载新增、变化或本地缺失的文件；完整模式会重新下载全部文件。"
+                "拉取前请先在模拟器内完成游戏更新。"
+            )
         ttk.Label(outer, text=note, foreground="#555555", wraplength=790).grid(
             row=5, column=0, columnspan=3, sticky="w", pady=(6, 10)
         )
@@ -342,7 +368,9 @@ class ResourcePullApp:
         self.connect_button = ttk.Button(actions, text="连接并检测", command=self.connect_device)
         self.connect_button.pack(side="left")
         self.pull_button = ttk.Button(
-            actions, text="完整拉取全部资源", command=self.start_pull
+            actions,
+            text=("完整拉取整个游戏" if GAME_PROFILE.key == "moba" else "完整拉取全部资源"),
+            command=self.start_pull,
         )
         self.pull_button.pack(side="left", padx=8)
         self.incremental_button = ttk.Button(
@@ -495,12 +523,38 @@ class ResourcePullApp:
             raise RuntimeError(output.strip() or f"设备 {device} 当前不可用。")
 
     def read_remote_manifest(
-        self, adb: str, device: str, remote: str
+        self,
+        adb: str,
+        device: str,
+        remote: str,
+        *,
+        prune_paths: tuple[str, ...] = (),
+        allow_empty: bool = False,
     ) -> dict[str, dict[str, int]]:
         remote_root = remote.rstrip("/")
+        if allow_empty:
+            code, probe = self.run_command(
+                [
+                    adb,
+                    "-s",
+                    device,
+                    "shell",
+                    f"find {shlex.quote(remote_root)} -type f -print -quit",
+                ],
+                log_output=False,
+            )
+            if code != 0 or not probe.strip():
+                self.events.put(("log", f"远端目录为空或不存在：{remote_root}"))
+                return {}
+        find_parts = [f"find {shlex.quote(remote_root)}"]
+        for prune_path in prune_paths:
+            find_parts.append(
+                f"-path {shlex.quote(prune_path.rstrip('/'))} -prune -o"
+            )
+        find_parts.append("-type f -print0")
         shell_command = (
-            f"find {shlex.quote(remote_root)} -type f -print0 | "
-            "xargs -0 -n 100 stat -c '%s|%Y|%n'"
+            " ".join(find_parts)
+            + " | xargs -0 -n 100 stat -c '%s|%Y|%n'"
         )
         self.events.put(("log", "正在读取远端文件大小和修改时间…"))
         code, output = self.run_command(
@@ -511,6 +565,9 @@ class ResourcePullApp:
             raise InterruptedError("用户停止了拉取。")
         if code != 0:
             raise RuntimeError(output.strip() or "读取远端文件清单失败。")
+        if allow_empty and not output.strip():
+            self.events.put(("log", f"远端目录为空：{remote_root}"))
+            return {}
         manifest = parse_remote_manifest(output, remote_root)
         self.events.put(("log", f"远端文件清单：{len(manifest)} 个文件。"))
         return manifest
@@ -585,7 +642,19 @@ class ResourcePullApp:
                     [adb, "-s", device, "shell", "pm", "list", "packages"],
                     log_output=False,
                 )[1]
-                packages = onmyoji_package_candidates(packages_output)
+                if GAME_PROFILE.key == "moba":
+                    package = GAME_PROFILE.default_package
+                    code, path_output = self.run_command(
+                        [adb, "-s", device, "shell", "pm", "path", package],
+                        log_output=False,
+                    )
+                    if code == 0 and "package:" in path_output:
+                        self.events.put(("remote", f"package:{package}"))
+                        self.events.put(("log", f"已自动找到{GAME_PROFILE.display_name} APK：{package}"))
+                    else:
+                        self.events.put(("log", f"未找到已安装的{GAME_PROFILE.display_name}：{package}"))
+                    return
+                packages = game_package_candidates(packages_output)
                 bases = ["/sdcard/Android/data", "/storage/emulated/0/Android/data"]
                 paths = [f"{base}/{package}" for base in bases for package in packages]
                 for remote in paths:
@@ -595,9 +664,9 @@ class ResourcePullApp:
                     )
                     if code == 0:
                         self.events.put(("remote", remote))
-                        self.events.put(("log", f"已自动找到阴阳师目录：{remote}"))
+                        self.events.put(("log", f"已自动找到{GAME_PROFILE.display_name}目录：{remote}"))
                         return
-                # 某些渠道包的包名不含 onmyoji，最后从 Android/data 目录名兜底筛选。
+                # 某些渠道包名可能与预设不同，最后从 Android/data 目录名兜底筛选。
                 code, listing = self.run_command(
                     [
                         adb,
@@ -620,19 +689,940 @@ class ResourcePullApp:
                     matches = [
                         line.strip()
                         for line in listing.splitlines()
-                        if line.strip() and "onmyoji" in PurePosixPath(line.strip()).name.lower()
+                        if line.strip()
+                        and any(
+                            keyword in PurePosixPath(line.strip()).name.lower()
+                            for keyword in GAME_PROFILE.package_keywords
+                        )
                     ]
                     if matches:
                         self.events.put(("remote", matches[0]))
-                        self.events.put(("log", f"已自动找到阴阳师目录：{matches[0]}"))
+                        self.events.put(("log", f"已自动找到{GAME_PROFILE.display_name}目录：{matches[0]}"))
                         return
-                self.events.put(("log", "未自动找到阴阳师目录，请手动填写 Android 源目录。"))
+                self.events.put(("log", f"未自动找到{GAME_PROFILE.display_name}目录，请手动填写 Android 源目录。"))
             except Exception as exc:
-                self.events.put(("log", f"自动查找阴阳师目录失败：{exc}"))
+                self.events.put(("log", f"自动查找{GAME_PROFILE.display_name}目录失败：{exc}"))
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _moba_package_name(self) -> str:
+        value = self.remote_var.get().strip()
+        if value.startswith("package:"):
+            value = value.split(":", 1)[1].strip()
+        if value and "/" not in value:
+            return value
+        return GAME_PROFILE.default_package
+
+    def _moba_apk_catalog(
+        self, adb: str, device: str, package: str
+    ) -> tuple[str, dict[str, int], list[tuple[str, int]]]:
+        code, output = self.run_command(
+            [adb, "-s", device, "shell", "pm", "path", package],
+            log_output=False,
+        )
+        paths = [
+            line.split("package:", 1)[1].strip()
+            for line in output.splitlines()
+            if line.strip().startswith("package:")
+        ]
+        if code != 0 or not paths:
+            raise RuntimeError(f"找不到已安装的 {package} APK。")
+        apk_path = paths[0]
+        code, size_output = self.run_command(
+            [adb, "-s", device, "shell", "stat", "-c", "%s", apk_path],
+            log_output=False,
+        )
+        if code != 0:
+            raise RuntimeError("无法读取决战平安京 APK 文件大小。")
+        code, mtime_output = self.run_command(
+            [adb, "-s", device, "shell", "stat", "-c", "%Y", apk_path],
+            log_output=False,
+        )
+        if code != 0:
+            raise RuntimeError("无法读取决战平安京 APK 修改时间。")
+        try:
+            apk_stamp = {
+                "size": int(size_output.strip()),
+                "mtime": int(mtime_output.strip()),
+            }
+        except (ValueError, TypeError):
+            raise RuntimeError(
+                "无法解析 APK 文件信息："
+                f"size={size_output.strip()!r}, mtime={mtime_output.strip()!r}"
+            )
+
+        code, listing = self.run_command(
+            [adb, "-s", device, "shell", "unzip", "-l", apk_path],
+            log_output=False,
+        )
+        if code != 0:
+            raise RuntimeError("无法读取 APK 内的 NPK 资源列表。")
+        assets: list[tuple[str, int]] = []
+        for line in listing.splitlines():
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            name = parts[-1]
+            if not MOBA_MODEL_ASSET_RE.match(name):
+                continue
+            try:
+                size = int(parts[0])
+            except ValueError:
+                continue
+            assets.append((name, size))
+        assets.sort(
+            key=lambda item: (
+                0 if Path(item[0]).stem.lower().startswith("hero") else 1,
+                int(re.search(r"(\d+)", Path(item[0]).stem).group(1))
+                if re.search(r"(\d+)", Path(item[0]).stem) else 999,
+                item[0].lower(),
+            )
+        )
+        if not assets:
+            raise RuntimeError("APK 内没有找到 hero*.npk / res.npk。")
+        return apk_path, apk_stamp, assets
+
+    def _stream_moba_apk_asset(
+        self,
+        adb: str,
+        device: str,
+        apk_path: str,
+        asset_name: str,
+        target: Path,
+        expected_size: int,
+    ) -> None:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_name(target.name + ".part")
+        try:
+            with temporary.open("wb") as stream:
+                process = subprocess.Popen(
+                    [
+                        adb, "-s", device, "exec-out", "unzip", "-p",
+                        apk_path, asset_name,
+                    ],
+                    stdout=stream,
+                    stderr=subprocess.PIPE,
+                    creationflags=subprocess_flags(),
+                )
+                self.current_process = process
+                _stdout, stderr = process.communicate()
+                self.current_process = None
+                if self.cancel_requested:
+                    raise InterruptedError("用户停止了拉取。")
+                if process.returncode != 0:
+                    detail = (stderr or b"").decode("utf-8", "replace").strip()
+                    raise RuntimeError(detail or f"APK 资源抽取失败：{asset_name}")
+            actual_size = temporary.stat().st_size
+            if actual_size != expected_size:
+                raise RuntimeError(
+                    f"{asset_name} 大小校验失败：{actual_size} != {expected_size}"
+                )
+            temporary.replace(target)
+        finally:
+            self.current_process = None
+            if temporary.exists():
+                try:
+                    temporary.unlink()
+                except OSError:
+                    pass
+
+    def _read_moba_root_manifest(
+        self,
+        adb: str,
+        device: str,
+        remote_root: str,
+        *,
+        allow_empty: bool = False,
+    ) -> dict[str, dict[str, int]]:
+        """读取 MuMu root 视角的 Android/data 清单。
+
+        MuMu 对 /storage/emulated/0 的普通 shell 视图会隐藏决战平安京的大资源，
+        但真实文件仍位于 /data/media/0/Android/data/...。因此平安京完整同步必须
+        通过 su 读取该物理目录，不能再依赖普通 sdcard FUSE 视图。
+        """
+        remote_root = remote_root.rstrip("/")
+        shell_command = (
+            f"find {shlex.quote(remote_root)} -type f "
+            "-exec stat -c '%s|%Y|%n' {} +"
+        )
+        self.events.put(("log", "正在以 root 视角读取完整游戏文件清单…"))
+        code, output = self.run_command(
+            [
+                adb,
+                "-s",
+                device,
+                "shell",
+                f"su -c {shlex.quote(shell_command)}",
+            ],
+            log_output=False,
+        )
+        if self.cancel_requested:
+            raise InterruptedError("用户停止了拉取。")
+        if code != 0:
+            raise RuntimeError(output.strip() or "root 文件清单读取失败。")
+        if allow_empty and not output.strip():
+            self.events.put(("log", f"root 远端目录为空：{remote_root}"))
+            return {}
+        manifest = parse_remote_manifest(output, remote_root)
+        self.events.put(("log", f"root 完整清单：{len(manifest):,} 个文件。"))
+        return manifest
+
+    def _stream_moba_root_file(
+        self,
+        adb: str,
+        device: str,
+        remote_path: str,
+        target: Path,
+        expected_size: int,
+    ) -> None:
+        """通过 su + cat 流式读取普通 shell 无权限访问的单个文件。"""
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_name(target.name + ".part")
+        try:
+            command = f"cat {shlex.quote(remote_path)}"
+            with temporary.open("wb") as stream:
+                process = subprocess.Popen(
+                    [
+                        adb,
+                        "-s",
+                        device,
+                        "exec-out",
+                        "su",
+                        "-c",
+                        command,
+                    ],
+                    stdout=stream,
+                    stderr=subprocess.PIPE,
+                    creationflags=subprocess_flags(),
+                )
+                self.current_process = process
+                _stdout, stderr = process.communicate()
+                self.current_process = None
+                if self.cancel_requested:
+                    raise InterruptedError("用户停止了拉取。")
+                if process.returncode != 0:
+                    detail = (stderr or b"").decode("utf-8", "replace").strip()
+                    raise RuntimeError(detail or f"root 文件拉取失败：{remote_path}")
+            actual_size = temporary.stat().st_size
+            if actual_size != expected_size:
+                raise RuntimeError(
+                    f"root 文件大小校验失败：{remote_path}；"
+                    f"{actual_size} != {expected_size}"
+                )
+            temporary.replace(target)
+        finally:
+            self.current_process = None
+            if temporary.exists():
+                try:
+                    temporary.unlink()
+                except OSError:
+                    pass
+
+    def _stream_moba_root_tree(
+        self,
+        adb: str,
+        device: str,
+        remote_root: str,
+        local_root: Path,
+        manifest: dict[str, dict[str, int]],
+    ) -> None:
+        """首次全量同步时用 root tar 单流传输整个 Android/data 树。"""
+        local_root.mkdir(parents=True, exist_ok=True)
+        total_files = len(manifest)
+        total_bytes = sum(row["size"] for row in manifest.values())
+        done_files = 0
+        done_bytes = 0
+        command = f"tar -C {shlex.quote(remote_root)} -cf - ."
+        process = subprocess.Popen(
+            [adb, "-s", device, "exec-out", "su", "-c", command],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            creationflags=subprocess_flags(),
+        )
+        self.current_process = process
+        try:
+            assert process.stdout is not None
+            with tarfile.open(fileobj=process.stdout, mode="r|") as archive:
+                for member in archive:
+                    if self.cancel_requested:
+                        process.terminate()
+                        raise InterruptedError("用户停止了拉取。")
+                    name = member.name.replace("\\", "/")
+                    while name.startswith("./"):
+                        name = name[2:]
+                    if not name or name == ".":
+                        continue
+                    relative = PurePosixPath(name)
+                    if relative.is_absolute() or ".." in relative.parts:
+                        raise RuntimeError(f"tar 中出现不安全路径：{member.name}")
+                    target = local_root.joinpath(*relative.parts)
+                    if member.isdir():
+                        target.mkdir(parents=True, exist_ok=True)
+                        continue
+                    if not member.isfile():
+                        # 游戏资源树不依赖符号链接；Windows 也不应创建 Android 链接。
+                        continue
+                    source = archive.extractfile(member)
+                    if source is None:
+                        raise RuntimeError(f"无法读取 tar 成员：{member.name}")
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    temporary = target.with_name(target.name + ".part")
+                    try:
+                        with temporary.open("wb") as output:
+                            shutil.copyfileobj(source, output, length=1024 * 1024)
+                        expected = manifest.get(relative.as_posix())
+                        if expected is not None and temporary.stat().st_size != expected["size"]:
+                            raise RuntimeError(
+                                f"tar 文件大小校验失败：{relative.as_posix()}"
+                            )
+                        temporary.replace(target)
+                        if member.mtime:
+                            try:
+                                os.utime(target, (member.mtime, member.mtime))
+                            except OSError:
+                                pass
+                    finally:
+                        if temporary.exists():
+                            try:
+                                temporary.unlink()
+                            except OSError:
+                                pass
+                    done_files += 1
+                    expected = manifest.get(relative.as_posix())
+                    done_bytes += (
+                        expected["size"] if expected is not None else int(member.size)
+                    )
+                    if done_files % 10 == 0 or done_files == total_files:
+                        percent = done_bytes * 100 / total_bytes if total_bytes else 100.0
+                        self.events.put(
+                            (
+                                "status",
+                                f"root 全量拉取 {done_files:,}/{total_files:,}；"
+                                f"约 {percent:.1f}%",
+                            )
+                        )
+                    if done_files % 100 == 0 or done_files == total_files:
+                        self.events.put(
+                            (
+                                "log",
+                                f"root 全量拉取：{done_files:,}/{total_files:,} 个文件；"
+                                f"约 {done_bytes / 1024 / 1024 / 1024:.2f} / "
+                                f"{total_bytes / 1024 / 1024 / 1024:.2f} GB。",
+                            )
+                        )
+            process.stdout.close()
+            return_code = process.wait()
+            stderr = b""
+            if process.stderr is not None:
+                stderr = process.stderr.read()
+            if return_code != 0:
+                detail = stderr.decode("utf-8", "replace").strip()
+                raise RuntimeError(detail or f"root tar 拉取失败，退出码 {return_code}。")
+            missing = [
+                relative
+                for relative, metadata in manifest.items()
+                if not (
+                    (target := local_path_for_remote(local_root, relative)).is_file()
+                    and target.stat().st_size == metadata["size"]
+                )
+            ]
+            if missing:
+                raise RuntimeError(
+                    f"root tar 拉取后仍缺少或大小不符 {len(missing)} 个文件；"
+                    f"首个：{missing[0]}"
+                )
+        finally:
+            self.current_process = None
+            if process.poll() is None:
+                process.terminate()
+
+    def _pull_moba_root_incremental(
+        self,
+        adb: str,
+        device: str,
+        remote_root: str,
+        local_root: Path,
+        manifest: dict[str, dict[str, int]],
+        changed: list[str],
+    ) -> None:
+        if not changed:
+            return
+        total_bytes = sum(manifest[path]["size"] for path in changed)
+        done_bytes = 0
+        for number, relative in enumerate(changed, 1):
+            if self.cancel_requested:
+                raise InterruptedError("用户停止了拉取。")
+            remote_path = f"{remote_root.rstrip('/')}/{relative}"
+            target = local_path_for_remote(local_root, relative)
+            self.events.put(
+                (
+                    "status",
+                    f"root 增量拉取 {number:,}/{len(changed):,}：{relative}",
+                )
+            )
+            self._stream_moba_root_file(
+                adb,
+                device,
+                remote_path,
+                target,
+                manifest[relative]["size"],
+            )
+            done_bytes += manifest[relative]["size"]
+            if number % 25 == 0 or number == len(changed):
+                self.events.put(
+                    (
+                        "log",
+                        f"root 增量拉取：{number:,}/{len(changed):,}；"
+                        f"约 {done_bytes / 1024 / 1024 / 1024:.2f} / "
+                        f"{total_bytes / 1024 / 1024 / 1024:.2f} GB。",
+                    )
+                )
+
+    def _moba_apk_files(
+        self, adb: str, device: str, package: str
+    ) -> list[dict[str, object]]:
+        code, output = self.run_command(
+            [adb, "-s", device, "shell", "pm", "path", package],
+            log_output=False,
+        )
+        paths = [
+            line.split("package:", 1)[1].strip()
+            for line in output.splitlines()
+            if line.strip().startswith("package:")
+        ]
+        if code != 0 or not paths:
+            raise RuntimeError(f"找不到已安装的 {package} APK。")
+        rows: list[dict[str, object]] = []
+        used_names: set[str] = set()
+        for number, remote_path in enumerate(paths, 1):
+            code, size_output = self.run_command(
+                [adb, "-s", device, "shell", "stat", "-c", "%s", remote_path],
+                log_output=False,
+            )
+            if code != 0:
+                raise RuntimeError(f"无法读取 APK 大小：{remote_path}")
+            code, mtime_output = self.run_command(
+                [adb, "-s", device, "shell", "stat", "-c", "%Y", remote_path],
+                log_output=False,
+            )
+            if code != 0:
+                raise RuntimeError(f"无法读取 APK 修改时间：{remote_path}")
+            try:
+                size = int(size_output.strip())
+                mtime = int(mtime_output.strip())
+            except ValueError as exc:
+                raise RuntimeError(f"无法解析 APK 文件信息：{remote_path}") from exc
+            name = PurePosixPath(remote_path).name or f"package_{number}.apk"
+            if name.lower() in used_names:
+                stem = Path(name).stem
+                suffix = Path(name).suffix or ".apk"
+                name = f"{stem}_{number}{suffix}"
+            used_names.add(name.lower())
+            rows.append(
+                {
+                    "remote": remote_path,
+                    "name": name,
+                    "size": size,
+                    "mtime": mtime,
+                }
+            )
+        return rows
+
+    def _pull_remote_manifest_files(
+        self,
+        adb: str,
+        device: str,
+        remote_root: str,
+        local_root: Path,
+        remote_manifest: dict[str, dict[str, int]],
+        relative_paths: list[str],
+        *,
+        label: str,
+    ) -> None:
+        if not relative_paths:
+            return
+        batches = pull_batches(
+            relative_paths, remote_prefix=remote_root.rstrip("/") + "/"
+        )
+        total_bytes = sum(remote_manifest[path]["size"] for path in relative_paths)
+        done_bytes = 0
+        for number, batch in enumerate(batches, 1):
+            if self.cancel_requested:
+                raise InterruptedError("用户停止了拉取。")
+            parent = PurePosixPath(batch[0]).parent.as_posix()
+            local_parent = (
+                local_root
+                if parent in {"", "."}
+                else local_path_for_remote(local_root, parent)
+            )
+            local_parent.mkdir(parents=True, exist_ok=True)
+            remote_paths = [
+                f"{remote_root.rstrip('/')}/{relative}" for relative in batch
+            ]
+            batch_bytes = sum(remote_manifest[path]["size"] for path in batch)
+            self.events.put(
+                (
+                    "status",
+                    f"{label} {number}/{len(batches)}；"
+                    f"本批 {len(batch)} 个文件；"
+                    f"约 {done_bytes / total_bytes * 100:.1f}%",
+                )
+            )
+            code, text = self.run_command(
+                [adb, "-s", device, "pull", "-a", *remote_paths, "."],
+                cwd=local_parent,
+                log_command=False,
+                log_output=False,
+            )
+            if self.cancel_requested:
+                raise InterruptedError("用户停止了拉取。")
+            if code != 0:
+                raise RuntimeError(
+                    text.strip() or f"ADB {label}失败，退出码 {code}。"
+                )
+            done_bytes += batch_bytes
+            if number % 10 == 0 or number == len(batches):
+                self.events.put(
+                    (
+                        "log",
+                        f"{label}：{number}/{len(batches)} 批，"
+                        f"约 {done_bytes / 1024 / 1024 / 1024:.2f} / "
+                        f"{total_bytes / 1024 / 1024 / 1024:.2f} GB。",
+                    )
+                )
+
+    def _start_moba_full_game_pull(self, *, incremental: bool) -> None:
+        try:
+            output = Path(
+                os.path.expandvars(self.output_var.get().strip())
+            ).expanduser().resolve()
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("目录无效", str(exc))
+            return
+        device = self.device_var.get().strip()
+        package = self._moba_package_name()
+        if not device:
+            messagebox.showerror("信息不完整", "请先选择正在运行的模拟器。")
+            return
+        package_output = output / package
+        external_root = f"{MOBA_ROOT_ANDROID_DATA}/{package}"
+        private_root = f"/data/user/0/{package}"
+        obb_root = f"/data/media/0/Android/obb/{package}"
+        action = "增量拉取整个游戏" if incremental else "完整拉取整个游戏"
+        if not messagebox.askokcancel(
+            action,
+            f"将镜像设备 {device} 上 {package} 的完整游戏资源：\n\n"
+            f"1. {external_root}\n"
+            f"2. {private_root}\n"
+            "3. 安装 APK（含全部 assets）\n"
+            f"4. {obb_root}\n\n"
+            f"保存到：\n{package_output}\n\n"
+            + (
+                "只下载新增、变化、本地缺失或大小不符的文件。"
+                if incremental
+                else "本次会重新下载全部游戏资源，体积可能超过 10 GB。"
+            ),
+        ):
+            return
+
+        def worker() -> None:
+            try:
+                adb = self.selected_adb()
+                output.mkdir(parents=True, exist_ok=True)
+                package_output.mkdir(parents=True, exist_ok=True)
+                self.ensure_device(adb, device)
+
+                self.events.put(("log", "正在读取完整 Android/data 文件清单……"))
+                external_manifest = self._read_moba_root_manifest(
+                    adb,
+                    device,
+                    external_root,
+                )
+                external_bytes = sum(row["size"] for row in external_manifest.values())
+                self.events.put(
+                    (
+                        "log",
+                        f"Android/data：{len(external_manifest):,} 个文件，"
+                        f"去重后约 {external_bytes / 1024 / 1024 / 1024:.2f} GB。",
+                    )
+                )
+
+                self.events.put(("log", "正在读取应用私有目录文件清单……"))
+                private_manifest = self._read_moba_root_manifest(
+                    adb, device, private_root, allow_empty=True
+                )
+                private_bytes = sum(row["size"] for row in private_manifest.values())
+                self.events.put((
+                    "log",
+                    f"应用私有目录：{len(private_manifest):,} 个文件，约 "
+                    f"{private_bytes / 1024 / 1024:.1f} MB。",
+                ))
+
+                self.events.put(("log", "正在读取 OBB 文件清单……"))
+                obb_manifest = self._read_moba_root_manifest(
+                    adb, device, obb_root, allow_empty=True
+                )
+                apk_rows = self._moba_apk_files(adb, device, package)
+                apk_bytes = sum(int(row["size"]) for row in apk_rows)
+                self.events.put(
+                    (
+                        "log",
+                        f"APK：{len(apk_rows)} 个文件，约 "
+                        f"{apk_bytes / 1024 / 1024 / 1024:.2f} GB。",
+                    )
+                )
+
+                manifest_path = package_output / MOBA_FULL_SYNC_MANIFEST
+                try:
+                    old_payload = json.loads(
+                        manifest_path.read_text(encoding="utf-8")
+                    )
+                except (OSError, ValueError, TypeError):
+                    old_payload = {}
+                if not isinstance(old_payload, dict):
+                    old_payload = {}
+                previous_external = old_payload.get("android_data", {})
+                previous_private = old_payload.get("private_data", {})
+                previous_obb = old_payload.get("obb", {})
+                previous_apk_rows = old_payload.get("apk", [])
+                if not isinstance(previous_external, dict):
+                    previous_external = {}
+                if not isinstance(previous_private, dict):
+                    previous_private = {}
+                if not isinstance(previous_obb, dict):
+                    previous_obb = {}
+                previous_apk = {
+                    str(row.get("name")): row
+                    for row in previous_apk_rows
+                    if isinstance(row, dict) and row.get("name")
+                } if isinstance(previous_apk_rows, list) else {}
+
+                external_changed = (
+                    changed_remote_files(
+                        package_output, external_manifest, previous_external
+                    )
+                    if incremental
+                    else sorted(external_manifest)
+                )
+                private_output = package_output / "_private"
+                private_changed = (
+                    changed_remote_files(
+                        private_output, private_manifest, previous_private
+                    )
+                    if incremental
+                    else sorted(private_manifest)
+                )
+                obb_output = package_output / "_obb"
+                obb_changed = (
+                    changed_remote_files(
+                        obb_output, obb_manifest, previous_obb
+                    )
+                    if incremental
+                    else sorted(obb_manifest)
+                )
+                self.events.put(
+                    (
+                        "log",
+                        f"资源比较：Android/data 需下载 {len(external_changed):,} / "
+                        f"{len(external_manifest):,}；私有目录需下载 "
+                        f"{len(private_changed):,} / {len(private_manifest):,}；"
+                        f"OBB 需下载 {len(obb_changed):,} / {len(obb_manifest):,}。",
+                    )
+                )
+
+                if incremental:
+                    self._pull_moba_root_incremental(
+                        adb,
+                        device,
+                        external_root,
+                        package_output,
+                        external_manifest,
+                        external_changed,
+                    )
+                else:
+                    self.events.put((
+                        "log",
+                        "首次完整同步使用 root tar 单流传输整个 Android/data，"
+                        "避免大资源被 /storage/emulated/0 视图隐藏。",
+                    ))
+                    self._stream_moba_root_tree(
+                        adb,
+                        device,
+                        external_root,
+                        package_output,
+                        external_manifest,
+                    )
+                if private_changed:
+                    if incremental:
+                        self._pull_moba_root_incremental(
+                            adb,
+                            device,
+                            private_root,
+                            private_output,
+                            private_manifest,
+                            private_changed,
+                        )
+                    else:
+                        self._stream_moba_root_tree(
+                            adb,
+                            device,
+                            private_root,
+                            private_output,
+                            private_manifest,
+                        )
+                if obb_changed:
+                    self._pull_moba_root_incremental(
+                        adb,
+                        device,
+                        obb_root,
+                        obb_output,
+                        obb_manifest,
+                        obb_changed,
+                    )
+
+                apk_output = package_output / "_apk"
+                apk_output.mkdir(parents=True, exist_ok=True)
+                apk_changed = 0
+                for number, row in enumerate(apk_rows, 1):
+                    if self.cancel_requested:
+                        raise InterruptedError("用户停止了拉取。")
+                    name = str(row["name"])
+                    target = apk_output / name
+                    old = previous_apk.get(name, {})
+                    needs_pull = (
+                        not incremental
+                        or int(old.get("size", -1)) != int(row["size"])
+                        or int(old.get("mtime", -1)) != int(row["mtime"])
+                        or not target.is_file()
+                        or target.stat().st_size != int(row["size"])
+                    )
+                    if not needs_pull:
+                        continue
+                    apk_changed += 1
+                    self.events.put(
+                        ("status", f"拉取 APK {number}/{len(apk_rows)}：{name}")
+                    )
+                    code, text = self.run_command(
+                        [adb, "-s", device, "pull", "-a", str(row["remote"]), "."],
+                        cwd=apk_output,
+                        log_command=False,
+                        log_output=False,
+                    )
+                    if code != 0:
+                        raise RuntimeError(
+                            text.strip() or f"APK 拉取失败：{row['remote']}"
+                        )
+                    if not target.is_file() or target.stat().st_size != int(row["size"]):
+                        raise RuntimeError(f"APK 大小校验失败：{target}")
+
+                # 保留旧的 APK NPK 缓存，方便现有解包入口继续读取基础 hero/res。
+                npk_root = package_output / "npk"
+                npk_root.mkdir(parents=True, exist_ok=True)
+                apk_path, apk_stamp, assets = self._moba_apk_catalog(
+                    adb, device, package
+                )
+                asset_manifest_path = package_output / MOBA_APK_ASSET_MANIFEST
+                try:
+                    old_asset_payload = json.loads(
+                        asset_manifest_path.read_text(encoding="utf-8")
+                    )
+                except (OSError, ValueError, TypeError):
+                    old_asset_payload = {}
+                old_apk_stamp = (
+                    old_asset_payload.get("apk", {})
+                    if isinstance(old_asset_payload, dict)
+                    else {}
+                )
+                same_apk = (
+                    isinstance(old_apk_stamp, dict)
+                    and int(old_apk_stamp.get("size", -1)) == apk_stamp["size"]
+                    and int(old_apk_stamp.get("mtime", -1)) == apk_stamp["mtime"]
+                )
+                extracted_assets = 0
+                for asset_name, asset_size in assets:
+                    target = npk_root / Path(asset_name).name
+                    if (
+                        incremental
+                        and same_apk
+                        and target.is_file()
+                        and target.stat().st_size == asset_size
+                    ):
+                        continue
+                    self.events.put(("status", f"更新 APK NPK 缓存：{target.name}"))
+                    self._stream_moba_apk_asset(
+                        adb, device, apk_path, asset_name, target, asset_size
+                    )
+                    extracted_assets += 1
+                asset_manifest_path.write_text(
+                    json.dumps(
+                        {
+                            "package": package,
+                            "apk": {**apk_stamp, "path": apk_path},
+                            "assets": {
+                                name: {"size": size} for name, size in assets
+                            },
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+
+                payload = {
+                    "package": package,
+                    "android_data_root": external_root,
+                    "android_data": external_manifest,
+                    "private_root": private_root,
+                    "private_data": private_manifest,
+                    "obb_root": obb_root,
+                    "obb": obb_manifest,
+                    "apk": apk_rows,
+                }
+                temporary = manifest_path.with_name(manifest_path.name + ".tmp")
+                temporary.write_text(
+                    json.dumps(payload, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                temporary.replace(manifest_path)
+                self.events.put(
+                    (
+                        "done",
+                        f"完整游戏资源已同步到 {package_output}；"
+                        f"Android/data 下载 {len(external_changed):,} 个文件，"
+                        f"私有目录下载 {len(private_changed):,} 个，"
+                        f"APK 更新 {apk_changed} 个，OBB 更新 {len(obb_changed):,} 个，"
+                        f"APK NPK 缓存更新 {extracted_assets} 个。",
+                    )
+                )
+            except InterruptedError:
+                self.events.put(("done", "拉取已停止。"))
+            except Exception as exc:
+                self.events.put(("error", str(exc)))
+
+        self.start_worker(
+            worker,
+            "正在检查完整游戏资源……" if incremental else "正在拉取整个游戏……",
+        )
+
+    def _start_moba_apk_pull(self, *, incremental: bool) -> None:
+        try:
+            output = Path(
+                os.path.expandvars(self.output_var.get().strip())
+            ).expanduser().resolve()
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("目录无效", str(exc))
+            return
+        device = self.device_var.get().strip()
+        package = self._moba_package_name()
+        if not device:
+            messagebox.showerror("信息不完整", "请先选择正在运行的模拟器。")
+            return
+        package_output = output / package
+        npk_root = package_output / "npk"
+        action = "增量拉取更新" if incremental else "完整拉取建模资源"
+        if not messagebox.askokcancel(
+            action,
+            f"将从设备 {device} 的 {package} APK 中抽取建模资源：\n"
+            "hero1~9.npk + res.npk\n\n"
+            f"保存到：\n{npk_root}\n\n"
+            + (
+                "APK 未变化时会直接复用本地 NPK。"
+                if incremental
+                else "本次会重新抽取这些建模 NPK。"
+            ),
+        ):
+            return
+
+        def worker() -> None:
+            try:
+                adb = self.selected_adb()
+                output.mkdir(parents=True, exist_ok=True)
+                package_output.mkdir(parents=True, exist_ok=True)
+                npk_root.mkdir(parents=True, exist_ok=True)
+                self.ensure_device(adb, device)
+                self.events.put(("log", "正在读取决战平安京 APK 内的 NPK 清单……"))
+                apk_path, apk_stamp, assets = self._moba_apk_catalog(
+                    adb, device, package
+                )
+                manifest_path = package_output / MOBA_APK_ASSET_MANIFEST
+                try:
+                    old_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError, TypeError):
+                    old_manifest = {}
+                old_apk = old_manifest.get("apk", {}) if isinstance(old_manifest, dict) else {}
+                same_apk = (
+                    isinstance(old_apk, dict)
+                    and int(old_apk.get("size", -1)) == apk_stamp["size"]
+                    and int(old_apk.get("mtime", -1)) == apk_stamp["mtime"]
+                )
+                changed: list[tuple[str, int]] = []
+                for asset_name, asset_size in assets:
+                    target = npk_root / Path(asset_name).name
+                    if (
+                        not incremental
+                        or not same_apk
+                        or not target.is_file()
+                        or target.stat().st_size != asset_size
+                    ):
+                        changed.append((asset_name, asset_size))
+                if incremental and not changed:
+                    self.events.put(("done", f"检查完成：{len(assets)} 个建模 NPK 已是最新。"))
+                    return
+
+                total_bytes = sum(size for _, size in changed)
+                done_bytes = 0
+                for number, (asset_name, asset_size) in enumerate(changed, 1):
+                    if self.cancel_requested:
+                        raise InterruptedError("用户停止了拉取。")
+                    target = npk_root / Path(asset_name).name
+                    self.events.put((
+                        "status",
+                        f"抽取 APK 建模资源 {number}/{len(changed)}：{target.name}",
+                    ))
+                    self.events.put((
+                        "log",
+                        f"抽取 {asset_name}（{asset_size / 1024 / 1024:.1f} MB）……",
+                    ))
+                    self._stream_moba_apk_asset(
+                        adb, device, apk_path, asset_name, target, asset_size
+                    )
+                    done_bytes += asset_size
+                    self.events.put((
+                        "log",
+                        f"完成 {target.name}；总进度约 "
+                        f"{done_bytes / total_bytes * 100:.1f}%",
+                    ))
+
+                payload = {
+                    "package": package,
+                    "apk": {**apk_stamp, "path": apk_path},
+                    "assets": {
+                        name: {"size": size}
+                        for name, size in assets
+                    },
+                }
+                manifest_path.write_text(
+                    json.dumps(payload, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                self.events.put((
+                    "done",
+                    f"建模资源拉取完成：{len(changed)} 个 NPK；保存到 {npk_root}",
+                ))
+            except InterruptedError:
+                self.events.put(("done", "拉取已停止。"))
+            except Exception as exc:
+                self.events.put(("error", str(exc)))
+
+        self.start_worker(
+            worker,
+            "正在检查 APK 建模资源……" if incremental else "正在抽取 APK 建模资源……",
+        )
+
     def start_pull(self) -> None:
+        if GAME_PROFILE.key == "moba":
+            self._start_moba_full_game_pull(incremental=False)
+            return
         try:
             output = Path(os.path.expandvars(self.output_var.get().strip())).expanduser().resolve()
         except (OSError, ValueError) as exc:
@@ -697,6 +1687,9 @@ class ResourcePullApp:
         self.start_worker(worker, "正在拉取完整游戏资源…")
 
     def start_incremental_pull(self) -> None:
+        if GAME_PROFILE.key == "moba":
+            self._start_moba_full_game_pull(incremental=True)
+            return
         try:
             output = Path(
                 os.path.expandvars(self.output_var.get().strip())

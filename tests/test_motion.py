@@ -19,12 +19,15 @@ from onmyoji_motion import (
     find_animation_metadata,
     decode_motion_with_cache_info,
     inverse_affine_row_matrix4,
+    load_motion_catalog,
     matrix4_multiply,
     motion_cache_path,
     normalized_bone_name,
     trs_row_matrix4,
+    trs_row_matrices,
     quaternion_delta,
     read_motion_header,
+    save_motion_catalog,
     skeleton_display_mask,
     trim_motion_to_animation_metadata,
 )
@@ -32,6 +35,27 @@ from onmyoji_rigged_mesh_gui import read_skeleton_hierarchy
 
 
 class MotionHeaderTests(unittest.TestCase):
+    def test_unpack_time_motion_catalog_round_trip_and_invalidation(self) -> None:
+        from onmyoji_motion import MotionHeader
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "manifest.csv").write_text("one", encoding="utf-8")
+            motion_path = root / "pkg_00" / "hero.rawanimation"
+            motion_path.parent.mkdir()
+            motion_path.touch()
+            header = MotionHeader(
+                motion_path.resolve(), 0, "hero.skeleton", "idle",
+                ("root", "body"), 30.0, 1.0,
+            )
+            save_motion_catalog(root, [header])
+            loaded = load_motion_catalog(root)
+            self.assertIsNotNone(loaded)
+            assert loaded is not None
+            self.assertEqual(loaded[0], header)
+            (root / "manifest.csv").write_text("changed", encoding="utf-8")
+            self.assertIsNone(load_motion_catalog(root))
+
     def test_persistent_motion_cache_is_memory_mapped_and_reused(self) -> None:
         skeleton = b"hero.skeleton"
         names = (b"idle", b"root", b"child")
@@ -214,6 +238,19 @@ class MotionHeaderTests(unittest.TestCase):
         matrices = compose_global_row_matrices(local, (-1, 0))
         np.testing.assert_allclose(matrices[0], trs_row_matrix4(local[0]))
         np.testing.assert_allclose(matrices[1][3, :3], (3.0, 2.0, 0.0))
+
+    def test_vectorized_trs_matrices_match_scalar_conversion(self) -> None:
+        transforms = np.asarray(
+            (
+                (1, 2, 3, 0, 0, 0, 1, 1, 1, 1),
+                (-2, 4, 1, 0.2, -0.3, 0.1, 0.8, 2, 0.5, 1.5),
+                (0, 0, 0, 0, 0, 0, 0, 1, 1, 1),
+            ),
+            dtype=np.float32,
+        )
+        batched = trs_row_matrices(transforms)
+        scalar = np.asarray([trs_row_matrix4(value) for value in transforms])
+        np.testing.assert_allclose(batched, scalar, atol=1.0e-6)
 
 
 class SkeletonCompositionTests(unittest.TestCase):

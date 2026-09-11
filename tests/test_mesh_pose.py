@@ -6,6 +6,69 @@ from pathlib import Path
 import onmyoji_rigged_mesh_gui as mesh_gui
 
 
+def translation_matrix(x, y, z):
+    return (
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        x, y, z, 1.0,
+    )
+
+
+BODY_BONES = (
+    "root",
+    "bip01_l_clavicle", "bip01_r_clavicle",
+    "bip01_l_upperarm", "bip01_r_upperarm",
+    "bip01_l_forearm", "bip01_r_forearm",
+    "bip01_l_hand", "bip01_r_hand",
+)
+NEUTRAL_BODY_POSITIONS = (
+    (0.0, 0.0, 0.0),
+    (1.0, 5.0, 0.0), (-1.0, 5.0, 0.0),
+    (2.0, 5.0, 0.0), (-2.0, 5.0, 0.0),
+    (3.0, 5.0, 0.0), (-3.0, 5.0, 0.0),
+    (4.0, 5.0, 0.0), (-4.0, 5.0, 0.0),
+)
+ACTION_BODY_POSITIONS = (
+    (0.0, 0.0, 0.0),
+    (1.0, 5.0, 0.0), (-1.0, 5.0, 0.0),
+    (2.0, 5.0, 0.0), (-1.7, 4.6, 0.5),
+    (3.0, 5.0, 0.0), (-1.8, 3.5, 1.0),
+    (4.0, 5.0, 0.0), (-1.2, 2.5, 1.5),
+)
+
+
+def body_skeleton(positions=NEUTRAL_BODY_POSITIONS):
+    return mesh_gui.SkeletonHierarchy(
+        source=Path("synthetic.skeleton"),
+        name="synthetic",
+        bone_names=BODY_BONES,
+        bone_keys=BODY_BONES,
+        bone_parents=(-1,) + (0,) * 8,
+        bone_bind_transforms=tuple(
+            (*position, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0)
+            for position in positions
+        ),
+    )
+
+
+def body_mesh(positions):
+    matrices = [translation_matrix(*position) for position in positions]
+    return mesh_gui.ParsedMesh(
+        version=4,
+        submeshes=[(len(positions), 0, 1, 0)],
+        bone_parents=[-1] + [0] * 8,
+        bone_names=list(BODY_BONES),
+        bone_matrices=matrices,
+        positions=list(positions),
+        normals=[(0.0, 1.0, 0.0)] * len(positions),
+        faces=[],
+        uvs=[(0.0, 0.0)] * len(positions),
+        joints=[(index, index, index, index) for index in range(len(positions))],
+        weights=[(1.0, 0.0, 0.0, 0.0)] * len(positions),
+    )
+
+
 class MeshBindPoseTests(unittest.TestCase):
     def test_face_pose_revision_only_invalidates_matching_skeleton_composites(self):
         package = mesh_gui.MaterialPackage(
@@ -93,133 +156,66 @@ class MeshBindPoseTests(unittest.TestCase):
         self.assertEqual(mesh.bone_names, ["root", "unused", "hair"])
         self.assertEqual(mesh.bone_parents, [-1, 0, 0])
         self.assertEqual(mesh.joints[0], (2, 0, 0, 0))
+        self.assertEqual(mesh.bone_matrices[0], identity)
+        self.assertEqual(mesh.bone_matrices[2], identity)
+        self.assertEqual(mesh.bone_matrices[1][13], 1.0)
 
     def test_action_baked_mesh_is_restored_from_skeleton_bind(self):
-        identity = (
-            1.0, 0.0, 0.0, 0.0,
-            0.0, 1.0, 0.0, 0.0,
-            0.0, 0.0, 1.0, 0.0,
-            0.0, 0.0, 0.0, 1.0,
-        )
-        skeleton = mesh_gui.SkeletonHierarchy(
-            source=Path("synthetic.skeleton"),
-            name="synthetic",
-            bone_names=("root", "child"),
-            bone_keys=("root", "child"),
-            bone_parents=(-1, 0),
-            bone_bind_transforms=(
-                (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0),
-                (1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0),
-            ),
-        )
+        skeleton = body_skeleton()
         bind_globals = mesh_gui._skeleton_bind_global_matrices(skeleton)
         self.assertIsNotNone(bind_globals)
-        bind_child = bind_globals[1]
-        # A 90-degree Z rotation at the child bone represents an action frame.
-        action_child = (
-            0.0, 1.0, 0.0, 0.0,
-            -1.0, 0.0, 0.0, 0.0,
-            0.0, 0.0, 1.0, 0.0,
-            1.0, 0.0, 0.0, 1.0,
-        )
-        skin = mesh_gui._matrix4_multiply(
-            mesh_gui._inverse_affine_row_matrix4(bind_child), action_child
-        )
-        current_position = mesh_gui._transform_row_position((1.0, 1.0, 0.0), skin)
-        mesh = mesh_gui.ParsedMesh(
-            version=4,
-            submeshes=[(1, 0, 0, 0)],
-            bone_parents=[-1, 0],
-            bone_names=["root", "child"],
-            bone_matrices=[identity, action_child],
-            positions=[current_position],
-            normals=[(0.0, 1.0, 0.0)],
-            faces=[],
-            uvs=[(0.0, 0.0)],
-            joints=[(1, 1, 1, 1)],
-            weights=[(1.0, 0.0, 0.0, 0.0)],
-        )
+        mesh = body_mesh(ACTION_BODY_POSITIONS)
 
         self.assertTrue(mesh_gui._restore_mesh_bind_pose(mesh, skeleton))
-        for actual, expected in zip(mesh.positions[0], (1.0, 1.0, 0.0)):
-            self.assertAlmostEqual(actual, expected, places=5)
-        # The source normal is transformed by the inverse of the action when
-        # returning to bind space, so it must point along the bind-space axis.
-        for actual, expected in zip(mesh.normals[0], (1.0, 0.0, 0.0)):
-            self.assertAlmostEqual(actual, expected, places=5)
-        for actual, expected in zip(mesh.bone_matrices[1], bind_child):
-            self.assertAlmostEqual(actual, expected, places=5)
+        for actual, expected in zip(mesh.positions, NEUTRAL_BODY_POSITIONS):
+            for component, target in zip(actual, expected):
+                self.assertAlmostEqual(component, target, places=5)
+        for actual, expected in zip(mesh.bone_matrices, bind_globals):
+            for component, target in zip(actual, expected):
+                self.assertAlmostEqual(component, target, places=5)
+
+    def test_neutral_mesh_is_not_mapped_to_action_skeleton(self):
+        skeleton = body_skeleton(ACTION_BODY_POSITIONS)
+        mesh = body_mesh(NEUTRAL_BODY_POSITIONS)
+        original_positions = list(mesh.positions)
+        original_matrices = list(mesh.bone_matrices)
+
+        self.assertFalse(mesh_gui._restore_mesh_bind_pose(mesh, skeleton))
+        self.assertEqual(mesh.positions, original_positions)
+        self.assertEqual(mesh.bone_matrices, original_matrices)
 
     def test_bind_restore_preserves_mesh_neutral_face_pose(self):
-        identity = (
-            1.0, 0.0, 0.0, 0.0,
-            0.0, 1.0, 0.0, 0.0,
-            0.0, 0.0, 1.0, 0.0,
-            0.0, 0.0, 0.0, 1.0,
-        )
+        neutral_body = body_skeleton()
         skeleton = mesh_gui.SkeletonHierarchy(
             source=Path("face.skeleton"),
             name="face",
-            bone_names=("root", "body", "kk_face", "lip"),
-            bone_keys=("root", "body", "kk_face", "lip"),
-            bone_parents=(-1, 0, 0, 2),
-            bone_bind_transforms=(
-                (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0),
-                (1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0),
-                (0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0),
+            bone_names=BODY_BONES + ("kk_face", "lip"),
+            bone_keys=BODY_BONES + ("kk_face", "lip"),
+            bone_parents=neutral_body.bone_parents + (0, 9),
+            bone_bind_transforms=neutral_body.bone_bind_transforms + (
+                (0.0, 6.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0),
                 (0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0),
             ),
         )
-        bind_globals = mesh_gui._skeleton_bind_global_matrices(skeleton)
-        self.assertIsNotNone(bind_globals)
-        action_body = (
-            0.0, 1.0, 0.0, 0.0,
-            -1.0, 0.0, 0.0, 0.0,
-            0.0, 0.0, 1.0, 0.0,
-            1.0, 0.0, 0.0, 1.0,
-        )
-        body_skin = mesh_gui._matrix4_multiply(
-            mesh_gui._inverse_affine_row_matrix4(bind_globals[1]),
-            action_body,
-        )
-        body_bind_position = (1.0, 1.0, 0.0)
-        body_action_position = mesh_gui._transform_row_position(
-            body_bind_position, body_skin
-        )
-        neutral_face_position = (0.0, 2.5, 0.0)
-        mesh = mesh_gui.ParsedMesh(
-            version=4,
-            submeshes=[(2, 0, 0, 0)],
-            bone_parents=[-1, 0, 0, 2],
-            bone_names=["root", "body", "kk_face", "lip"],
-            bone_matrices=[
-                identity,
-                action_body,
-                (
-                    1.0, 0.0, 0.0, 0.0,
-                    0.0, 1.0, 0.0, 0.0,
-                    0.0, 0.0, 1.0, 0.0,
-                    0.0, 1.2, 0.0, 1.0,
-                ),
-                (
-                    1.0, 0.0, 0.0, 0.0,
-                    0.0, 1.0, 0.0, 0.0,
-                    0.0, 0.0, 1.0, 0.0,
-                    0.0, 2.4, 0.0, 1.0,
-                ),
-            ],
-            positions=[body_action_position, neutral_face_position],
-            normals=[(0.0, 1.0, 0.0), (0.0, 0.0, 1.0)],
-            faces=[],
-            uvs=[(0.0, 0.0), (0.0, 0.0)],
-            joints=[(1, 1, 1, 1), (3, 3, 3, 3)],
-            weights=[(1.0, 0.0, 0.0, 0.0), (1.0, 0.0, 0.0, 0.0)],
-        )
+        mesh = body_mesh(ACTION_BODY_POSITIONS)
+        neutral_face_position = (0.0, 5.9, 0.0)
+        mesh.bone_names.extend(("kk_face", "lip"))
+        mesh.bone_parents.extend((0, 9))
+        mesh.bone_matrices.extend((
+            translation_matrix(0.0, 5.8, 0.0),
+            translation_matrix(0.0, 5.9, 0.0),
+        ))
+        mesh.positions.append(neutral_face_position)
+        mesh.normals.append((0.0, 0.0, 1.0))
+        mesh.uvs.append((0.0, 0.0))
+        mesh.joints.append((10, 10, 10, 10))
+        mesh.weights.append((1.0, 0.0, 0.0, 0.0))
 
         self.assertTrue(mesh_gui._restore_mesh_bind_pose(mesh, skeleton))
-        for actual, expected in zip(mesh.positions[0], body_bind_position):
-            self.assertAlmostEqual(actual, expected, places=5)
-        self.assertEqual(mesh.positions[1], neutral_face_position)
+        self.assertEqual(mesh.positions[-1], neutral_face_position)
+        self.assertEqual(
+            mesh.bone_matrices[-1], translation_matrix(0.0, 5.9, 0.0)
+        )
 
 
 if __name__ == "__main__":

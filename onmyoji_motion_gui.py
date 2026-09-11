@@ -37,21 +37,66 @@ from onmyoji_motion import (
     export_vmd,
     find_animation_metadata,
     inverse_affine_row_matrix4,
+    load_motion_catalog,
     matrix4_multiply,
     motion_cache_path,
     neox_to_pmx_matrix4,
     normalized_bone_name,
+    prepare_motion_assets,
     quaternion_delta,
     quaternion_multiply,
     read_motion_header,
+    save_motion_catalog,
     skeleton_display_mask,
     trim_motion_to_animation_metadata,
     trs_row_matrix4,
+    trs_row_matrices,
 )
 
 
 APP_TITLE = "式神动作预览与 VMD 导出"
 DISPLAY_LIMIT = 5000
+
+
+def _extract_pmx_skinning(vertices, bone_count: int) -> tuple[np.ndarray, np.ndarray]:
+    """Extract PMX deform data with one typed branch per vertex, then normalize in NumPy."""
+    joints = np.zeros((len(vertices), 4), dtype=np.int32)
+    weights = np.zeros((len(vertices), 4), dtype=np.float32)
+    for vertex_index, vertex in enumerate(vertices):
+        deform = vertex.deform
+        deform_name = type(deform).__name__
+        if deform_name == "Bdef4":
+            joints[vertex_index] = (
+                deform.index0, deform.index1, deform.index2, deform.index3
+            )
+            weights[vertex_index] = (
+                deform.weight0, deform.weight1, deform.weight2, deform.weight3
+            )
+        elif deform_name in {"Bdef2", "Sdef"}:
+            weight0 = float(deform.weight0)
+            joints[vertex_index, :2] = (deform.index0, deform.index1)
+            weights[vertex_index, :2] = (weight0, 1.0 - weight0)
+        elif deform_name == "Bdef1":
+            joints[vertex_index, 0] = deform.index0
+            weights[vertex_index, 0] = 1.0
+        else:
+            # Preserve compatibility with third-party pymeshio deform classes.
+            for slot in range(4):
+                if not hasattr(deform, f"index{slot}"):
+                    continue
+                joints[vertex_index, slot] = int(getattr(deform, f"index{slot}"))
+                if hasattr(deform, f"weight{slot}"):
+                    weights[vertex_index, slot] = float(
+                        getattr(deform, f"weight{slot}")
+                    )
+    np.clip(joints, 0, max(0, bone_count - 1), out=joints)
+    np.maximum(weights, 0.0, out=weights)
+    totals = weights.sum(axis=1, keepdims=True)
+    empty = totals[:, 0] <= 1.0e-8
+    weights[empty, 0] = 1.0
+    totals[empty, 0] = 1.0
+    weights /= totals
+    return np.ascontiguousarray(joints), np.ascontiguousarray(weights)
 
 
 class MotionPreviewApp(tk.Tk):
@@ -94,7 +139,9 @@ class MotionPreviewApp(tk.Tk):
         self.yaw = -0.45
         self.pitch = -0.15
         self.zoom = 1.0
-        self.drag: tuple[int, int, float, float] | None = None
+        self.pan_x = 0.0
+        self.pan_y = 0.0
+        self.drag: tuple[str, int, int, float, float, float, float] | None = None
         self.worker_queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self.scan_generation = 0
         self.parent_cache: dict[tuple[str, tuple[str, ...]], tuple[int, ...]] = {}
@@ -118,6 +165,7 @@ class MotionPreviewApp(tk.Tk):
         self.pmx_catalog_loading = False
         self.predecode_running = False
         self.record_state: dict[str, object] | None = None
+        self.batch_export_state: dict[str, object] | None = None
         self.fbx_exporting = False
 
         self._build_ui()
@@ -134,9 +182,21 @@ class MotionPreviewApp(tk.Tk):
         self.pmx_sort_var.trace_add("write", lambda *_: self._apply_pmx_filter())
         self.after(40, self._poll_workers)
         self.after(16, self._tick)
+        self.after(1, self._load_cached_motion_catalog)
         # PMX output trees can contain tens of thousands of files.  Loading
         # that catalogue is now explicitly user-triggered by “刷新模型”, or
         # happens after a motion is selected.
+
+    def _load_cached_motion_catalog(self) -> None:
+        root = Path(self.root_var.get())
+        cached = load_motion_catalog(root) if root.is_dir() else None
+        if cached is None:
+            return
+        self.headers = cached
+        self._apply_filter()
+        self.status_var.set(
+            f"已直接载入解包阶段生成的动作索引：{len(cached):,} 个动作。"
+        )
 
     def _build_ui(self) -> None:
         top = ttk.Frame(self, padding=8)
@@ -163,6 +223,12 @@ class MotionPreviewApp(tk.Tk):
             pmx_row, text="导出动画 FBX", command=self._export_fbx
         )
         self.fbx_button.pack(side="left", padx=(6, 0))
+        self.batch_export_button = ttk.Button(
+            pmx_row,
+            text="一键导出模型全部动作",
+            command=self._export_all_model_motions,
+        )
+        self.batch_export_button.pack(side="left", padx=(6, 0))
 
         pane = ttk.Panedwindow(self, orient="horizontal")
         pane.pack(fill="both", expand=True, padx=8)
@@ -281,8 +347,14 @@ class MotionPreviewApp(tk.Tk):
         ttk.Label(right, textvariable=self.info_var, anchor="w").pack(fill="x", padx=8, pady=(2, 5))
         self.canvas = tk.Canvas(right, background="#10141b", highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
-        self.canvas.bind("<ButtonPress-1>", self._drag_start)
+        self.canvas.bind(
+            "<ButtonPress-1>", lambda event: self._drag_start(event, "rotate")
+        )
         self.canvas.bind("<B1-Motion>", self._drag_move)
+        self.canvas.bind(
+            "<ButtonPress-2>", lambda event: self._drag_start(event, "pan")
+        )
+        self.canvas.bind("<B2-Motion>", self._drag_move)
         self.canvas.bind("<MouseWheel>", self._wheel)
 
         controls = ttk.Frame(right, padding=(8, 8, 8, 4))
@@ -314,6 +386,11 @@ class MotionPreviewApp(tk.Tk):
             command=self._timeline_changed,
         )
         self.timeline.pack(fill="x", padx=8, pady=(0, 8))
+        ttk.Label(
+            right,
+            text="左键旋转 · 中键平移 · 滚轮缩放",
+            foreground="#65758b",
+        ).pack(anchor="e", padx=8, pady=(0, 5))
         ttk.Label(self, textvariable=self.status_var, relief="sunken", anchor="w", padding=(6, 3)).pack(fill="x")
 
     def _choose_root(self) -> None:
@@ -444,16 +521,10 @@ class MotionPreviewApp(tk.Tk):
             if str(value).strip().lower() != "全部角色"
         }
         exact_role = role in known_roles
-        motion_candidates = (
-            any(self._pmx_match_score(item) > 0 for item in self.pmx_items)
-            if self.motion_filter_active
-            else False
-        )
         self.visible_pmx_items = [
             item
             for item in self.pmx_items
             if not self.motion_filter_active
-            or not motion_candidates
             or self._pmx_match_score(item) > 0
             if (rarity == "全部稀有度" or item.rarity == rarity)
             and (
@@ -526,20 +597,90 @@ class MotionPreviewApp(tk.Tk):
         if self.motion is None:
             return ""
         score = self._pmx_match_score(item)
-        return "官方关联" if score > 0 else ""
+        if score >= 100:
+            return "官方+骨架"
+        if score >= 80:
+            return "名称+骨架"
+        if score >= 70:
+            return "名称匹配"
+        return ""
+
+    @staticmethod
+    def _model_identity_keys(value: str) -> set[str]:
+        """Conservative model/skeleton identities; never use loose substrings."""
+        stem = Path(str(value).replace("\\", "/")).stem.lower()
+        stem = re.sub(r"^\d{6}_[0-9a-f]{8,}$", "", stem)
+        stem = re.sub(r"_[0-9a-f]{8}$", "", stem)
+        parts = [part for part in re.split(r"[_\-. ]+", stem) if part]
+        keys = {normalized_bone_name(stem)} if stem else set()
+        removable = {
+            "show", "skin", "model", "battle", "default", "mirror",
+            "默认组件", "yifu", "body",
+        }
+        separators = {"默认组件", "component", "components"}
+        for index, part in enumerate(parts):
+            if part not in separators or index == 0:
+                continue
+            prefix = parts[:index]
+            keys.add(normalized_bone_name("_".join(prefix)))
+            if re.fullmatch(r"[sc]\d+", prefix[0]) or prefix[0] == "j":
+                keys.add(normalized_bone_name("_".join(prefix[1:])))
+        trimmed = list(parts)
+        while trimmed and trimmed[-1] in removable:
+            trimmed.pop()
+            if trimmed:
+                keys.add(normalized_bone_name("_".join(trimmed)))
+        # Exported skin/model names commonly add a leading quality or variant
+        # token (s2_, s6_, c1_, j_) that is not present in Skeleton names.
+        if parts and (re.fullmatch(r"[sc]\d+", parts[0]) or parts[0] == "j"):
+            without_variant = parts[1:]
+            if without_variant:
+                keys.add(normalized_bone_name("_".join(without_variant)))
+                while without_variant and without_variant[-1] in removable:
+                    without_variant.pop()
+                if without_variant:
+                    keys.add(normalized_bone_name("_".join(without_variant)))
+        return {key for key in keys if key}
 
     def _pmx_match_score(self, item: pmx_browser.PreviewItem) -> int:
-        """Accept only a direct official THP dependency relation.
-
-        Model names, roles, and bone-name similarity intentionally do not take
-        part here: they frequently join unrelated characters in this game.
-        """
-        if self.motion is None or self.official_motion_bindings is None:
+        """Rank official links and conservative name matches verified by bones."""
+        if self.motion is None:
             return 0
-        model_root = Path(__file__).resolve().parent / "unpacked" / "model"
-        return 100 if self.official_motion_bindings.matches_motion(
-            self.motion.header.path, model_root, item.source_mesh
-        ) else 0
+        skeleton_keys = self._model_identity_keys(self.motion.header.skeleton_name)
+        model_keys = set()
+        for value in (item.display_name, item.path.stem):
+            model_keys.update(self._model_identity_keys(value))
+        name_match = bool(skeleton_keys & model_keys)
+        if self.official_motion_bindings is not None:
+            model_root = Path(__file__).resolve().parent / "unpacked" / "model"
+            motion_bones = {
+                normalized_bone_name(value)
+                for value in self.motion.header.bone_names
+            }
+            mesh_bones = self.official_motion_bindings.bone_names_for_mesh(
+                item.source_mesh
+            )
+            count_close = bool(
+                mesh_bones
+                and abs(len(mesh_bones) - len(motion_bones))
+                <= max(3, int(len(motion_bones) * 0.10))
+            )
+            bone_match = bool(
+                motion_bones
+                and motion_bones.issubset(mesh_bones)
+                and count_close
+            )
+            if self.official_motion_bindings.matches_motion(
+                self.motion.header.path, model_root, item.source_mesh
+            ):
+                return 120 if name_match else 100
+            if name_match and bone_match:
+                return 80
+            # If an indexed source Mesh is known and its bones disagree, do
+            # not let a similar-looking file name reintroduce a false match.
+            if mesh_bones:
+                return 0
+        return 70 if name_match else 0
 
     def _filter_pmx_for_motion(self) -> None:
         if self.motion is None:
@@ -565,7 +706,11 @@ class MotionPreviewApp(tk.Tk):
             self._pmx_selected()
 
     def _pmx_selected(self, _event=None) -> None:
-        if self.record_state is not None or self.fbx_exporting:
+        if (
+            self.record_state is not None
+            or self.fbx_exporting
+            or self.batch_export_state is not None
+        ):
             self.status_var.set("正在输出当前预览，完成或停止后才能切换模型。")
             return
         selected = self.pmx_tree.selection()
@@ -633,33 +778,9 @@ class MotionPreviewApp(tk.Tk):
                 preview = load_preview(path, model=model)
                 bone_names = tuple(str(bone.name) for bone in model.bones)
                 mesh_path, mesh_bind_matrices = self._source_mesh_layout_for_pmx(path, bone_names)
-                joints = np.zeros((len(model.vertices), 4), dtype=np.int32)
-                weights = np.zeros((len(model.vertices), 4), dtype=np.float32)
-                for vertex_index, vertex in enumerate(model.vertices):
-                    deform = vertex.deform
-                    available: list[tuple[int, float]] = []
-                    for slot in range(4):
-                        index_name = f"index{slot}"
-                        if not hasattr(deform, index_name):
-                            continue
-                        bone_index = int(getattr(deform, index_name))
-                        weight_name = f"weight{slot}"
-                        if hasattr(deform, weight_name):
-                            weight = float(getattr(deform, weight_name))
-                        elif slot == 0 and hasattr(deform, "weight0"):
-                            weight = float(deform.weight0)
-                        elif slot == 1 and hasattr(deform, "weight0"):
-                            weight = 1.0 - float(deform.weight0)
-                        else:
-                            weight = 1.0 if slot == 0 else 0.0
-                        available.append((bone_index, max(0.0, weight)))
-                    total = sum(weight for _, weight in available)
-                    if total <= 1.0e-8:
-                        available = [(0, 1.0)]
-                        total = 1.0
-                    for slot, (bone_index, weight) in enumerate(available[:4]):
-                        joints[vertex_index, slot] = max(0, min(bone_index, len(model.bones) - 1))
-                        weights[vertex_index, slot] = weight / total
+                joints, weights = _extract_pmx_skinning(
+                    model.vertices, len(model.bones)
+                )
                 payload = {
                     "preview": preview,
                     "base": preview.positions.copy(),
@@ -703,6 +824,10 @@ class MotionPreviewApp(tk.Tk):
         self.status_var.set("正在扫描动作元数据……")
 
         def worker() -> None:
+            cached = load_motion_catalog(root)
+            if cached is not None:
+                self.worker_queue.put(("scan_done", (generation, cached, 0)))
+                return
             found: list[MotionHeader] = []
             failed = 0
             paths = list(root.rglob("*.rawanimation"))
@@ -726,6 +851,10 @@ class MotionPreviewApp(tk.Tk):
                     if index % 1000 == 0:
                         self.worker_queue.put(("scan_progress", (generation, index)))
             found.sort(key=lambda h: (h.skeleton_name.lower(), h.action.lower(), str(h.path)))
+            try:
+                save_motion_catalog(root, found)
+            except OSError:
+                pass
             self.worker_queue.put(("scan_done", (generation, found, failed)))
 
         threading.Thread(target=worker, daemon=True).start()
@@ -743,41 +872,19 @@ class MotionPreviewApp(tk.Tk):
         self.status_var.set("正在收集待预解码动作……")
 
         def worker() -> None:
-            paths = list(root.rglob("*.rawanimation"))
-            total = len(paths)
-            reused = 0
-            decoded = 0
-            failed = 0
-            lock = threading.Lock()
-            last_reported = 0.0
+            def progress(stage, done, total, reused, decoded, failed) -> None:
+                self.worker_queue.put(
+                    (
+                        "predecode_progress",
+                        (stage, done, total, reused, decoded, failed),
+                    )
+                )
 
-            def prepare(path: Path) -> bool | None:
-                try:
-                    _header, _cache_path, cache_hit = ensure_decoded_motion_cache(path)
-                    return cache_hit
-                except (OSError, MotionFormatError):
-                    return None
-
-            with ThreadPoolExecutor(max_workers=4) as executor:
-                for index, cache_hit in enumerate(executor.map(prepare, paths), 1):
-                    if cache_hit is None:
-                        failed += 1
-                    elif cache_hit:
-                        reused += 1
-                    else:
-                        decoded += 1
-                    now = time.monotonic()
-                    if index == total or index % 20 == 0 or now - last_reported >= 0.75:
-                        with lock:
-                            self.worker_queue.put(
-                                (
-                                    "predecode_progress",
-                                    (index, total, reused, decoded, failed),
-                                )
-                            )
-                        last_reported = now
+            headers, reused, decoded, failed = prepare_motion_assets(
+                root, progress=progress, decode_all=True
+            )
             self.worker_queue.put(
-                ("predecode_done", (total, reused, decoded, failed))
+                ("predecode_done", (headers, reused, decoded, failed))
             )
 
         threading.Thread(target=worker, daemon=True).start()
@@ -798,6 +905,8 @@ class MotionPreviewApp(tk.Tk):
             )
 
     def _tree_selected(self, _event=None) -> None:
+        if self.batch_export_state is not None:
+            return
         selected = self.tree.selection()
         if selected:
             index = int(selected[0])
@@ -965,19 +1074,21 @@ class MotionPreviewApp(tk.Tk):
                             f"扫描完成：{len(headers):,} 个可用 v0 动作，跳过 {failed:,} 个异常/新版文件{display_note}。"
                         )
                 elif kind == "predecode_progress":
-                    done, total, reused, decoded, failed = payload
+                    stage, done, total, reused, decoded, failed = payload
                     percent = done * 100.0 / max(total, 1)
                     self.status_var.set(
-                        f"正在预解码 {done:,}/{total:,}（{percent:.1f}%） · "
+                        f"{stage} {done:,}/{total:,}（{percent:.1f}%） · "
                         f"复用 {reused:,} · 新增 {decoded:,} · 跳过 {failed:,}"
                     )
                 elif kind == "predecode_done":
-                    total, reused, decoded, failed = payload
+                    headers, reused, decoded, failed = payload
+                    self.headers = headers
+                    self._apply_filter()
                     self.predecode_running = False
                     self.predecode_button.configure(state="normal")
                     cache_root = Path(__file__).resolve().parent / ".motion_cache"
                     self.status_var.set(
-                        f"预解码完成：检查 {total:,}，复用 {reused:,}，"
+                        f"预解析完成：动作 {len(headers):,}，复用 {reused:,}，"
                         f"新增 {decoded:,}，跳过 {failed:,}；缓存保存在 {cache_root}"
                     )
                 elif kind == "motion_done":
@@ -1010,11 +1121,19 @@ class MotionPreviewApp(tk.Tk):
                         if cache_hit else "首次解码结果已保存"
                     )
                     self.status_var.set(f"动作载入完成（{cache_note}）{suffix}")
-                    self.motion_filter_active = True
-                    self._apply_pmx_filter()
-                    self._select_best_motion_candidate()
+                    if self.batch_export_state is None:
+                        self.motion_filter_active = True
+                        self._apply_pmx_filter()
+                        self._select_best_motion_candidate()
                     self._connect_skin()
                     self._render(0.0)
+                    batch_state = self.batch_export_state
+                    if (
+                        batch_state is not None
+                        and batch_state.get("expected_motion")
+                        == str(motion.header.path.resolve()).lower()
+                    ):
+                        self.after(1, self._batch_export_current_files)
                 elif kind == "pmx_list_done":
                     items, classifications = payload
                     self.pmx_catalog_loading = False
@@ -1048,6 +1167,38 @@ class MotionPreviewApp(tk.Tk):
                     except Exception as exc:
                         self.skin = None
                         messagebox.showerror(APP_TITLE, f"PMX 模型预览准备失败：\n{exc}")
+                elif kind == "batch_model_ready":
+                    copied_pmx, total = payload
+                    if self.batch_export_state is not None:
+                        self.batch_export_state["copied_pmx"] = copied_pmx
+                        self.status_var.set(f"模型复制完成，开始导出 {total} 个动作。")
+                        self._batch_export_next()
+                elif kind == "batch_progress":
+                    current, total_actions, label, done, total = payload
+                    percent = done * 100.0 / max(1, total)
+                    self.status_var.set(
+                        f"批量导出 {current}/{total_actions}：{label} "
+                        f"{done}/{total}（{percent:.1f}%）"
+                    )
+                elif kind == "batch_files_done":
+                    if (
+                        self.batch_export_state is not None
+                        and self.batch_export_state.get("cancelled")
+                    ):
+                        self._finish_batch_export(True)
+                    else:
+                        try:
+                            self._start_batch_video(Path(payload))
+                        except Exception as exc:
+                            self._batch_item_finished(
+                                f"视频启动失败：{type(exc).__name__}: {exc}"
+                            )
+                elif kind == "batch_item_error":
+                    self._batch_item_finished(str(payload))
+                elif kind == "batch_error":
+                    if self.batch_export_state is not None:
+                        self.batch_export_state["failed"].append(str(payload))
+                        self._finish_batch_export(False)
                 elif kind == "fbx_progress":
                     label, done, total = payload
                     percent = done * 100.0 / max(total, 1)
@@ -1125,6 +1276,9 @@ class MotionPreviewApp(tk.Tk):
     def _connect_skin(self) -> None:
         if self.skin is None or self.motion is None:
             return
+        self.skin["gpu_skinning"] = False
+        if self.gpu_renderer is not None:
+            self.gpu_renderer.disable_skinning()
         motion_names = self.motion.header.bone_names
         by_key = {normalized_bone_name(name): index for index, name in enumerate(motion_names)}
         aliases: dict[str, list[int]] = {}
@@ -1169,6 +1323,29 @@ class MotionPreviewApp(tk.Tk):
         )
         self.skin["retarget"] = not direct_compatible
         self.skin["offset"] = np.zeros(3, dtype=np.float32)
+        reference_matrices = trs_row_matrices(reference_local)
+        self.skin["source_reference_inverse"] = inverse_affine_row_matrix4(
+            reference_matrices
+        )
+        target_bind = self.skin.get("mesh_bind_matrices")
+        if target_bind is not None:
+            bind_pmx = neox_to_pmx_matrix4(
+                np.asarray(target_bind, dtype=np.float32)
+            )
+            self.skin["bind_pmx"] = bind_pmx
+            self.skin["bind_pmx_inverse"] = inverse_affine_row_matrix4(bind_pmx)
+        gpu_note = ""
+        if self.gpu_renderer is not None:
+            try:
+                self.gpu_renderer.prepare_skinning(
+                    self.skin["joints"],
+                    self.skin["weights"],
+                    len(self.skin["bone_names"]),
+                )
+                self.skin["gpu_skinning"] = True
+                gpu_note = "；GPU 蒙皮已启用"
+            except Exception as exc:
+                gpu_note = f"；GPU 蒙皮不可用，已回退 CPU（{exc}）"
         if self.motion_bind_transforms is not None:
             note = "已使用 Skeleton 精确绑定姿势"
         else:
@@ -1178,7 +1355,7 @@ class MotionPreviewApp(tk.Tk):
         self.status_var.set(
             f"PMX 动作匹配完成：{len(matched)}/{len(mapping)} 根骨骼"
             f"（其中皮肤别名映射 {relaxed}）；"
-            f"{'启用形态重定向；' if self.skin['retarget'] else ''}{note}。"
+            f"{'启用形态重定向；' if self.skin['retarget'] else ''}{note}{gpu_note}。"
         )
 
     def _direct_skin_compatible(
@@ -1284,12 +1461,14 @@ class MotionPreviewApp(tk.Tk):
         source = self.motion.frames[frame]
         if len(reference) != len(source):
             return None
-        source_delta = np.empty((len(source), 4, 4), dtype=np.float32)
-        for index in range(len(source)):
-            source_delta[index] = matrix4_multiply(
-                inverse_affine_row_matrix4(trs_row_matrix4(reference[index])),
-                trs_row_matrix4(source[index]),
+        reference_inverse = self.skin.get("source_reference_inverse")
+        if reference_inverse is None:
+            reference_inverse = inverse_affine_row_matrix4(
+                trs_row_matrices(reference)
             )
+        source_delta = matrix4_multiply(
+            reference_inverse, trs_row_matrices(source)
+        )
         target_current = np.zeros_like(target_bind)
         visiting = np.zeros(count, dtype=np.uint8)
 
@@ -1319,16 +1498,81 @@ class MotionPreviewApp(tk.Tk):
 
         for index in range(count):
             visit(index)
-        bind_pmx = neox_to_pmx_matrix4(target_bind)
+        bind_pmx = self.skin.get("bind_pmx")
+        if bind_pmx is None:
+            bind_pmx = neox_to_pmx_matrix4(target_bind)
         current_pmx = neox_to_pmx_matrix4(target_current)
         return bind_pmx, current_pmx
 
-    def _matrix_skin_positions(self, frame: int) -> np.ndarray | None:
-        poses = self._matrix_target_global_poses(frame)
-        if poses is None or self.skin is None:
+    def _skin_matrices(self, frame: int) -> np.ndarray | None:
+        """Return one compact affine transform per PMX bone for CPU or GPU use."""
+        if self.skin is None or self.motion is None:
             return None
-        bind_pmx, current_pmx = poses
-        skin_matrices = matrix4_multiply(inverse_affine_row_matrix4(bind_pmx), current_pmx)
+        poses = self._matrix_target_global_poses(frame)
+        if poses is not None:
+            bind_pmx, current_pmx = poses
+            bind_inverse = self.skin.get("bind_pmx_inverse")
+            if bind_inverse is None:
+                bind_inverse = inverse_affine_row_matrix4(bind_pmx)
+            return matrix4_multiply(bind_inverse, current_pmx)
+
+        mapping = self.skin.get("mapping")
+        reference_pose = self.skin.get("reference_pose")
+        if mapping is None or reference_pose is None:
+            return None
+        mapping = np.asarray(mapping, dtype=np.int32)
+        bind = np.asarray(self.skin["bind"], dtype=np.float32)
+        count = len(bind)
+        matrices = np.repeat(
+            np.eye(4, dtype=np.float32)[None, :, :], count, axis=0
+        )
+        if self.skin.get("retarget"):
+            pose_pos, pose_rot, pose_scale = self._retarget_pose(frame)
+            reference_pos = bind
+            reference_rot = np.zeros_like(pose_rot)
+            reference_rot[:, 3] = 1.0
+            reference_scale = np.ones_like(pose_scale)
+            pose_indices = np.arange(count, dtype=np.int32)
+            valid = np.ones(count, dtype=bool)
+        else:
+            pose_pos, pose_rot, pose_scale = compose_global_transforms(
+                self.motion.frames[frame], self.parents
+            )
+            reference_pos, reference_rot, reference_scale = reference_pose
+            pose_indices = np.maximum(mapping, 0)
+            valid = mapping >= 0
+        valid &= np.isfinite(pose_pos[pose_indices]).all(axis=1)
+        valid &= np.isfinite(pose_rot[pose_indices]).all(axis=1)
+        valid &= np.isfinite(pose_scale[pose_indices]).all(axis=1)
+        if not valid.any():
+            return matrices
+        selected = pose_indices[valid]
+        rotation_delta = quaternion_delta(
+            pose_rot[selected], reference_rot[selected]
+        )
+        scale_delta = np.divide(
+            pose_scale[selected],
+            reference_scale[selected],
+            out=np.ones_like(pose_scale[selected]),
+            where=np.abs(reference_scale[selected]) > 1.0e-8,
+        )
+        translation_delta = pose_pos[selected] - reference_pos[selected]
+        transforms = np.zeros((len(selected), 10), dtype=np.float32)
+        transforms[:, 3:7] = rotation_delta
+        transforms[:, 7:10] = scale_delta
+        affine = trs_row_matrices(transforms)
+        affine[:, 3, :3] = (
+            bind[valid]
+            + translation_delta
+            - np.einsum("ni,nij->nj", bind[valid], affine[:, :3, :3])
+        )
+        matrices[valid] = affine
+        return matrices
+
+    def _matrix_skin_positions(self, frame: int) -> np.ndarray | None:
+        skin_matrices = self._skin_matrices(frame)
+        if skin_matrices is None or self.skin is None:
+            return None
         base = np.asarray(self.skin["base"], dtype=np.float32)
         points = np.column_stack((base, np.ones(len(base), dtype=np.float32)))
         joints = np.asarray(self.skin["joints"], dtype=np.int32)
@@ -1512,6 +1756,148 @@ class MotionPreviewApp(tk.Tk):
             )
             current_globals[index] = trs_row_matrix4(transform)
         return bind_globals, current_globals
+
+    def _write_fbx_file(
+        self,
+        output_path: Path,
+        pmx_path: Path,
+        motion: DecodedMotion,
+        skin: dict[str, object],
+        report,
+    ) -> tuple[int, int]:
+        """Write one FBX without dialogs so single and batch export share it."""
+        import pymeshio.pmx.reader
+        from onmyoji_fbx import decompose_row_matrices, write_animated_fbx
+
+        model = pymeshio.pmx.reader.read_from_file(str(pmx_path))
+        bone_names = list(skin["bone_names"])
+        parents = tuple(int(value) for value in skin["parents"])
+        frame_count = motion.sample_count
+        bone_count = len(bone_names)
+        bind_globals, _ = self._fbx_global_poses(0)
+        bind_local = self._global_to_local_matrices(bind_globals, parents)
+        bind_t, bind_r, bind_s = decompose_row_matrices(bind_local)
+        frame_t = np.empty((frame_count, bone_count, 3), dtype=np.float32)
+        frame_r = np.empty_like(frame_t)
+        frame_s = np.empty_like(frame_t)
+        for frame in range(frame_count):
+            _bind, current_globals = self._fbx_global_poses(frame)
+            current_local = self._global_to_local_matrices(
+                current_globals, parents
+            )
+            translation, rotation, scaling = decompose_row_matrices(
+                current_local
+            )
+            frame_t[frame] = translation
+            frame_r[frame] = rotation
+            frame_s[frame] = scaling
+            if frame % 5 == 0 or frame + 1 == frame_count:
+                report("烘焙骨骼动画", frame + 1, frame_count)
+        frame_r = np.degrees(
+            np.unwrap(np.radians(frame_r.astype(np.float64)), axis=0)
+        ).astype(np.float32)
+        frame_r += (
+            360.0 * np.rint((bind_r - frame_r[0]) / 360.0)[None, :, :]
+        ).astype(np.float32)
+
+        positions = np.asarray(
+            [(v.position.x, v.position.y, v.position.z) for v in model.vertices],
+            dtype=np.float32,
+        )
+        normals = np.asarray(
+            [(v.normal.x, v.normal.y, v.normal.z) for v in model.vertices],
+            dtype=np.float32,
+        )
+        uvs = np.asarray(
+            [(v.uv.x, v.uv.y) for v in model.vertices], dtype=np.float32
+        )
+        raw_indices = np.asarray(model.indices, dtype=np.int32)
+        triangles = raw_indices[
+            : len(raw_indices) - len(raw_indices) % 3
+        ].reshape(-1, 3)
+        face_materials: list[int] = []
+        remaining = len(triangles)
+        for material_index, material in enumerate(model.materials):
+            count = min(remaining, max(0, int(material.vertex_count) // 3))
+            face_materials.extend([material_index] * count)
+            remaining -= count
+        if remaining:
+            face_materials.extend([0] * remaining)
+
+        texture_dir = output_path.parent / f"{output_path.stem}_textures"
+        copied_textures: dict[int, Path] = {}
+        material_defs: list[dict[str, object]] = []
+        for index, material in enumerate(model.materials):
+            texture_index = int(getattr(material, "texture_index", -1))
+            texture_target = None
+            if 0 <= texture_index < len(model.textures):
+                source = pmx_path.parent / str(model.textures[texture_index]).replace(
+                    "\\", os.sep
+                ).replace("/", os.sep)
+                if source.is_file():
+                    texture_target = copied_textures.get(texture_index)
+                    if texture_target is None:
+                        texture_dir.mkdir(parents=True, exist_ok=True)
+                        texture_target = texture_dir / f"{texture_index:03d}_{source.name}"
+                        if (
+                            not texture_target.is_file()
+                            or texture_target.stat().st_size != source.stat().st_size
+                        ):
+                            temporary = texture_target.with_suffix(
+                                texture_target.suffix + ".tmp"
+                            )
+                            shutil.copyfile(source, temporary)
+                            temporary.replace(texture_target)
+                        copied_textures[texture_index] = texture_target
+            color = getattr(material, "diffuse_color", None)
+            diffuse = (
+                float(getattr(color, "r", 0.8)),
+                float(getattr(color, "g", 0.8)),
+                float(getattr(color, "b", 0.8)),
+                float(getattr(material, "alpha", 1.0)),
+            )
+            material_defs.append(
+                {
+                    "name": str(
+                        getattr(material, "name", "") or f"Material_{index:03d}"
+                    ),
+                    "diffuse": diffuse,
+                    "texture": texture_target,
+                    "relative_texture": (
+                        str(texture_target.relative_to(output_path.parent)).replace(
+                            "\\", "/"
+                        )
+                        if texture_target is not None else ""
+                    ),
+                }
+            )
+
+        if len(positions) != len(skin["joints"]):
+            raise MotionFormatError("当前 PMX 已变化，请重新载入模型后再导出 FBX。")
+        write_animated_fbx(
+            output_path,
+            model_name=pmx_path.stem,
+            positions=positions,
+            normals=normals,
+            uvs=uvs,
+            triangles=triangles,
+            face_materials=np.asarray(face_materials, dtype=np.int32),
+            material_defs=material_defs,
+            joints=np.asarray(skin["joints"], dtype=np.int32),
+            weights=np.asarray(skin["weights"], dtype=np.float32),
+            bone_names=bone_names,
+            parents=parents,
+            bind_globals=bind_globals,
+            bind_translation=bind_t,
+            bind_rotation=bind_r,
+            bind_scaling=bind_s,
+            frame_translation=frame_t,
+            frame_rotation=frame_r,
+            frame_scaling=frame_s,
+            fps=motion.sample_rate,
+            progress=report,
+        )
+        return frame_count, bone_count
 
     def _export_fbx(self) -> None:
         if self.record_state is not None or self.fbx_exporting:
@@ -1697,18 +2083,36 @@ class MotionPreviewApp(tk.Tk):
         if motion is None or motion.sample_count == 0:
             raise MotionFormatError("尚未载入可录制动作")
         frame = min(motion.sample_count - 1, max(0, int(round(seconds * motion.sample_rate))))
+        if (
+            self.skin is not None
+            and self.gpu_renderer is not None
+            and self.skin.get("gpu_skinning")
+        ):
+            try:
+                skin_matrices = self._skin_matrices(frame)
+                if skin_matrices is None:
+                    raise RuntimeError("当前动作无法生成骨骼矩阵")
+                self.gpu_renderer.update_bone_matrices(skin_matrices)
+                image = self.gpu_renderer.render(
+                    width, height, self.yaw, self.pitch, self.zoom,
+                    self.pan_x, self.pan_y, False,
+                )
+                return image.convert("RGB"), frame
+            except Exception as exc:
+                self.skin["gpu_skinning"] = False
+                self.gpu_renderer.disable_skinning()
+                self.status_var.set(f"GPU 蒙皮不可用，已自动切回 CPU：{exc}")
         skinned = self._skin_positions(frame)
         if skinned is not None and self.gpu_renderer is not None:
             try:
                 self.gpu_renderer.update_positions(skinned)
                 image = self.gpu_renderer.render(
-                    width, height, self.yaw, self.pitch, self.zoom, 0.0, 0.0, False
+                    width, height, self.yaw, self.pitch, self.zoom,
+                    self.pan_x, self.pan_y, False,
                 )
                 return image.convert("RGB"), frame
             except Exception as exc:
                 self.status_var.set(f"模型动画预览失败，已切回骨架：{exc}")
-                self.skin["offset"] = None
-                self.skin["reference_pose"] = None
         points = compose_global_positions(motion.frames[frame], self.parents)
         visible = skeleton_display_mask(points, self.parents)
         cy, sy = math.cos(self.yaw), math.sin(self.yaw)
@@ -1723,8 +2127,12 @@ class MotionPreviewApp(tk.Tk):
         scale = 0.82 * min(width / max(span[0], 1.0), height / max(span[1], 1.0)) * self.zoom
         center = (fit_points[:, :2].min(axis=0) + fit_points[:, :2].max(axis=0)) * 0.5
         screen = np.empty((len(points), 2), dtype=np.float32)
-        screen[:, 0] = (projected[:, 0] - center[0]) * scale + width * 0.5
-        screen[:, 1] = height * 0.5 - (projected[:, 1] - center[1]) * scale
+        screen[:, 0] = (
+            (projected[:, 0] - center[0]) * scale + width * 0.5 + self.pan_x
+        )
+        screen[:, 1] = (
+            height * 0.5 - (projected[:, 1] - center[1]) * scale + self.pan_y
+        )
 
         image = Image.new("RGB", (width, height), (16, 20, 27))
         painter = ImageDraw.Draw(image)
@@ -1756,6 +2164,342 @@ class MotionPreviewApp(tk.Tk):
         self.canvas.delete("all")
         self.canvas.create_image(0, 0, anchor="nw", image=self.preview_image)
         self.time_label.configure(text=f"{seconds:.2f} / {motion.duration:.2f} 秒  ·  帧 {frame}")
+
+    def _current_source_mesh_names(self, pmx_path: Path) -> tuple[str, ...]:
+        names: list[str] = []
+        known = self.pmx_source_meshes.get(str(pmx_path.resolve()).lower(), "")
+        if known:
+            names.append(Path(known).name)
+        try:
+            payload = json.loads(
+                (pmx_path.parent / ".build.json").read_text(encoding="utf-8")
+            )
+            source = str(payload.get("source_mesh", "")).strip()
+            if source:
+                names.append(Path(source).name)
+            names.extend(
+                Path(str(value)).name
+                for value in payload.get("components", ())
+                if str(value).strip()
+            )
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            pass
+        return tuple(dict.fromkeys(name.lower() for name in names if name))
+
+    def _matching_headers_for_current_pmx(self) -> list[MotionHeader]:
+        if self.skin is None:
+            return []
+        headers = self.headers or load_motion_catalog(Path(self.root_var.get())) or []
+        pmx_path = Path(self.pmx_var.get()).resolve()
+        source_meshes = self._current_source_mesh_names(pmx_path)
+        target_names = tuple(str(value) for value in self.skin["bone_names"])
+        target_keys = {normalized_bone_name(value) for value in target_names}
+        model_keys = self._model_identity_keys(pmx_path.stem)
+        model_root = Path(__file__).resolve().parent / "unpacked" / "model"
+        official_source_names = {
+            Path(value.replace("\\", "/")).name.lower()
+            for value in source_meshes
+        }
+        ranked: list[tuple[int, MotionHeader]] = []
+        skeleton_match_cache: dict[str, bool] = {}
+        bone_signature_cache: dict[tuple[str, ...], set[str]] = {}
+        for header in headers:
+            name_match = skeleton_match_cache.get(header.skeleton_name)
+            if name_match is None:
+                name_match = bool(
+                    model_keys & self._model_identity_keys(header.skeleton_name)
+                )
+                skeleton_match_cache[header.skeleton_name] = name_match
+            official = False
+            if self.official_motion_bindings is not None and official_source_names:
+                try:
+                    relative = header.path.relative_to(model_root)
+                    motion_key = str(relative).replace("\\", "/").lower()
+                    official = bool(
+                        self.official_motion_bindings.motion_to_meshes.get(
+                            motion_key, frozenset()
+                        )
+                        & official_source_names
+                    )
+                except ValueError:
+                    pass
+            # A skeleton identity or an official package edge is required
+            # before the costlier bone comparison.  Bone-count equality alone
+            # is far too common across unrelated humanoid characters.
+            if not official and not name_match:
+                continue
+            motion_keys = bone_signature_cache.get(header.bone_names)
+            if motion_keys is None:
+                motion_keys = {
+                    normalized_bone_name(value) for value in header.bone_names
+                }
+                bone_signature_cache[header.bone_names] = motion_keys
+            if len(motion_keys) < 4:
+                continue
+            exact_bones = motion_keys == target_keys
+            overlap = len(motion_keys & target_keys) / max(1, len(motion_keys))
+            count_close = abs(len(target_keys) - len(motion_keys)) <= max(
+                2, int(len(motion_keys) * 0.08)
+            )
+            # A finished PMX can legitimately contain body + hair/accessory
+            # bones.  A complete motion-bone subset is therefore stronger
+            # evidence than equal total counts; 95% overlap still requires a
+            # close count to avoid attaching a partial humanoid rig by chance.
+            bone_compatible = (
+                exact_bones
+                or motion_keys.issubset(target_keys)
+                or (overlap >= 0.95 and count_close)
+            )
+            # Official package edges must still pass the actual loaded PMX rig;
+            # package accessory meshes are a common source of false candidates.
+            if not bone_compatible:
+                continue
+            if official:
+                score = 300
+            elif name_match and exact_bones:
+                score = 220
+            elif name_match:
+                score = 180
+            else:
+                continue
+            ranked.append((score, header))
+
+        ranked.sort(
+            key=lambda value: (
+                -value[0],
+                value[1].action.lower(),
+                value[1].skeleton_name.lower(),
+                str(value[1].path).lower(),
+            )
+        )
+        unique: dict[tuple[object, ...], MotionHeader] = {}
+        for _score, header in ranked:
+            key = (
+                normalized_bone_name(header.skeleton_name),
+                normalized_bone_name(header.action),
+                tuple(normalized_bone_name(name) for name in header.bone_names),
+                round(header.duration, 4),
+                round(header.sample_rate, 4),
+            )
+            unique.setdefault(key, header)
+        return list(unique.values())
+
+    @staticmethod
+    def _safe_export_name(value: str, fallback: str) -> str:
+        return re.sub(
+            r"[^0-9A-Za-z_\-\u4e00-\u9fff]+", "_", value
+        ).strip("_") or fallback
+
+    def _export_all_model_motions(self) -> None:
+        if self.batch_export_state is not None:
+            self.batch_export_state["cancelled"] = True
+            if self.record_state is not None:
+                self.record_state["cancelled"] = True
+            self.batch_export_button.configure(state="disabled", text="正在停止……")
+            return
+        pmx_path = Path(self.pmx_var.get())
+        if self.skin is None or not pmx_path.is_file():
+            messagebox.showinfo(APP_TITLE, "请先选择并载入一个 PMX 模型。")
+            return
+        headers = self._matching_headers_for_current_pmx()
+        if not headers:
+            messagebox.showinfo(
+                APP_TITLE,
+                "没有找到同时通过资源关联、骨架名称和骨骼结构校验的动作。\n"
+                "请先完成一次新版一键解包，或点击“扫描动作”。",
+            )
+            return
+        destination = filedialog.askdirectory(title="选择模型动作全集导出目录")
+        if not destination:
+            return
+        safe_model = self._safe_export_name(pmx_path.stem, "模型")
+        root = Path(destination).resolve() / f"{safe_model}_动作全集"
+        suffix = 2
+        while root.exists():
+            root = Path(destination).resolve() / f"{safe_model}_动作全集_{suffix}"
+            suffix += 1
+        self.playing = False
+        self.play_button.configure(text="播放")
+        self.batch_export_state = {
+            "headers": headers,
+            "index": 0,
+            "root": root,
+            "source_pmx": pmx_path.resolve(),
+            "copied_pmx": None,
+            "current_folder": None,
+            "success": 0,
+            "failed": [],
+            "cancelled": False,
+            "width": max(320, self.canvas.winfo_width()),
+            "height": max(240, self.canvas.winfo_height()),
+            "view": (self.yaw, self.pitch, self.zoom, self.pan_x, self.pan_y),
+        }
+        self.batch_export_button.configure(text="停止批量导出")
+        self.status_var.set(
+            f"准备导出 {len(headers)} 个匹配动作：正在复制 PMX 与贴图……"
+        )
+
+        def worker() -> None:
+            try:
+                model_dir = root / "模型"
+                shutil.copytree(pmx_path.parent, model_dir)
+                copied_pmx = model_dir / pmx_path.name
+                (root / "动作").mkdir(parents=True, exist_ok=True)
+                self.worker_queue.put(
+                    ("batch_model_ready", (copied_pmx, len(headers)))
+                )
+            except Exception as exc:
+                self.worker_queue.put(("batch_error", f"复制模型失败：{exc}"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _batch_export_next(self) -> None:
+        state = self.batch_export_state
+        if state is None:
+            return
+        if state["cancelled"] or state["index"] >= len(state["headers"]):
+            self._finish_batch_export(bool(state["cancelled"]))
+            return
+        header = state["headers"][state["index"]]
+        state["expected_motion"] = str(header.path.resolve()).lower()
+        self.status_var.set(
+            f"批量导出 {state['index'] + 1}/{len(state['headers'])}："
+            f"读取 {header.action}"
+        )
+        self._load_path(header.path)
+
+    def _batch_export_current_files(self) -> None:
+        state = self.batch_export_state
+        motion = self.motion
+        skin = self.skin
+        if state is None or motion is None or skin is None:
+            return
+        if state["cancelled"]:
+            self._finish_batch_export(True)
+            return
+        ordinal = int(state["index"]) + 1
+        action_name = self._safe_export_name(motion.header.action, f"动作_{ordinal:04d}")
+        folder = Path(state["root"]) / "动作" / f"{ordinal:04d}_{action_name}"
+        folder.mkdir(parents=True, exist_ok=True)
+        state["current_folder"] = folder
+        copied_pmx = Path(state["copied_pmx"])
+        model_name = self._safe_export_name(copied_pmx.stem, "模型")
+
+        def report(label: str, done: int, total: int) -> None:
+            self.worker_queue.put(
+                (
+                    "batch_progress",
+                    (
+                        int(state["index"]) + 1,
+                        len(state["headers"]),
+                        label,
+                        done,
+                        total,
+                    ),
+                )
+            )
+
+        def worker() -> None:
+            try:
+                export_vmd(
+                    motion,
+                    copied_pmx,
+                    folder / f"{model_name}_{action_name}.vmd",
+                    reference_transforms=self.motion_bind_transforms,
+                    compatible_path=(
+                        copied_pmx.parent / f"{model_name}_动作兼容.pmx"
+                    ),
+                )
+                self._write_fbx_file(
+                    folder / f"{model_name}_{action_name}.fbx",
+                    copied_pmx,
+                    motion,
+                    skin,
+                    report,
+                )
+                self.worker_queue.put(("batch_files_done", folder))
+            except Exception as exc:
+                self.worker_queue.put(
+                    (
+                        "batch_item_error",
+                        f"{motion.header.action}: {type(exc).__name__}: {exc}",
+                    )
+                )
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _start_batch_video(self, folder: Path) -> None:
+        state = self.batch_export_state
+        motion = self.motion
+        if state is None or motion is None:
+            return
+        try:
+            import imageio_ffmpeg
+        except ImportError as exc:
+            self.worker_queue.put(("batch_item_error", f"视频组件缺失：{exc}"))
+            return
+        self.yaw, self.pitch, self.zoom, self.pan_x, self.pan_y = state["view"]
+        width = int(state["width"])
+        height = int(state["height"])
+        width -= width % 2
+        height -= height % 2
+        action_name = self._safe_export_name(motion.header.action, "动作")
+        model_name = self._safe_export_name(Path(state["copied_pmx"]).stem, "模型")
+        target = folder / f"{model_name}_{action_name}.mp4"
+        temporary = folder / f".{target.stem}.recording.mp4"
+        writer = imageio_ffmpeg.write_frames(
+            str(temporary),
+            (width, height),
+            fps=motion.sample_rate if motion.sample_rate > 0 else 30.0,
+            codec="libx264",
+            pix_fmt_in="rgb24",
+            pix_fmt_out="yuv420p",
+            quality=7,
+            output_params=["-movflags", "+faststart"],
+        )
+        writer.send(None)
+        self.record_state = {
+            "writer": writer,
+            "target": target,
+            "temporary": temporary,
+            "width": width,
+            "height": height,
+            "fps": motion.sample_rate if motion.sample_rate > 0 else 30.0,
+            "frame": 0,
+            "total": motion.sample_count,
+            "old_time": float(self.timeline_var.get()),
+            "cancelled": False,
+            "batch": True,
+        }
+        self.after(1, self._record_video_step)
+
+    def _batch_item_finished(self, error: str | None = None) -> None:
+        state = self.batch_export_state
+        if state is None:
+            return
+        if error:
+            state["failed"].append(error)
+        else:
+            state["success"] += 1
+        state["index"] += 1
+        self.after(1, self._batch_export_next)
+
+    def _finish_batch_export(self, cancelled: bool) -> None:
+        state = self.batch_export_state
+        if state is None:
+            return
+        self.batch_export_state = None
+        self.batch_export_button.configure(state="normal", text="一键导出模型全部动作")
+        failed = list(state["failed"])
+        summary = (
+            f"{'批量导出已停止' if cancelled else '批量导出完成'}："
+            f"成功 {state['success']}，失败 {len(failed)}。\n"
+            f"输出：{state['root']}"
+        )
+        if failed:
+            summary += "\n\n前几项失败：\n" + "\n".join(failed[:8])
+        self.status_var.set(summary.replace("\n", "；"))
+        messagebox.showinfo(APP_TITLE, summary)
 
     def _record_video(self) -> None:
         """Record the complete current preview as quickly as rendering permits."""
@@ -1893,8 +2637,18 @@ class MotionPreviewApp(tk.Tk):
         self.timeline_var.set(old_time)
         self._render(old_time)
         failure = error or close_error
+        batch_recording = bool(state.get("batch"))
         if cancelled or failure is not None:
             temporary.unlink(missing_ok=True)
+            if batch_recording:
+                batch_state = self.batch_export_state
+                if batch_state is not None and batch_state.get("cancelled"):
+                    self._finish_batch_export(True)
+                else:
+                    self._batch_item_finished(
+                        "视频录制已停止" if cancelled else f"视频录制失败：{failure}"
+                    )
+                return
             if cancelled:
                 self.status_var.set("视频录制已停止，未保存未完成文件。")
             else:
@@ -1905,8 +2659,14 @@ class MotionPreviewApp(tk.Tk):
             temporary.replace(target)
         except OSError as exc:
             temporary.unlink(missing_ok=True)
+            if batch_recording:
+                self._batch_item_finished(f"视频保存失败：{exc}")
+                return
             self.status_var.set("视频保存失败")
             messagebox.showerror(APP_TITLE, f"视频保存失败：\n{exc}")
+            return
+        if batch_recording:
+            self._batch_item_finished()
             return
         self.status_var.set(f"视频录制完成：{target}")
         messagebox.showinfo(
@@ -1916,17 +2676,24 @@ class MotionPreviewApp(tk.Tk):
             f"{int(state['width'])}×{int(state['height'])}",
         )
 
-    def _drag_start(self, event) -> None:
+    def _drag_start(self, event, mode: str = "rotate") -> None:
         if self.record_state is not None:
             return
-        self.drag = (event.x, event.y, self.yaw, self.pitch)
+        self.drag = (
+            mode, event.x, event.y, self.yaw, self.pitch, self.pan_x, self.pan_y
+        )
 
     def _drag_move(self, event) -> None:
         if self.record_state is not None:
             return
         if self.drag is None:
             return
-        x, y, yaw, pitch = self.drag
+        mode, x, y, yaw, pitch, pan_x, pan_y = self.drag
+        if mode == "pan":
+            self.pan_x = pan_x + event.x - x
+            self.pan_y = pan_y + event.y - y
+            self._render(self.timeline_var.get())
+            return
         self.yaw = yaw + (event.x - x) * 0.01
         self.pitch = max(-1.45, min(1.45, pitch + (event.y - y) * 0.01))
         self._render(self.timeline_var.get())

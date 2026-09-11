@@ -43,16 +43,24 @@ import zipfile
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
+from statistics import median
 from typing import Callable, Iterable
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+from game_profiles import get_game_profile
 
-APP_TITLE = "阴阳师 PMX 一键解包工具"
+
+GAME_PROFILE = get_game_profile()
+APP_TITLE = f"{GAME_PROFILE.display_name} PMX 一键解包工具"
+UNPACKED_DIR_NAME = GAME_PROFILE.unpacked_dir
+DEFAULT_RESOURCE_DIR_NAME = GAME_PROFILE.local_resource_dir
+DEFAULT_RIGGED_OUTPUT_DIR_NAME = GAME_PROFILE.rigged_output_dir
+ENABLE_ROLE_CLASSIFICATION = GAME_PROFILE.enable_role_classification
 # 这里只表示 PMX 文件本身的输出兼容版本。材质匹配规则、报告格式或 GUI
 # 调整不应修改它，否则所有 .build.json 会同时失效并触发一次全量重写。
-PMX_OUTPUT_FORMAT_VERSION = 34
+PMX_OUTPUT_FORMAT_VERSION = 35
 # 材质 resolver 的输入/规则兼容版本。只在匹配逻辑会改变最终材质包时递增；
 # GUI、报告和预览器调整不得递增。
 MATERIAL_RESOLVER_VERSION = 43
@@ -73,6 +81,24 @@ FACIAL_BONE_ROOT_KEYS = frozenset(
         "face_root",
     }
 )
+# Mesh 和 Skeleton 矩阵不同只说明两套 bind 不同，不能证明动作在 Mesh
+# 一侧。角色身体的左右对称性提供方向证据：只有 Skeleton 明显更中立时，
+# 才允许把顶点重映射过去。否则以 Mesh 自带的蒙皮空间为准，避免把庭院/展示
+# Skeleton 的坐姿或表演姿态反向烘进本来对称的模型。
+POSE_SYMMETRY_BONE_TERMS = (
+    "clavicle",
+    "upperarm",
+    "forearm",
+    "hand",
+    "thigh",
+    "calf",
+    "foot",
+    "toe",
+)
+POSE_SYMMETRY_MIN_PAIRS = 4
+POSE_SYMMETRY_MIN_ACTION_SCORE = 0.08
+POSE_SYMMETRY_MIN_IMPROVEMENT = 0.04
+POSE_SYMMETRY_MAX_REST_RATIO = 0.75
 # 额外包材质同步的缓存格式。只有路径哈希/筛选规则发生变化时才递增；
 # GUI 文案和普通 PMX 输出规则不应让数万条补充路径重新计算。
 SUPPLEMENTAL_MATERIAL_SYNC_VERSION = 1
@@ -91,6 +117,10 @@ _ORPHAN_MANIFEST_CACHE: dict[
 ] = {}
 _PMX_BUILD_OUTPUT_CACHE: dict[str, dict[str, list[Path]]] = {}
 TRUSTED_MATERIAL_CONFIDENCE = frozenset({
+    "平安京EXPK几何语义精确",
+    "平安京展示高模几何精确",
+    "平安京展示高模主贴图",
+    "平安京展示高模部分主贴图",
     "旧NPK物理组精确",
     "旧NPK物理组精确主贴图",
     "旧NPK几何组精确",
@@ -1291,26 +1321,44 @@ def archive_index(path: Path) -> int | None:
 
 
 def locate_model_resource_root(selected: Path) -> Path | None:
-    """接受工具目录、cloudfilesys3/res、游戏包目录或整个 yys 目录。"""
+    """接受工具目录、cloudfilesys3/res、游戏包目录或完整拉取目录。"""
     selected = selected.resolve()
     if (selected / "model.idx").is_file():
         return selected
 
-    relative_candidates = (
+    relative_candidates = [
         Path("res"),
         Path("cloudfilesys3") / "res",
         Path("Documents") / "cloudfilesys3" / "res",
-        Path("files") / "netease" / "onmyoji" / "Documents" / "cloudfilesys3" / "res",
+    ]
+    for namespace in GAME_PROFILE.resource_namespaces:
+        relative_candidates.append(
+            Path("files") / "netease" / namespace / "Documents" / "cloudfilesys3" / "res"
+        )
+    # 兼容网易 NeoX 同类客户端中内部 namespace 与 Android 包名不同的情况。
+    relative_candidates.extend(
+        Path("files") / "netease" / name / "Documents" / "cloudfilesys3" / "res"
+        for name in ("onmyoji", "moba")
+        if name not in GAME_PROFILE.resource_namespaces
     )
     for relative in relative_candidates:
         candidate = selected / relative
         if (candidate / "model.idx").is_file():
             return candidate.resolve()
 
-    # 用户通常选择 yys；其下一层才是 com.netease... 包目录。
-    package_patterns = (
-        "*/files/netease/onmyoji/Documents/cloudfilesys3/res/model.idx",
-        "*/*/files/netease/onmyoji/Documents/cloudfilesys3/res/model.idx",
+    package_patterns: list[str] = []
+    for namespace in GAME_PROFILE.resource_namespaces:
+        package_patterns.extend(
+            (
+                f"*/files/netease/{namespace}/Documents/cloudfilesys3/res/model.idx",
+                f"*/*/files/netease/{namespace}/Documents/cloudfilesys3/res/model.idx",
+            )
+        )
+    package_patterns.extend(
+        (
+            "*/files/netease/*/Documents/cloudfilesys3/res/model.idx",
+            "*/*/files/netease/*/Documents/cloudfilesys3/res/model.idx",
+        )
     )
     for package_pattern in package_patterns:
         for index_path in selected.glob(package_pattern):
@@ -1331,17 +1379,17 @@ def resolve_source_and_model_folder(selected: Path) -> tuple[Path | None, Path]:
         return source, selected
 
     source = locate_model_resource_root(selected)
-    script_model = Path(__file__).resolve().parent / "unpacked" / "model"
+    script_model = Path(__file__).resolve().parent / UNPACKED_DIR_NAME / "model"
     if source is not None:
         # 解包结果始终放在工具旁边，不向游戏本体目录写文件。
         return source, script_model
-    if (selected / "unpacked" / "model" / "manifest.csv").exists():
-        return locate_model_resource_root(selected), selected / "unpacked" / "model"
+    if (selected / UNPACKED_DIR_NAME / "model" / "manifest.csv").exists():
+        return locate_model_resource_root(selected), selected / UNPACKED_DIR_NAME / "model"
     return None, selected
 
 
-def locate_nearby_onmyoji_apk(selected: Path) -> Path | None:
-    """在用户所选目录及其近邻中自动寻找阴阳师 APK。"""
+def locate_nearby_game_apk(selected: Path) -> Path | None:
+    """在用户所选目录及其近邻中自动寻找当前游戏 APK。"""
     selected = selected.resolve()
     if selected.is_file() and selected.suffix.lower() == ".apk":
         return selected
@@ -1363,7 +1411,7 @@ def locate_nearby_onmyoji_apk(selected: Path) -> Path | None:
             for path in folder.glob("*.apk"):
                 fallback.append(path)
                 lowered = path.name.lower()
-                if "onmyoji" in lowered or "阴阳师" in path.name:
+                if any(hint.lower() in lowered for hint in GAME_PROFILE.apk_hints):
                     preferred.append(path)
         except OSError:
             continue
@@ -1373,6 +1421,11 @@ def locate_nearby_onmyoji_apk(selected: Path) -> Path | None:
     if not choices:
         return None
     return max(choices, key=lambda path: (path.stat().st_mtime_ns, path.stat().st_size))
+
+
+def locate_nearby_onmyoji_apk(selected: Path) -> Path | None:
+    """旧 API 兼容入口；实际按当前游戏配置寻找 APK。"""
+    return locate_nearby_game_apk(selected)
 
 
 def _parse_idx_bytes(data: bytes):
@@ -2292,10 +2345,56 @@ def sync_supplemental_material_resources(
     return total_added
 
 
+def _parse_neox_xml_bytes(data: bytes) -> ET.Element:
+    """Parse NeoX XML across UTF-8/GB2312/GB18030 resource variants.
+
+    Python 3.10 expat rejects some multibyte XML declarations such as gb2312.
+    Decode those explicitly, strip the declaration, then parse Unicode text.
+    Non-XML NeoX editor text still raises ParseError and is ignored by callers.
+    """
+    try:
+        return ET.fromstring(data)
+    except (ET.ParseError, UnicodeError, ValueError) as first_error:
+        match = re.search(
+            br"<\?xml[^>]*encoding\s*=\s*['\"]([^'\"]+)['\"]",
+            data[:256],
+            re.IGNORECASE,
+        )
+        declared = (
+            match.group(1).decode("ascii", "ignore").strip()
+            if match is not None else ""
+        )
+        candidates: list[str] = []
+        for encoding in (declared, "utf-8-sig", "gb18030", "gb2312", "utf-16"):
+            if encoding and encoding.lower() not in {item.lower() for item in candidates}:
+                candidates.append(encoding)
+        for encoding in candidates:
+            try:
+                text = data.decode(encoding)
+            except (LookupError, UnicodeError):
+                continue
+            text = re.sub(
+                r"^\ufeff?\s*<\?xml[^>]*\?>\s*",
+                "",
+                text,
+                count=1,
+                flags=re.IGNORECASE,
+            )
+            try:
+                return ET.fromstring(text)
+            except (ET.ParseError, UnicodeError, ValueError):
+                continue
+        raise first_error
+
+
+def _read_neox_xml_root(path: Path) -> ET.Element:
+    return _parse_neox_xml_bytes(path.read_bytes())
+
+
 def parse_material_xml(path: Path) -> list[MaterialDefinition]:
     try:
-        root = ET.parse(path).getroot()
-    except (OSError, ET.ParseError, UnicodeError):
+        root = _read_neox_xml_root(path)
+    except (OSError, ET.ParseError, UnicodeError, ValueError):
         return []
     group = root.find(".//MaterialGroup")
     if group is None:
@@ -3466,8 +3565,8 @@ def parse_gim_mesh_reference(path: Path) -> str | None:
     此时 GIM 的 Mesh="model/.../*.mesh" 仍是客户端实际使用的稳定资源键。
     """
     try:
-        root = ET.parse(path).getroot()
-    except (OSError, ET.ParseError, UnicodeError):
+        root = _read_neox_xml_root(path)
+    except (OSError, ET.ParseError, UnicodeError, ValueError):
         return None
     for node in root.iter():
         for key, value in node.attrib.items():
@@ -3486,8 +3585,8 @@ def parse_gim_skeleton_reference(path: Path) -> str | None:
     SkeletonFile 才是引擎组装时使用的完整骨架身份。
     """
     try:
-        root = ET.parse(path).getroot()
-    except (OSError, ET.ParseError, UnicodeError):
+        root = _read_neox_xml_root(path)
+    except (OSError, ET.ParseError, UnicodeError, ValueError):
         return None
     for node in root.findall(".//SkeletonFile/FileName"):
         reference = (node.get("Value") or "").strip().replace("\\", "/")
@@ -3515,8 +3614,8 @@ def parse_gim_submeshes(path: Path) -> list[GimSubmesh]:
     里的真实下标。多材质模型常见 10,1,0,2... 这种非顺序映射。
     """
     try:
-        root = ET.parse(path).getroot()
-    except (OSError, ET.ParseError, UnicodeError):
+        root = _read_neox_xml_root(path)
+    except (OSError, ET.ParseError, UnicodeError, ValueError):
         return []
     group = root.find(".//SubMesh")
     if group is None:
@@ -3879,6 +3978,701 @@ def build_old_npk_material_packages(
         variants[mesh_path.resolve()] = list(unique.values())
         if len(unique) == 1:
             by_mesh[mesh_path.resolve()] = next(iter(unique.values()))
+    return packages, by_mesh, variants
+
+
+def _moba_reference_family(reference: str) -> str:
+    """Return the numeric Arena hero family from ``hero/<id>_name/...``."""
+    normalized = reference.strip().replace("\\", "/").lower().lstrip("/")
+    match = re.match(r"hero/(\d+)(?:_[^/]+)?/", normalized)
+    return match.group(1) if match else ""
+
+
+def _moba_gim_family(submeshes: list[GimSubmesh]) -> str:
+    families: set[str] = set()
+    for submesh in submeshes:
+        match = re.match(r"(\d+)", submesh.name.strip().lower())
+        if match:
+            families.add(match.group(1))
+    return next(iter(families)) if len(families) == 1 else ""
+
+
+def _moba_submesh_name_base(value: str) -> str:
+    return re.sub(r"_\d+$", "", value.strip().lower())
+
+
+def build_moba_expk_material_packages(
+    model_folder: Path,
+    progress: Callable[[int, int], None] | None = None,
+) -> tuple[
+    list[MaterialPackage],
+    dict[Path, MaterialPackage],
+    dict[Path, list[MaterialPackage]],
+]:
+    """Restore Arena hero materials from EXPK using geometry + hero semantics.
+
+    Arena does not keep GIM, Mesh and MaterialGroup physically adjacent.  The
+    old desktop-NPK +/-12-record heuristic therefore produces no matches.  We
+    instead prove GIM -> Mesh across the whole hero archive using exact submesh
+    bounds, then pair MaterialGroup -> GIM by the explicit ``hero/<id>`` family
+    and material/submesh names.  Opaque texture signatures are resolved only
+    when the physical KTX evidence around the repeated MaterialGroup references
+    is unique; ambiguous references stay unbound rather than receiving a guess.
+    """
+    import moba_expk as expk
+
+    model_folder = model_folder.resolve()
+    manifest_path = model_folder / "npk_manifest.json"
+    if not manifest_path.is_file():
+        return [], {}, {}
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        resources = [
+            expk.ExtractedResource(**item) for item in payload.get("resources", ())
+        ]
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        return [], {}, {}
+
+    by_archive: dict[str, list[tuple[object, Path]]] = defaultdict(list)
+    for item in resources:
+        path = (model_folder / item.relative_path).resolve()
+        if path.is_file():
+            by_archive[item.archive.lower()].append((item, path))
+    for rows in by_archive.values():
+        rows.sort(key=lambda pair: pair[0].physical_order)
+
+    image_suffixes = {".ktx", ".dds", ".png", ".jpg", ".jpeg", ".bmp"}
+    packages: list[MaterialPackage] = []
+    candidates_by_mesh: dict[Path, list[MaterialPackage]] = defaultdict(list)
+    parsed_archives: dict[str, dict[str, object]] = {}
+    total_material_rows = 0
+
+    for archive, rows in by_archive.items():
+        if not archive.startswith("hero"):
+            continue
+        mesh_rows: list[tuple[object, Path, ParsedMesh]] = []
+        gim_rows: list[tuple[object, Path, list[GimSubmesh], str]] = []
+        material_rows: list[
+            tuple[object, Path, list[MaterialDefinition], str]
+        ] = []
+        image_rows: list[tuple[int, Path]] = []
+
+        for item, path in rows:
+            suffix = path.suffix.lower()
+            if suffix == ".mesh":
+                try:
+                    parsed = parse_mesh(path)
+                except (OSError, MeshFormatError, ValueError):
+                    continue
+                mesh_rows.append((item, path, parsed))
+                continue
+            if suffix in image_suffixes:
+                image_rows.append((item.physical_order, path))
+                continue
+            if suffix != ".xml":
+                continue
+
+            material_defs = parse_material_xml(path)
+            if material_defs:
+                families = {
+                    _moba_reference_family(reference)
+                    for material in material_defs
+                    for reference in material.textures.values()
+                    if _moba_reference_family(reference)
+                }
+                family = next(iter(families)) if len(families) == 1 else ""
+                if family:
+                    material_rows.append((item, path, material_defs, family))
+
+            submeshes = parse_gim_submeshes(path)
+            if submeshes:
+                family = _moba_gim_family(submeshes)
+                if family:
+                    gim_rows.append((item, path, submeshes, family))
+
+        total_material_rows += len(material_rows)
+        meshes_by_slots: dict[
+            int, list[tuple[object, Path, ParsedMesh]]
+        ] = defaultdict(list)
+        for mesh_item, mesh_path, parsed in mesh_rows:
+            meshes_by_slots[len(parsed.submeshes)].append(
+                (mesh_item, mesh_path, parsed)
+            )
+
+        proven_gims: list[
+            tuple[object, Path, list[GimSubmesh], str, object, Path]
+        ] = []
+        for gim_item, gim_path, submeshes, family in gim_rows:
+            matches = [
+                (mesh_item, mesh_path)
+                for mesh_item, mesh_path, parsed in meshes_by_slots.get(
+                    len(submeshes), ()
+                )
+                if _gim_geometry_matches_mesh(submeshes, parsed)
+            ]
+            if len(matches) != 1:
+                continue
+            mesh_item, mesh_path = matches[0]
+            proven_gims.append(
+                (gim_item, gim_path, submeshes, family, mesh_item, mesh_path)
+            )
+
+        # Collect repeated logical texture references.  KTX filenames are opaque
+        # EXPK signatures, but hero packages still keep the texture payloads near
+        # the MaterialGroup/GIM cluster.  A repeated reference must have a unique
+        # total-distance winner; a one-off reference must be immediately adjacent.
+        ref_orders: dict[str, list[int]] = defaultdict(list)
+        ref_original: dict[str, str] = {}
+        ref_family: dict[str, str] = {}
+        family_anchors: dict[str, list[int]] = defaultdict(list)
+        for material_item, _path, material_defs, family in material_rows:
+            family_anchors[family].append(material_item.physical_order)
+            for material in material_defs:
+                primary = material_primary_texture(material)
+                if not primary or _moba_reference_family(primary) != family:
+                    continue
+                normalized = primary.replace("\\", "/").lower()
+                ref_orders[normalized].append(material_item.physical_order)
+                ref_original.setdefault(normalized, primary)
+                ref_family[normalized] = family
+        for gim_item, _path, _submeshes, family, _mesh_item, _mesh_path in proven_gims:
+            family_anchors[family].append(gim_item.physical_order)
+
+        proposals: list[tuple[int, int, str, list[tuple[int, Path]]]] = []
+        for reference, orders in ref_orders.items():
+            anchors = family_anchors.get(ref_family[reference], orders)
+            if not anchors:
+                continue
+            low = min(anchors) - 10
+            high = max(anchors) + 10
+            possible = [
+                (order, image_path)
+                for order, image_path in image_rows
+                if low <= order <= high
+            ]
+            if not possible:
+                continue
+            scored = sorted(
+                (
+                    sum(abs(order - occurrence) for occurrence in orders),
+                    min(abs(order - occurrence) for occurrence in orders),
+                    order,
+                    image_path,
+                )
+                for order, image_path in possible
+            )
+            best_total, best_min = scored[0][0], scored[0][1]
+            second_total = scored[1][0] if len(scored) > 1 else None
+            strong = (
+                len(scored) == 1
+                or (len(orders) == 1 and best_min <= 2)
+                or (
+                    len(orders) >= 2
+                    and second_total is not None
+                    and best_total < second_total
+                )
+            )
+            if strong:
+                proposals.append(
+                    (
+                        -len(orders),
+                        best_total,
+                        reference,
+                        [(row[2], row[3]) for row in scored],
+                    )
+                )
+
+        resolved_images: dict[str, Path] = {}
+        used_images: set[Path] = set()
+        for _negative_uses, _distance, reference, possible in sorted(proposals):
+            chosen = next(
+                (path for _order, path in possible if path not in used_images),
+                None,
+            )
+            if chosen is not None:
+                resolved_images[reference] = chosen
+                used_images.add(chosen)
+
+        parsed_archives[archive] = {
+            "materials": material_rows,
+            "gims": proven_gims,
+            "resolved_images": resolved_images,
+        }
+
+    done = 0
+    for archive, state in parsed_archives.items():
+        material_rows = state["materials"]
+        proven_gims = state["gims"]
+        resolved_images = state["resolved_images"]
+        if not isinstance(material_rows, list) or not isinstance(proven_gims, list):
+            continue
+        if not isinstance(resolved_images, dict):
+            continue
+
+        gims_by_family: dict[
+            str, list[tuple[object, Path, list[GimSubmesh], str, object, Path]]
+        ] = defaultdict(list)
+        for row in proven_gims:
+            gims_by_family[row[3]].append(row)
+
+        for material_item, material_path, material_defs, family in material_rows:
+            done += 1
+            material_names = {
+                _normalized_material_name(material.name)
+                for material in material_defs
+                if material.name
+            }
+            choices: list[
+                tuple[
+                    tuple[int, int, int],
+                    object,
+                    Path,
+                    list[GimSubmesh],
+                    object,
+                    Path,
+                ]
+            ] = []
+            for (
+                gim_item,
+                gim_path,
+                submeshes,
+                _gim_family,
+                mesh_item,
+                mesh_path,
+            ) in gims_by_family.get(family, ()):
+                if not any(
+                    0 <= submesh.material_index < len(material_defs)
+                    for submesh in submeshes
+                ):
+                    continue
+                submesh_names = {
+                    _normalized_material_name(
+                        _moba_submesh_name_base(submesh.name)
+                    )
+                    for submesh in submeshes
+                }
+                overlap = len(material_names.intersection(submesh_names))
+                max_index = max(
+                    (submesh.material_index for submesh in submeshes),
+                    default=-1,
+                )
+                exact_slot_fit = int(max_index < len(material_defs))
+                score = (
+                    -overlap,
+                    -exact_slot_fit,
+                    abs(material_item.physical_order - gim_item.physical_order),
+                )
+                choices.append(
+                    (
+                        score,
+                        gim_item,
+                        gim_path,
+                        submeshes,
+                        mesh_item,
+                        mesh_path,
+                    )
+                )
+            choices.sort(key=lambda row: row[0])
+            if not choices or (
+                len(choices) > 1 and choices[0][0] == choices[1][0]
+            ):
+                if progress and (done % 100 == 0 or done == total_material_rows):
+                    progress(done, total_material_rows)
+                continue
+
+            _score, _gim_item, _gim_path, submeshes, _mesh_item, mesh_path = (
+                choices[0]
+            )
+            ordered_materials, valid_count = order_materials_by_gim_partial(
+                material_defs, submeshes
+            )
+            if valid_count == 0:
+                continue
+
+            required_refs: list[str] = []
+            texture_map: dict[str, Path] = {}
+            for material in ordered_materials:
+                primary = material_primary_texture(material)
+                if not primary or _moba_reference_family(primary) != family:
+                    continue
+                normalized = primary.replace("\\", "/").lower()
+                if normalized not in required_refs:
+                    required_refs.append(normalized)
+                image_path = resolved_images.get(normalized)
+                if isinstance(image_path, Path):
+                    texture_map[primary] = image_path
+            if not required_refs or len(texture_map) != len(required_refs):
+                if progress and (done % 100 == 0 or done == total_material_rows):
+                    progress(done, total_material_rows)
+                continue
+
+            package_name = (
+                getattr(material_item, "semantic_label", "")
+                or next(
+                    (material.name for material in ordered_materials if material.name),
+                    "",
+                )
+                or f"{archive}-{material_item.physical_order:06d}"
+            )
+            package = MaterialPackage(
+                xml_path=material_path,
+                index=material_item.physical_order,
+                package_name=package_name,
+                materials=ordered_materials,
+                mesh_paths=[mesh_path],
+                texture_map=texture_map,
+                confidence="平安京EXPK几何语义精确",
+            )
+            packages.append(package)
+            candidates_by_mesh[mesh_path.resolve()].append(package)
+            if progress and (done % 100 == 0 or done == total_material_rows):
+                progress(done, total_material_rows)
+
+    by_mesh: dict[Path, MaterialPackage] = {}
+    variants: dict[Path, list[MaterialPackage]] = {}
+    for mesh_path, values in candidates_by_mesh.items():
+        unique: dict[tuple[object, ...], MaterialPackage] = {}
+        for package in values:
+            signature = _material_variant_signature(package.materials)
+            old = unique.get(signature)
+            if old is None or len(package.texture_map) > len(old.texture_map):
+                unique[signature] = package
+        variants[mesh_path] = list(unique.values())
+        if len(unique) == 1:
+            by_mesh[mesh_path] = next(iter(unique.values()))
+    return packages, by_mesh, variants
+
+
+def _moba_showcase_reference(path: Path) -> tuple[str, str]:
+    """Return (showcase key, logical GIS path) for Arena cutscene GIMs."""
+    try:
+        text = path.read_bytes().decode("gb18030", errors="ignore").replace("\\", "/")
+    except OSError:
+        return "", ""
+    match = re.search(
+        r"hero/guochang/([0-9]+(?:_[0-9A-Za-z]+)*)_guochang\.gis",
+        text,
+        re.IGNORECASE,
+    )
+    if not match:
+        return "", ""
+    return match.group(1).lower(), match.group(0)
+
+
+def _moba_showcase_geometry_error(
+    submeshes: list[GimSubmesh], mesh: ParsedMesh
+) -> float | None:
+    """Arena-only relaxed geometry score; lower is better, zero is identical."""
+    if len(submeshes) != len(mesh.submeshes):
+        return None
+    mesh_bounds = _mesh_submesh_bounds(mesh)
+    if len(mesh_bounds) != len(submeshes):
+        return None
+    error = 0.0
+    for gim, (mesh_center, mesh_half) in zip(submeshes, mesh_bounds):
+        if gim.bounding_center is None or gim.bounding_half is None:
+            return None
+        for declared, actual in zip(
+            (*gim.bounding_center, *gim.bounding_half),
+            (*mesh_center, *mesh_half),
+        ):
+            error += abs(declared - actual) / (1.0 + abs(declared))
+    return error
+
+
+def _moba_showcase_texture_kind(path: Path) -> str:
+    """Conservatively classify nearby showcase images as albedo/normal/mask."""
+    try:
+        from PIL import Image
+        import astc_encoder.pil_codec  # noqa: F401
+
+        raw = path.read_bytes()
+        if raw.startswith(b"\xABKTX 11\xBB\r\n\x1A\n"):
+            if len(raw) < 68:
+                return "unknown"
+            header = struct.unpack("<13I", raw[12:64])
+            internal_format = header[4]
+            width, height = header[6], header[7]
+            key_value_size = header[12]
+            image_size_offset = 64 + key_value_size
+            if image_size_offset + 4 > len(raw):
+                return "unknown"
+            image_size = struct.unpack_from("<I", raw, image_size_offset)[0]
+            payload = raw[
+                image_size_offset + 4 : image_size_offset + 4 + image_size
+            ]
+            if 0x93B0 <= internal_format <= 0x93BD:
+                profile = 1
+                block_width, block_height = ASTC_BLOCK_SIZES[
+                    internal_format - 0x93B0
+                ]
+            elif 0x93D0 <= internal_format <= 0x93DD:
+                profile = 0
+                block_width, block_height = ASTC_BLOCK_SIZES[
+                    internal_format - 0x93D0
+                ]
+            else:
+                return "unknown"
+            padded_width = (
+                (width + block_width - 1) // block_width * block_width
+            )
+            padded_height = (
+                (height + block_height - 1) // block_height * block_height
+            )
+            image = Image.frombytes(
+                "RGBA",
+                (padded_width, padded_height),
+                payload,
+                "astc",
+                (profile, block_width, block_height),
+            ).crop((0, 0, width, height))
+        else:
+            image = Image.open(io.BytesIO(raw)).convert("RGBA")
+        image.thumbnail((64, 64))
+        pixels = list(image.convert("RGB").getdata())
+        if not pixels:
+            return "unknown"
+        count = len(pixels)
+        mean_r = sum(pixel[0] for pixel in pixels) / count
+        mean_g = sum(pixel[1] for pixel in pixels) / count
+        mean_b = sum(pixel[2] for pixel in pixels) / count
+        chroma = sum(max(pixel) - min(pixel) for pixel in pixels) / count
+        blue_bias = mean_b - (mean_r + mean_g) / 2.0
+        if mean_b >= 150 and blue_bias >= 45 and abs(mean_r - mean_g) <= 40:
+            return "normal"
+        if chroma <= 7:
+            return "mask"
+        return "albedo"
+    except Exception:
+        return "unknown"
+
+
+def build_moba_showcase_material_packages(
+    model_folder: Path,
+    progress: Callable[[int, int], None] | None = None,
+) -> tuple[
+    list[MaterialPackage],
+    dict[Path, MaterialPackage],
+    dict[Path, list[MaterialPackage]],
+]:
+    """Build Arena cutscene/showcase high-model packages from res.npk only."""
+    import moba_expk as expk
+
+    model_folder = model_folder.resolve()
+    manifest_path = model_folder / "npk_manifest.json"
+    if not manifest_path.is_file():
+        return [], {}, {}
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        resources = [
+            expk.ExtractedResource(**item)
+            for item in payload.get("resources", ())
+            if str(item.get("archive", "")).lower() == "res.npk"
+        ]
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return [], {}, {}
+
+    rows: list[tuple[object, Path]] = []
+    for item in resources:
+        path = (model_folder / item.relative_path).resolve()
+        if path.is_file():
+            rows.append((item, path))
+    rows.sort(key=lambda pair: pair[0].physical_order)
+
+    meshes_by_slots: dict[int, list[tuple[object, Path, ParsedMesh]]] = defaultdict(list)
+    image_rows: list[tuple[int, Path]] = []
+    xml_rows: list[tuple[object, Path]] = []
+    image_suffixes = {".ktx", ".dds", ".png", ".jpg", ".jpeg", ".bmp"}
+    for item, path in rows:
+        suffix = path.suffix.lower()
+        if suffix == ".mesh":
+            try:
+                parsed = parse_mesh(path)
+            except (OSError, MeshFormatError, ValueError):
+                continue
+            meshes_by_slots[len(parsed.submeshes)].append((item, path, parsed))
+        elif suffix in image_suffixes:
+            image_rows.append((item.physical_order, path))
+        elif suffix == ".xml":
+            xml_rows.append((item, path))
+
+    showcase_gims: list[
+        tuple[str, str, object, Path, list[GimSubmesh], object, Path, float]
+    ] = []
+    for item, path in xml_rows:
+        key, logical_gis = _moba_showcase_reference(path)
+        if not key:
+            continue
+        submeshes = parse_gim_submeshes(path)
+        if not submeshes:
+            continue
+        scored: list[tuple[float, object, Path]] = []
+        for mesh_item, mesh_path, parsed in meshes_by_slots.get(len(submeshes), ()):
+            error = _moba_showcase_geometry_error(submeshes, parsed)
+            if error is not None:
+                scored.append((error, mesh_item, mesh_path))
+        scored.sort(key=lambda value: value[0])
+        if not scored:
+            continue
+        best_error, mesh_item, mesh_path = scored[0]
+        second_error = scored[1][0] if len(scored) > 1 else float("inf")
+        if not (
+            best_error <= 0.1
+            and second_error >= max(0.5, best_error * 20.0)
+        ):
+            continue
+        showcase_gims.append(
+            (
+                key,
+                logical_gis,
+                item,
+                path,
+                submeshes,
+                mesh_item,
+                mesh_path,
+                best_error,
+            )
+        )
+
+    material_candidates: dict[
+        str, list[tuple[int, object, Path, list[MaterialDefinition]]]
+    ] = defaultdict(list)
+    showcase_keys = {row[0] for row in showcase_gims}
+    for item, path in xml_rows:
+        materials = parse_material_xml(path)
+        if not materials:
+            continue
+        normalized_refs = [
+            primary.replace("\\", "/").lower()
+            for material in materials
+            if (primary := material_primary_texture(material))
+        ]
+        for key in showcase_keys:
+            if any(
+                re.search(rf"/{re.escape(key)}(?:_|\.)", "/" + reference)
+                for reference in normalized_refs
+            ):
+                material_candidates[key].append(
+                    (item.physical_order, item, path, materials)
+                )
+
+    selected_materials: dict[
+        str, tuple[int, object, Path, list[MaterialDefinition]]
+    ] = {}
+    for key, _logical, gim_item, _gim_path, *_rest in showcase_gims:
+        candidates = material_candidates.get(key, [])
+        if not candidates:
+            continue
+        candidates.sort(key=lambda row: abs(row[0] - gim_item.physical_order))
+        selected_materials[key] = candidates[0]
+
+    image_owner: dict[str, list[tuple[int, Path]]] = defaultdict(list)
+    material_orders = {key: row[0] for key, row in selected_materials.items()}
+    for image_order, image_path in image_rows:
+        distances = sorted(
+            (abs(image_order - order), key)
+            for key, order in material_orders.items()
+        )
+        if not distances or distances[0][0] > 6:
+            continue
+        if len(distances) > 1 and distances[0][0] == distances[1][0]:
+            continue
+        image_owner[distances[0][1]].append((image_order, image_path))
+
+    packages: list[MaterialPackage] = []
+    by_mesh: dict[Path, MaterialPackage] = {}
+    variants: dict[Path, list[MaterialPackage]] = {}
+    total = len(showcase_gims)
+    for number, (
+        key,
+        _logical_gis,
+        _gim_item,
+        gim_path,
+        submeshes,
+        _mesh_item,
+        mesh_path,
+        _geometry_error,
+    ) in enumerate(showcase_gims, 1):
+        selected = selected_materials.get(key)
+        if selected is None:
+            materials = [MaterialDefinition(submesh.name, {}) for submesh in submeshes]
+            package = MaterialPackage(
+                xml_path=gim_path,
+                index=archive_index(gim_path) or 0,
+                package_name=f"{key}_guochang",
+                materials=materials,
+                mesh_paths=[mesh_path],
+                texture_map={},
+                confidence="平安京展示高模几何精确",
+            )
+        else:
+            material_order, _material_item, material_path, material_defs = selected
+            ordered_materials, valid_count = order_materials_by_gim_partial(
+                material_defs, submeshes
+            )
+            if valid_count == 0:
+                ordered_materials = [
+                    MaterialDefinition(submesh.name, {}) for submesh in submeshes
+                ]
+
+            primary_refs: list[str] = []
+            for material in ordered_materials:
+                primary = material_primary_texture(material)
+                if primary and primary not in primary_refs:
+                    primary_refs.append(primary)
+
+            nearby = sorted(image_owner.get(key, []), key=lambda row: row[0])
+            albedos = [
+                (order, path)
+                for order, path in nearby
+                if _moba_showcase_texture_kind(path) == "albedo"
+            ]
+            texture_map: dict[str, Path] = {}
+            if primary_refs and len(albedos) == len(primary_refs):
+                texture_map.update(
+                    (reference, image_path)
+                    for reference, (_order, image_path) in zip(primary_refs, albedos)
+                )
+            elif primary_refs and len(albedos) == 1:
+                body_reference = next(
+                    (
+                        reference for reference in primary_refs
+                        if "weapon" not in reference.lower()
+                    ),
+                    primary_refs[0],
+                )
+                texture_map[body_reference] = albedos[0][1]
+            elif primary_refs and albedos:
+                non_weapon = [
+                    reference for reference in primary_refs
+                    if "weapon" not in reference.lower()
+                ]
+                if len(non_weapon) == 1:
+                    texture_map[non_weapon[0]] = min(
+                        albedos, key=lambda row: abs(row[0] - material_order)
+                    )[1]
+
+            if primary_refs and len(texture_map) == len(primary_refs):
+                confidence = "平安京展示高模主贴图"
+            elif texture_map:
+                confidence = "平安京展示高模部分主贴图"
+            else:
+                confidence = "平安京展示高模几何精确"
+            package = MaterialPackage(
+                xml_path=material_path,
+                index=material_order,
+                package_name=f"{key}_guochang",
+                materials=ordered_materials,
+                mesh_paths=[mesh_path],
+                texture_map=texture_map,
+                confidence=confidence,
+            )
+        packages.append(package)
+        resolved = mesh_path.resolve()
+        by_mesh[resolved] = package
+        variants[resolved] = [package]
+        if progress:
+            progress(number, total)
     return packages, by_mesh, variants
 
 
@@ -13982,11 +14776,101 @@ def _facial_bone_indices(mesh: ParsedMesh) -> set[int]:
     return result
 
 
+def _opposite_body_bone_key(key: str) -> str | None:
+    """Return the right-side counterpart for a normalized left-side bone."""
+    for left, right in (("_l_", "_r_"), ("_left_", "_right_")):
+        if left in key:
+            return key.replace(left, right, 1)
+    if key.endswith("_l"):
+        return key[:-2] + "_r"
+    return None
+
+
+def _bilateral_pose_asymmetry(
+    bone_names: list[str] | tuple[str, ...],
+    matrices: list[tuple[float, ...]] | tuple[tuple[float, ...], ...],
+    eligible_indices: set[int],
+) -> float | None:
+    """Measure body-pose asymmetry from matching left/right bind positions.
+
+    The score is normalized by body extent, so it can be compared across models.
+    Hair, cloth, weapons and face controls are intentionally excluded: those bones
+    are commonly asymmetric even in a neutral character pose.
+    """
+    by_key = {
+        _normalized_bone_key(name): (index, tuple(matrices[index]))
+        for index, name in enumerate(bone_names)
+        if index in eligible_indices and index < len(matrices)
+    }
+    pairs: list[
+        tuple[tuple[float, float, float], tuple[float, float, float]]
+    ] = []
+    for key, (_left_index, left) in by_key.items():
+        if not any(term in key for term in POSE_SYMMETRY_BONE_TERMS):
+            continue
+        opposite = _opposite_body_bone_key(key)
+        if opposite is None or opposite not in by_key:
+            continue
+        right = by_key[opposite][1]
+        if len(left) != 16 or len(right) != 16:
+            continue
+        positions = (
+            (left[12], left[13], left[14]),
+            (right[12], right[13], right[14]),
+        )
+        if not all(math.isfinite(value) for point in positions for value in point):
+            continue
+        pairs.append(positions)
+    if len(pairs) < POSE_SYMMETRY_MIN_PAIRS:
+        return None
+
+    center_x = median(
+        (left[0] + right[0]) * 0.5 for left, right in pairs
+    )
+    points = [point for pair in pairs for point in pair]
+    scale = max(
+        max(point[1] for point in points) - min(point[1] for point in points),
+        max(abs(point[0] - center_x) for point in points),
+        1.0e-6,
+    )
+    errors = [
+        math.sqrt(
+            (left[0] + right[0] - 2.0 * center_x) ** 2
+            + (left[1] - right[1]) ** 2
+            + (left[2] - right[2]) ** 2
+        ) / scale
+        for left, right in pairs
+    ]
+    return sum(errors) / len(errors)
+
+
+def _skeleton_bind_is_more_neutral(
+    mesh: ParsedMesh,
+    current_globals: list[tuple[float, ...]],
+    target_globals: list[tuple[float, ...]],
+    eligible_indices: set[int],
+) -> bool:
+    """Require directional evidence before replacing the Mesh bind pose."""
+    current_score = _bilateral_pose_asymmetry(
+        mesh.bone_names, current_globals, eligible_indices
+    )
+    target_score = _bilateral_pose_asymmetry(
+        mesh.bone_names, target_globals, eligible_indices
+    )
+    if current_score is None or target_score is None:
+        return False
+    return (
+        current_score >= POSE_SYMMETRY_MIN_ACTION_SCORE
+        and target_score + POSE_SYMMETRY_MIN_IMPROVEMENT <= current_score
+        and target_score <= current_score * POSE_SYMMETRY_MAX_REST_RATIO
+    )
+
+
 def _restore_mesh_bind_pose(
     mesh: ParsedMesh,
     skeleton: SkeletonHierarchy,
 ) -> bool:
-    """把动作已烘焙进 Mesh 的顶点/骨矩阵还原为官方 bind/T-pose。"""
+    """有方向证据时，把动作 Mesh 还原到更中立的 Skeleton bind pose。"""
     bind_globals = _skeleton_bind_global_matrices(skeleton)
     if bind_globals is None:
         return False
@@ -14014,13 +14898,21 @@ def _restore_mesh_bind_pose(
     if not weighted_bones:
         return False
     preserved_face_bones = _facial_bone_indices(mesh)
+    eligible_bones = weighted_bones - preserved_face_bones
     changed = any(
         _matrix4_max_delta(
             current_globals[index], bind_globals[mesh_to_skeleton[index]]
         ) > 1.0e-3
-        for index in weighted_bones - preserved_face_bones
+        for index in eligible_bones
     )
     if not changed:
+        return False
+    skeleton_targets = [
+        bind_globals[skeleton_index] for skeleton_index in mesh_to_skeleton
+    ]
+    if not _skeleton_bind_is_more_neutral(
+        mesh, current_globals, skeleton_targets, eligible_bones
+    ):
         return False
 
     skin_matrices: list[tuple[float, ...]] = []
@@ -14065,7 +14957,9 @@ def _restore_mesh_bind_pose(
         mesh.positions = restored_positions
         mesh.normals = restored_normals
         mesh.bone_matrices = [
-            bind_globals[skeleton_index] for skeleton_index in mesh_to_skeleton
+            current_globals[index]
+            if index in preserved_face_bones else skeleton_targets[index]
+            for index in range(len(current_globals))
         ]
         return True
     except (MeshFormatError, ValueError, OverflowError):
@@ -14104,9 +14998,12 @@ def _expand_mesh_to_skeleton(
             for joint in joints
         ))
     mesh.joints = remapped
+    expanded_matrices = list(bind_globals)
+    for old_index, new_index in enumerate(old_to_new):
+        expanded_matrices[new_index] = tuple(mesh.bone_matrices[old_index])
     mesh.bone_names = list(skeleton.bone_names)
     mesh.bone_parents = list(skeleton.bone_parents)
-    mesh.bone_matrices = list(bind_globals)
+    mesh.bone_matrices = expanded_matrices
     return True
 
 
@@ -15239,7 +16136,7 @@ def export_mesh_variant(
         source_size = 0
     size_bucket = mesh_size_bucket(source_size)
     model_output = output_root / category / size_bucket / folder_name
-    if category == "带贴图":
+    if category == "带贴图" and ENABLE_ROLE_CLASSIFICATION:
         try:
             import pmx_role_classifier as role_classifier
 
@@ -15538,10 +16435,23 @@ def save_pmx(
         model.indices.extend(face)
 
     texture_indices: dict[str, int] = {}
+    texture_path_indices: dict[str, int] = {}
+    referenced_textures = {
+        primary
+        for material in (materials or ())
+        if (primary := material_primary_texture(material))
+    }
     for original, path in (texture_files or {}).items():
+        if materials is not None and original not in referenced_textures:
+            continue
         relative = os.path.relpath(path, output_path.parent).replace("/", "\\")
-        texture_indices[original] = len(model.textures)
-        model.textures.append(relative)
+        relative_key = relative.replace("/", "\\").lower()
+        texture_index = texture_path_indices.get(relative_key)
+        if texture_index is None:
+            texture_index = len(model.textures)
+            texture_path_indices[relative_key] = texture_index
+            model.textures.append(relative)
+        texture_indices[original] = texture_index
 
     for index, (_, mesh_face_count, _, _) in enumerate(mesh.submeshes):
         material_def = materials[index] if materials and index < len(materials) else None
@@ -15628,7 +16538,7 @@ def save_composite_pmx(
         / size_bucket
         / f"{clean_name}_{short_hash}"
     )
-    if composite.direct_merge:
+    if composite.direct_merge and ENABLE_ROLE_CLASSIFICATION:
         try:
             import pmx_role_classifier as role_classifier
 
@@ -16145,7 +17055,7 @@ def ensure_scene_cache(
     if source_root is None:
         if any(scene_root.rglob("*.xml")):
             return scene_root
-        raise RuntimeError("没有场景解包缓存；请选择包含 scene.idx 的完整 yys 目录")
+        raise RuntimeError(f"没有场景解包缓存；请选择包含 scene.idx 的完整{GAME_PROFILE.display_name}资源目录")
 
     import onmyoji_wpk_gui as wpk
 
@@ -17144,14 +18054,15 @@ class RiggedMeshApp(tk.Tk):
         self.minsize(760, 500)
 
         root = Path(__file__).resolve().parent
-        default_input = root / "yys" if (root / "yys").is_dir() else root
-        default_output = root / "rigged_models"
+        resource_root = root / DEFAULT_RESOURCE_DIR_NAME
+        default_input = resource_root if resource_root.is_dir() else root
+        default_output = root / DEFAULT_RIGGED_OUTPUT_DIR_NAME
 
         self.source_mode_var = tk.StringVar(value="wpk")
         self.input_var = tk.StringVar(value=str(default_input))
         self.output_var = tk.StringVar(value=str(default_output))
         self.fast_reuse_var = tk.BooleanVar(value=True)
-        self.status_var = tk.StringVar(value="选择阴阳师目录，然后选择一种一键解包方式。")
+        self.status_var = tk.StringVar(value=f"选择{GAME_PROFILE.display_name}目录，然后选择一种一键解包方式。")
         self.progress_var = tk.DoubleVar(value=0.0)
         self.progress_text_var = tk.StringVar(value="0.0%")
 
@@ -17178,20 +18089,23 @@ class RiggedMeshApp(tk.Tk):
         mode_frame.grid(row=0, column=1, columnspan=2, sticky="w", **pad)
         ttk.Radiobutton(
             mode_frame,
-            text="新版 WPK（移动端）",
+            text=("移动端 EXPK/NPK（APK）" if GAME_PROFILE.key == "moba" else "新版 WPK（移动端）"),
             variable=self.source_mode_var,
             value="wpk",
             command=self._source_mode_changed,
         ).pack(side="left")
-        ttk.Radiobutton(
+        npk_button = ttk.Radiobutton(
             mode_frame,
             text="旧版 NPK（桌面端）",
             variable=self.source_mode_var,
             value="npk",
             command=self._source_mode_changed,
-        ).pack(side="left", padx=(18, 0))
+        )
+        npk_button.pack(side="left", padx=(18, 0))
+        if not GAME_PROFILE.supports_old_npk:
+            npk_button.configure(state="disabled")
 
-        ttk.Label(paths, text="阴阳师目录").grid(row=1, column=0, sticky="w", **pad)
+        ttk.Label(paths, text=f"{GAME_PROFILE.display_name}目录").grid(row=1, column=0, sticky="w", **pad)
         ttk.Entry(paths, textvariable=self.input_var).grid(
             row=1, column=1, sticky="ew", **pad
         )
@@ -17211,11 +18125,21 @@ class RiggedMeshApp(tk.Tk):
         actions = ttk.LabelFrame(self, text="功能")
         actions.pack(fill="x", **pad)
         white_button = ttk.Button(
-            actions, text="一键解包 PMX 白模", command=self.start_white_pmx
+            actions,
+            text=(
+                "全部模型白模（含局内低模）"
+                if GAME_PROFILE.key == "moba" else "一键解包 PMX 白模"
+            ),
+            command=self.start_white_pmx,
         )
         white_button.pack(side="left", fill="x", expand=True, padx=8, pady=10)
         textured_button = ttk.Button(
-            actions, text="一键解包带贴图 PMX", command=self.start_one_click
+            actions,
+            text=(
+                "一键解包展示高模 PMX"
+                if GAME_PROFILE.key == "moba" else "一键解包带贴图 PMX"
+            ),
+            command=self.start_one_click,
         )
         textured_button.pack(side="left", fill="x", expand=True, padx=8, pady=10)
         scene_button = ttk.Button(
@@ -17257,17 +18181,29 @@ class RiggedMeshApp(tk.Tk):
         log_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
         self.log = tk.Text(log_frame, height=15, wrap="word")
         self.log.pack(fill="both", expand=True, padx=5, pady=5)
+        mode_note = (
+            "选择平安京拉取目录；工具会读取其中 npk/hero1~9.npk 与 res.npk。"
+            if GAME_PROFILE.key == "moba"
+            else (
+                "新版选择完整资源拉取目录（也兼容 cloudfilesys3/res）。"
+                if not GAME_PROFILE.supports_old_npk
+                else "先选择新版 WPK 或旧版桌面 NPK。新版选择完整 yys 目录（也兼容 cloudfilesys3/res），旧版选择包含 model1.npk、model2.npk、qmodel.npk、tex_res.npk 的游戏目录。"
+            )
+        )
         self._log(
-            "先选择新版 WPK 或旧版桌面 NPK。新版选择完整 yys 目录（也兼容 "
-            "cloudfilesys3/res），旧版选择包含 model1.npk、model2.npk、qmodel.npk、"
-            "tex_res.npk 的游戏目录。“PMX 白模”只解包并转换"
-            "模型；“带贴图 PMX”会继续分析 THD、恢复材质贴图并组合确定附件；"
-            "“场景 PMX”按 SCN 中的原始位置、旋转、缩放还原静态场景。"
+            mode_note
+            + (
+                "平安京默认优先处理 res.npk 中 hero/guochang 展示高模；"
+                "“全部模型白模”才会包含 hero1~9.npk 的局内低模。"
+                if GAME_PROFILE.key == "moba" else
+                "“PMX 白模”只解包并转换模型；“带贴图 PMX”会继续分析 THD、恢复材质贴图并组合确定附件；"
+                "“场景 PMX”按 SCN 中的原始位置、旋转、缩放还原静态场景。"
+            )
         )
 
     def _default_output_for_mode(self, mode: str | None = None) -> Path:
         root = Path(__file__).resolve().parent
-        return root / ("rigged_models_npk" if (mode or self.source_mode_var.get()) == "npk" else "rigged_models")
+        return root / ("rigged_models_npk" if (mode or self.source_mode_var.get()) == "npk" else DEFAULT_RIGGED_OUTPUT_DIR_NAME)
 
     def _model_folder_for_mode(self) -> Path:
         root = Path(__file__).resolve().parent
@@ -17277,7 +18213,7 @@ class RiggedMeshApp(tk.Tk):
 
     def _source_mode_changed(self) -> None:
         root = Path(__file__).resolve().parent
-        known_defaults = {root / "rigged_models", root / "rigged_models_npk"}
+        known_defaults = {root / DEFAULT_RIGGED_OUTPUT_DIR_NAME, root / "rigged_models_npk"}
         current = Path(self.output_var.get()).resolve()
         if current in {path.resolve() for path in known_defaults}:
             self.output_var.set(str(self._default_output_for_mode()))
@@ -17289,7 +18225,7 @@ class RiggedMeshApp(tk.Tk):
         value = filedialog.askdirectory(
             title=(
                 "选择包含 model1.npk / tex_res.npk 的旧版阴阳师目录"
-                if old_mode else "选择完整 yys 目录或 cloudfilesys3/res"
+                if old_mode else f"选择完整{GAME_PROFILE.display_name}资源目录或 cloudfilesys3/res"
             ),
             initialdir=self.input_var.get(),
         )
@@ -17513,6 +18449,12 @@ class RiggedMeshApp(tk.Tk):
         return rows
 
     def start_scene_pmx(self):
+        if GAME_PROFILE.key == "moba":
+            messagebox.showinfo(
+                APP_TITLE,
+                "决战平安京当前先接人物 hero/res EXPK 解包；scene.npk 场景链暂未启用。",
+            )
+            return
         if self.source_mode_var.get() == "npk":
             messagebox.showinfo(
                 APP_TITLE,
@@ -17521,12 +18463,12 @@ class RiggedMeshApp(tk.Tk):
             return
         selected_input = Path(self.input_var.get()).resolve()
         source_root, _model_folder = resolve_source_and_model_folder(selected_input)
-        unpacked_root = Path(__file__).resolve().parent / "unpacked"
+        unpacked_root = Path(__file__).resolve().parent / UNPACKED_DIR_NAME
         cached_scene = unpacked_root / "scene"
         if source_root is None and not any(cached_scene.rglob("*.xml")):
             messagebox.showerror(
                 APP_TITLE,
-                "请选择完整 yys 目录，或先准备工具旁的 unpacked/scene 场景缓存。",
+                f"请选择完整{GAME_PROFILE.display_name}资源目录，或先准备工具旁的 {UNPACKED_DIR_NAME}/scene 场景缓存。",
             )
             return
 
@@ -17575,7 +18517,7 @@ class RiggedMeshApp(tk.Tk):
                     candidates = list(selected_input.rglob("scene.thx"))
                     if not candidates:
                         candidates = list(
-                            (Path(__file__).resolve().parent / "yys").rglob(
+                            (Path(__file__).resolve().parent / DEFAULT_RESOURCE_DIR_NAME).rglob(
                                 "scene.thx"
                             )
                         )
@@ -17615,7 +18557,7 @@ class RiggedMeshApp(tk.Tk):
     ) -> None:
         selected_output = Path(self.output_var.get()).resolve()
         fast_reuse = bool(self.fast_reuse_var.get())
-        unpacked_root = Path(__file__).resolve().parent / "unpacked"
+        unpacked_root = Path(__file__).resolve().parent / UNPACKED_DIR_NAME
 
         def worker():
             try:
@@ -17716,8 +18658,19 @@ class RiggedMeshApp(tk.Tk):
         selected_input = Path(self.input_var.get()).resolve()
         selected_output = Path(self.output_var.get()).resolve()
         old_mode = self.source_mode_var.get() == "npk"
+        moba_mode = GAME_PROFILE.key == "moba"
+        if old_mode and not GAME_PROFILE.supports_old_npk:
+            messagebox.showerror(APP_TITLE, f"{GAME_PROFILE.display_name}当前仅启用 APK 内 EXPK/NPK 解包。")
+            return
         old_root = None
-        if old_mode:
+        moba_root = None
+        if moba_mode:
+            import moba_expk
+
+            source_root = None
+            moba_root = moba_expk.locate_moba_npk_root(selected_input)
+            model_folder = Path(__file__).resolve().parent / UNPACKED_DIR_NAME / "model"
+        elif old_mode:
             import onmyoji_npk as npk
 
             old_root = npk.locate_old_npk_root(selected_input)
@@ -17730,18 +18683,24 @@ class RiggedMeshApp(tk.Tk):
                 (model_folder / name).exists()
                 for name in ("npk_manifest_models.json", "npk_manifest.json")
             )
-            if old_mode else (model_folder / "manifest.csv").exists()
+            if (old_mode or moba_mode) else (model_folder / "manifest.csv").exists()
         )
-        if (old_mode and old_root is None and not has_cache) or (
-            not old_mode and source_root is None and not has_cache
-        ):
+        source_missing = (
+            (moba_mode and moba_root is None)
+            or (old_mode and old_root is None)
+            or (not moba_mode and not old_mode and source_root is None)
+        )
+        if source_missing and not has_cache:
             messagebox.showerror(
                 APP_TITLE,
                 (
-                    "请选择包含 model1.npk、model2.npk、qmodel.npk 和 tex_res.npk "
-                    "的旧版阴阳师目录。"
-                    if old_mode else
-                    "请选择完整 yys 目录，或包含 model.idx、model*.wpk 的 res 目录。"
+                    "请选择平安京拉取目录；其中应存在 npk/hero1.npk 等建模资源。"
+                    if moba_mode else (
+                        "请选择包含 model1.npk、model2.npk、qmodel.npk 和 tex_res.npk "
+                        "的旧版阴阳师目录。"
+                        if old_mode else
+                        f"请选择完整{GAME_PROFILE.display_name}资源目录，或包含 model.idx、model*.wpk 的 res 目录。"
+                    )
                 ),
             )
             return
@@ -17754,6 +18713,21 @@ class RiggedMeshApp(tk.Tk):
                     self.events.put(("log", "首次运行：正在自动安装解包与 PMX 依赖……"))
                     self.events.put(("status", "正在安装依赖"))
                     install_pmx_dependency()
+
+                if moba_mode and moba_root is not None:
+                    import moba_expk
+
+                    self.events.put(("log", "正在增量解包平安京 hero1~9 EXPK 人物模型……"))
+                    moba_expk.extract_resources(
+                        moba_root,
+                        model_folder.parent,
+                        include_textures=False,
+                        log=lambda text: self.events.put(("log", text)),
+                        progress=lambda stem, done, total: (
+                            self.events.put(("progress", done * 100 / total if total else 100)),
+                            self.events.put(("status", f"解包 {stem} {done}/{total}")),
+                        ),
+                    )
 
                 if old_mode and old_root is not None:
                     import onmyoji_npk as npk
@@ -18034,8 +19008,19 @@ class RiggedMeshApp(tk.Tk):
         selected_output = Path(self.output_var.get()).resolve()
         fast_reuse = bool(self.fast_reuse_var.get())
         old_mode = self.source_mode_var.get() == "npk"
+        moba_mode = GAME_PROFILE.key == "moba"
+        if old_mode and not GAME_PROFILE.supports_old_npk:
+            messagebox.showerror(APP_TITLE, f"{GAME_PROFILE.display_name}当前仅启用 APK 内 EXPK/NPK 解包。")
+            return
         old_root = None
-        if old_mode:
+        moba_root = None
+        if moba_mode:
+            import moba_expk
+
+            source_root = None
+            moba_root = moba_expk.locate_moba_npk_root(selected_input)
+            model_folder = Path(__file__).resolve().parent / UNPACKED_DIR_NAME / "model"
+        elif old_mode:
             import onmyoji_npk as npk
 
             old_root = npk.locate_old_npk_root(selected_input)
@@ -18045,18 +19030,24 @@ class RiggedMeshApp(tk.Tk):
             source_root, model_folder = resolve_source_and_model_folder(selected_input)
         has_cache = (
             (model_folder / "npk_manifest.json").exists()
-            if old_mode else (model_folder / "manifest.csv").exists()
+            if (old_mode or moba_mode) else (model_folder / "manifest.csv").exists()
         )
-        if (old_mode and old_root is None and not has_cache) or (
-            not old_mode and source_root is None and not has_cache
-        ):
+        source_missing = (
+            (moba_mode and moba_root is None)
+            or (old_mode and old_root is None)
+            or (not moba_mode and not old_mode and source_root is None)
+        )
+        if source_missing and not has_cache:
             messagebox.showerror(
                 APP_TITLE,
                 (
-                    "请选择包含 model1.npk、model2.npk、qmodel.npk 和 tex_res.npk "
-                    "的旧版阴阳师目录。"
-                    if old_mode else
-                    "请选择完整 yys 目录，或包含 model.idx、model*.wpk 的 res 目录。"
+                    "请选择平安京拉取目录；其中应存在 npk/hero1.npk 等建模资源。"
+                    if moba_mode else (
+                        "请选择包含 model1.npk、model2.npk、qmodel.npk 和 tex_res.npk "
+                        "的旧版阴阳师目录。"
+                        if old_mode else
+                        f"请选择完整{GAME_PROFILE.display_name}资源目录，或包含 model.idx、model*.wpk 的 res 目录。"
+                    )
                 ),
             )
             return
@@ -18064,7 +19055,7 @@ class RiggedMeshApp(tk.Tk):
         def worker():
             wpk_reader = None
             archive_groups = None
-            phase_total = 13
+            phase_total = 14 if GAME_PROFILE.key == "onmyoji" else 13
 
             def phase_status(number: int, detail: str) -> None:
                 self.events.put(
@@ -18104,10 +19095,29 @@ class RiggedMeshApp(tk.Tk):
                         None,
                     )
                 preflight_apk_path = (
-                    None if old_mode else locate_nearby_onmyoji_apk(selected_input)
+                    None if (old_mode or moba_mode) else locate_nearby_game_apk(selected_input)
                 )
-                output_root = selected_output / "PMX输出"
-                if old_mode:
+                output_root = selected_output / (
+                    "展示高模PMX" if moba_mode else "PMX输出"
+                )
+                if moba_mode:
+                    import moba_expk
+
+                    archive_fingerprint = (
+                        moba_expk.source_fingerprint(moba_root, True)
+                        if moba_root is not None else
+                        hashlib.sha256((model_folder / "npk_manifest.json").read_bytes()).hexdigest()
+                    )
+                    source_fingerprint = hashlib.sha256(
+                        (
+                            f"moba-showcase-high-v1:{archive_fingerprint}:"
+                            f"{MATERIAL_RESOLVER_VERSION}:"
+                            f"{COMPOSITE_RESOLVER_VERSION}:"
+                            f"{FACIAL_NEUTRAL_POSE_VERSION}:"
+                            f"{PMX_OUTPUT_FORMAT_VERSION}"
+                        ).encode("utf-8")
+                    ).hexdigest()
+                elif old_mode:
                     import onmyoji_npk as npk
 
                     old_archive_fingerprint = (
@@ -18141,6 +19151,46 @@ class RiggedMeshApp(tk.Tk):
                         preflight_thd_dir,
                         preflight_apk_path,
                     )
+                # Older builds could write the same resolved image path twice
+                # into a PMX texture table. PMXEditor reports a generic load
+                # error for those otherwise valid models. Run this migration
+                # once before the fast-reuse exit; new files are deduplicated
+                # directly by save_pmx().
+                try:
+                    from pmx_editor_compat import migrate_pmx_tree
+
+                    def pmx_compat_progress(
+                        done: int, total: int, repaired_count: int, failed_count: int
+                    ) -> None:
+                        self.events.put(
+                            (
+                                "status",
+                                f"总流程 [1/{phase_total}] 检查 PMXEditor 兼容性 "
+                                f"{done}/{total}；修复 {repaired_count}；"
+                                f"失败 {failed_count}",
+                            )
+                        )
+
+                    compat_checked, compat_repaired, compat_failed = migrate_pmx_tree(
+                        output_root, progress=pmx_compat_progress
+                    )
+                    if compat_checked:
+                        self.events.put(
+                            (
+                                "log",
+                                f"PMXEditor 兼容性：检查 {compat_checked}，"
+                                f"修复重复贴图表 {compat_repaired}，"
+                                f"失败 {compat_failed}。",
+                            )
+                        )
+                except Exception as exc:
+                    self.events.put(
+                        (
+                            "log",
+                            "PMXEditor 兼容性迁移失败，将继续正常解包："
+                            f"{type(exc).__name__}: {exc}",
+                        )
+                    )
                 if (
                     fast_reuse
                     and can_fast_reuse_one_click(output_root, source_fingerprint)
@@ -18161,6 +19211,26 @@ class RiggedMeshApp(tk.Tk):
                     self.events.put(("status", "资源未变化：已直接复用现有结果"))
                     self.events.put(("done_message", summary))
                     return
+
+                if moba_mode and moba_root is not None:
+                    import moba_expk
+
+                    phase_status(2, "增量解包平安京 hero/res EXPK 模型与贴图")
+                    self.events.put((
+                        "log",
+                        "正在解包 hero1~9.npk 与 res.npk；首次处理会解密并筛选 Mesh/XML/贴图，"
+                        "后续按 NPK 指纹直接复用。",
+                    ))
+                    moba_expk.extract_resources(
+                        moba_root,
+                        model_folder.parent,
+                        include_textures=True,
+                        log=lambda text: self.events.put(("log", text)),
+                        progress=lambda stem, done, total: (
+                            self.events.put(("progress", done * 100 / total if total else 100)),
+                            phase_status(2, f"解包 {stem} {done}/{total}"),
+                        ),
+                    )
 
                 if old_mode and old_root is not None:
                     import onmyoji_npk as npk
@@ -18245,9 +19315,11 @@ class RiggedMeshApp(tk.Tk):
                     # 这里必须按当前来源检查对应清单，否则 NPK 已成功解包后仍会
                     # 被误判为“找不到 model.idx”。
                     expected_manifest = model_folder / (
-                        "npk_manifest.json" if old_mode else "manifest.csv"
+                        "npk_manifest.json" if (old_mode or moba_mode) else "manifest.csv"
                     )
                     if not expected_manifest.exists():
+                        if moba_mode:
+                            raise RuntimeError("缺少平安京 EXPK 解包清单 npk_manifest.json")
                         if old_mode:
                             raise RuntimeError("缺少旧版 NPK 解包清单 npk_manifest.json")
                         raise RuntimeError("缺少解包结果，也找不到 model.idx")
@@ -18290,7 +19362,7 @@ class RiggedMeshApp(tk.Tk):
                     self.events.put(
                         (
                             "log",
-                            "附近未发现阴阳师 APK：已有 APK 内容缓存仍会继续复用；"
+                            f"附近未发现{GAME_PROFILE.display_name} APK：已有 APK 内容缓存仍会继续复用；"
                             "只有当前 THX 出现缓存和本体都没有的新资源时，才需要新版 APK。",
                         )
                     )
@@ -18440,7 +19512,8 @@ class RiggedMeshApp(tk.Tk):
                     )
                 if not rows:
                     raise RuntimeError("没有发现带骨 mesh")
-                self.events.put(("scan_done", rows))
+                if not moba_mode:
+                    self.events.put(("scan_done", rows))
 
                 self.events.put(("log", "正在分析材质 XML 与贴图资源分组……"))
                 material_stage = {"label": "", "number": 1, "total": 1}
@@ -18473,11 +19546,42 @@ class RiggedMeshApp(tk.Tk):
                             "status",
                             f"总流程 [5/{phase_total}] 材质匹配 "
                             f"[{stage_number}/{stage_total}]："
-                            f"THD 精确依赖 {done}/{total}",
+                            + (
+                                f"平安京几何/材质关联 {done}/{total}"
+                                if moba_mode
+                                else f"THD 精确依赖 {done}/{total}"
+                            ),
                         )
                     )
 
-                if old_mode and thd_dir is None:
+                if moba_mode:
+                    phase_status(5, "识别 res.npk 中 hero/guochang 展示高模与材质")
+                    packages, by_mesh, variants_by_mesh = (
+                        build_moba_showcase_material_packages(
+                            model_folder,
+                            progress=report_thd_dependency,
+                        )
+                    )
+                    showcase_paths = {
+                        path.resolve() for path in variants_by_mesh
+                    } | {
+                        path.resolve() for path in by_mesh
+                    }
+                    rows = [
+                        row for row in rows
+                        if row.path.resolve() in showcase_paths
+                    ]
+                    if not rows:
+                        raise RuntimeError(
+                            "当前 res.npk 没有识别到可唯一确认的 hero/guochang 展示高模"
+                        )
+                    self.events.put(("scan_done", rows))
+                    self.events.put((
+                        "log",
+                        f"展示高模筛选完成：从全部带骨 Mesh 中锁定 {len(rows)} 个；"
+                        "hero1~9.npk 局内低模不进入本次输出。",
+                    ))
+                elif old_mode and thd_dir is None:
                     packages, by_mesh, variants_by_mesh = (
                         build_old_npk_material_packages(
                             model_folder,
@@ -18499,7 +19603,13 @@ class RiggedMeshApp(tk.Tk):
                 complete_packages = sum(
                     1 for item in packages
                     if item.confidence
-                    in {"THD精确", "THD路径自举", "人工验证"}
+                    in {
+                        "平安京EXPK几何语义精确",
+                        "平安京展示高模主贴图",
+                        "THD精确",
+                        "THD路径自举",
+                        "人工验证",
+                    }
                 )
                 main_only_packages = sum(
                     1 for item in packages
@@ -18557,11 +19667,15 @@ class RiggedMeshApp(tk.Tk):
                         )
                     )
 
-                composite_models = build_composite_models(
-                    model_folder,
-                    composite_materials,
-                    thd_dir,
-                    progress=report_composite_analysis,
+                composite_models = (
+                    []
+                    if moba_mode else
+                    build_composite_models(
+                        model_folder,
+                        composite_materials,
+                        thd_dir,
+                        progress=report_composite_analysis,
+                    )
                 )
                 self.events.put(
                     (
@@ -18594,36 +19708,48 @@ class RiggedMeshApp(tk.Tk):
                         progress=report_wpk_validation,
                     )
 
-                output_root = selected_output / "PMX输出"
+                output_root = selected_output / (
+                    "展示高模PMX" if moba_mode else "PMX输出"
+                )
                 output_root.mkdir(parents=True, exist_ok=True)
-                try:
-                    import pmx_role_classifier as role_classifier
+                if ENABLE_ROLE_CLASSIFICATION:
+                    try:
+                        import pmx_role_classifier as role_classifier
 
-                    phase_status(8, "准备角色名称与稀有度目录")
-                    character_catalog, catalog_refreshed = (
-                        role_classifier.prepare_character_catalog(
-                            output_root, refresh=True
+                        phase_status(8, "读取游戏内角色与中文皮肤索引")
+                        local_roles, local_rebuilt, local_index_path = (
+                            role_classifier.prepare_local_resource_catalog(output_root)
                         )
-                    )
-                    self.events.put(
-                        (
-                            "log",
-                            f"角色元数据：可用 {len(character_catalog)} 条"
-                            + (
-                                "，已从官方列表更新本地缓存。"
-                                if catalog_refreshed
-                                else "，使用本地缓存或当前可用列表。"
-                            ),
+                        character_catalog, catalog_refreshed = (
+                            role_classifier.prepare_character_catalog(
+                                output_root, refresh=True
+                            )
                         )
-                    )
-                except Exception as exc:
-                    self.events.put(
-                        (
-                            "log",
-                            "角色元数据暂不可用，未确认资源将保留内部分类："
-                            f"{type(exc).__name__}: {exc}",
+                        self.events.put(
+                            (
+                                "log",
+                                f"游戏内索引：式神 {len(local_roles.heroes)} 条、"
+                                f"皮肤模型 {len(local_roles.models)} 条"
+                                + ("，已按本次资源重建；" if local_rebuilt else "，已读取缓存；")
+                                + f"合并角色元数据 {len(character_catalog)} 条"
+                                + (
+                                    "，外部列表已作为新角色补充。"
+                                    if catalog_refreshed
+                                    else "，使用当前本地资料。"
+                                ),
+                            )
                         )
-                    )
+                    except Exception as exc:
+                        self.events.put(
+                            (
+                                "log",
+                                "角色元数据暂不可用，未确认资源将保留内部分类："
+                                f"{type(exc).__name__}: {exc}",
+                            )
+                        )
+                else:
+                    phase_status(8, f"{GAME_PROFILE.display_name}使用独立模型目录，不套用阴阳师式神分类")
+                    self.events.put(("log", f"{GAME_PROFILE.display_name}已禁用阴阳师角色/稀有度分类。"))
                 texture_cache = DecodedTextureCache(
                     model_folder.parent / "decoded_png_cache"
                 )
@@ -19147,61 +20273,126 @@ class RiggedMeshApp(tk.Tk):
                             f"{focus_counts['额外包']} 个。",
                         )
                     )
-                try:
-                    import pmx_role_classifier as role_classifier
+                if ENABLE_ROLE_CLASSIFICATION:
+                    try:
+                        import pmx_role_classifier as role_classifier
 
-                    self.events.put(("progress", 0))
-                    phase_status(13, "按稀有度和中文角色名整理成品")
-                    role_entries = role_classifier.scan_entries(
-                        output_root,
-                        progress=lambda done, total: self.events.put(
-                            (
-                                "status",
+                        self.events.put(("progress", 0))
+                        phase_status(13, "按稀有度和中文角色名整理成品")
+                        role_entries = role_classifier.scan_entries(
+                            output_root,
+                            progress=lambda done, total: self.events.put(
                                 (
-                                    f"总流程 [13/{phase_total}] 读取角色分类元数据 "
-                                    f"{done}/{total}"
-                                    if total
-                                    else f"总流程 [13/{phase_total}] "
-                                    f"读取角色分类元数据：已发现 {done} 个"
+                                    "status",
+                                    (
+                                        f"总流程 [13/{phase_total}] 读取角色分类元数据 "
+                                        f"{done}/{total}"
+                                        if total
+                                        else f"总流程 [13/{phase_total}] "
+                                        f"读取角色分类元数据：已发现 {done} 个"
+                                    ),
+                                )
+                            ),
+                        )
+                        role_moved, role_reports = role_classifier.apply_classification(
+                            output_root,
+                            role_entries,
+                            progress=lambda done, total: (
+                                self.events.put(
+                                    (
+                                        "progress",
+                                        done * 100 / total if total else 100,
+                                    )
                                 ),
+                                self.events.put(
+                                    (
+                                        "status",
+                                        f"总流程 [13/{phase_total}] 整理角色目录 "
+                                        f"{done}/{total}",
+                                    )
+                                ),
+                            ),
+                        )
+                        self.events.put(
+                            (
+                                "log",
+                                f"角色分类：共 {len(role_entries)} 个带贴图成品；"
+                                f"移动 {role_moved} 个目录；同步 {role_reports} 份报告。",
                             )
-                        ),
-                    )
-                    role_moved, role_reports = role_classifier.apply_classification(
-                        output_root,
-                        role_entries,
-                        progress=lambda done, total: (
+                        )
+                    except Exception as exc:
+                        self.events.put(
+                            (
+                                "log",
+                                "按稀有度/中文名整理失败，PMX 本身不受影响："
+                                f"{type(exc).__name__}: {exc}",
+                            )
+                        )
+                else:
+                    phase_status(13, f"保留{GAME_PROFILE.display_name}原始资源分类")
+                if GAME_PROFILE.key == "onmyoji":
+                    try:
+                        from onmyoji_motion import prepare_motion_assets
+
+                        self.events.put(("progress", 0))
+                        phase_status(14, "建立动作与动画元数据索引")
+
+                        def motion_progress(
+                            stage: str,
+                            done: int,
+                            total: int,
+                            reused_motion: int,
+                            decoded_motion: int,
+                            failed_motion: int,
+                        ) -> None:
                             self.events.put(
                                 (
                                     "progress",
                                     done * 100 / total if total else 100,
                                 )
-                            ),
+                            )
                             self.events.put(
                                 (
                                     "status",
-                                    f"总流程 [13/{phase_total}] 整理角色目录 "
-                                    f"{done}/{total}",
+                                    f"总流程 [14/{phase_total}] {stage} "
+                                    f"{done}/{total}；复用 {reused_motion}；"
+                                    f"新增 {decoded_motion}；跳过 {failed_motion}",
                                 )
-                            ),
-                        ),
-                    )
-                    self.events.put(
+                            )
+
                         (
-                            "log",
-                            f"角色分类：共 {len(role_entries)} 个带贴图成品；"
-                            f"移动 {role_moved} 个目录；同步 {role_reports} 份报告。",
+                            motion_headers,
+                            motion_reused,
+                            motion_decoded,
+                            motion_failed,
+                        ) = prepare_motion_assets(
+                            model_folder,
+                            progress=motion_progress,
                         )
-                    )
-                except Exception as exc:
-                    self.events.put(
-                        (
-                            "log",
-                            "按稀有度/中文名整理失败，PMX 本身不受影响："
-                            f"{type(exc).__name__}: {exc}",
+                        from onmyoji_motion_bindings import OfficialMotionBindings
+
+                        phase_status(14, "建立动作与模型的严格关联索引")
+                        motion_bindings = OfficialMotionBindings.load_or_build(
+                            Path(__file__).resolve().parent
                         )
-                    )
-                phase_status(13, "保存本次增量状态")
+                        self.events.put(
+                            (
+                                "log",
+                                f"动作预解析：可用 {len(motion_headers)}；"
+                                f"已有解码缓存 {motion_reused}；新增解码 "
+                                f"{motion_decoded}；跳过 {motion_failed}；"
+                                f"严格模型关联 {len(motion_bindings.motion_to_meshes)}。",
+                            )
+                        )
+                    except Exception as exc:
+                        self.events.put(
+                            (
+                                "log",
+                                "动作预解析失败，PMX 不受影响，可稍后在动作工具重试："
+                                f"{type(exc).__name__}: {exc}",
+                            )
+                        )
+                phase_status(phase_total, "保存本次增量状态")
                 write_one_click_state(output_root, source_fingerprint)
                 self.events.put(("progress", 100))
                 summary = (
@@ -19587,7 +20778,7 @@ def self_test(folder: Path) -> int:
 def main() -> int:
     if "--self-test" in sys.argv:
         script_root = Path(__file__).resolve().parent
-        default = script_root / "unpacked" / "model"
+        default = script_root / UNPACKED_DIR_NAME / "model"
         index = sys.argv.index("--self-test")
         folder = (
             Path(sys.argv[index + 1])

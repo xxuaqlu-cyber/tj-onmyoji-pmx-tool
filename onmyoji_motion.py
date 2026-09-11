@@ -6,11 +6,14 @@ from __future__ import annotations
 import base64
 import copy
 import hashlib
+import json
 import os
+import re
 import struct
 import subprocess
 import threading
 import xml.etree.ElementTree as ElementTree
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -19,6 +22,8 @@ import numpy as np
 
 _ANIMATION_XML_INDEX: dict[Path, dict[str, tuple[Path, ...]]] = {}
 _ANIMATION_XML_INDEX_LOCK = threading.Lock()
+MOTION_CATALOG_SCHEMA = 1
+ANIMATION_XML_INDEX_SCHEMA = 2
 
 
 class MotionFormatError(RuntimeError):
@@ -172,6 +177,102 @@ def motion_cache_path(path: Path, cache_root: Path | None = None) -> Path:
     return root / f"{key}.nanim"
 
 
+def _motion_asset_cache_path(root: Path, name: str) -> Path:
+    root = Path(root).resolve()
+    workspace = Path(__file__).resolve().parent
+    try:
+        root.relative_to(workspace)
+    except ValueError:
+        return root / ".motion_cache" / f"{name}.json"
+    key = hashlib.sha1(str(root).lower().encode("utf-8")).hexdigest()[:12]
+    return workspace / ".motion_cache" / f"{name}_{key}.json"
+
+
+def _motion_asset_fingerprint(root: Path) -> dict[str, list[int]]:
+    root = Path(root).resolve()
+    candidates = (
+        root / "manifest.csv",
+        root / "npk_manifest.json",
+        root.parent / "manifest.csv",
+    )
+    result: dict[str, list[int]] = {}
+    for path in candidates:
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        result[str(path.resolve())] = [int(stat.st_size), int(stat.st_mtime_ns)]
+    return result
+
+
+def _write_json_atomic(path: Path, payload: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+def _motion_header_payload(header: MotionHeader, root: Path) -> dict[str, object]:
+    return {
+        "path": str(header.path.relative_to(root)).replace("\\", "/"),
+        "version": header.version,
+        "skeleton_ref": header.skeleton_ref,
+        "action": header.action,
+        "bone_names": list(header.bone_names),
+        "sample_rate": header.sample_rate,
+        "duration": header.duration,
+    }
+
+
+def save_motion_catalog(root: Path, headers: list[MotionHeader]) -> Path:
+    root = Path(root).resolve()
+    path = _motion_asset_cache_path(root, "motion_catalog_v1")
+    _write_json_atomic(
+        path,
+        {
+            "schema": MOTION_CATALOG_SCHEMA,
+            "root": str(root),
+            "fingerprint": _motion_asset_fingerprint(root),
+            "motions": [_motion_header_payload(header, root) for header in headers],
+        },
+    )
+    return path
+
+
+def load_motion_catalog(root: Path) -> list[MotionHeader] | None:
+    """Load the unpack-time action catalogue without walking the resource tree."""
+    root = Path(root).resolve()
+    path = _motion_asset_cache_path(root, "motion_catalog_v1")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if (
+            payload.get("schema") != MOTION_CATALOG_SCHEMA
+            or payload.get("root") != str(root)
+            or payload.get("fingerprint") != _motion_asset_fingerprint(root)
+        ):
+            return None
+        headers = []
+        for item in payload["motions"]:
+            motion_path = root / str(item["path"])
+            headers.append(
+                MotionHeader(
+                    path=motion_path,
+                    version=int(item["version"]),
+                    skeleton_ref=str(item["skeleton_ref"]),
+                    action=str(item["action"]),
+                    bone_names=tuple(str(value) for value in item["bone_names"]),
+                    sample_rate=float(item["sample_rate"]),
+                    duration=float(item["duration"]),
+                )
+            )
+        return headers
+    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
 def _decoded_cache_header(
     decoded_path: Path, header: MotionHeader
 ) -> tuple[int, int, float, float, bool] | None:
@@ -258,6 +359,78 @@ def decode_motion(path: Path, cache_root: Path | None = None) -> DecodedMotion:
     return motion
 
 
+def prepare_motion_assets(
+    root: Path,
+    progress=None,
+    max_workers: int | None = None,
+    decode_all: bool = False,
+) -> tuple[list[MotionHeader], int, int, int]:
+    """Prepare action/XML indexes, optionally decoding every clip on request.
+
+    Returns ``(headers, reused, decoded, failed)``.  The optional callback
+    receives ``(stage, done, total, reused, decoded, failed)``.
+    """
+    root = Path(root).resolve()
+    cached_headers = load_motion_catalog(root)
+    if cached_headers is not None and not decode_all:
+        if progress is not None:
+            progress("读取动作索引", len(cached_headers), len(cached_headers), 0, 0, 0)
+        build_animation_xml_index(root)
+        return cached_headers, 0, 0, 0
+    paths = list(root.rglob("*.rawanimation"))
+    total = len(paths)
+    if progress is not None:
+        progress("索引动画 XML", 0, total, 0, 0, 0)
+    build_animation_xml_index(root)
+    if progress is not None:
+        progress(
+            "解析并缓存动作" if decode_all else "建立动作目录",
+            0, total, 0, 0, 0,
+        )
+    workers = max_workers or min(8, max(2, (os.cpu_count() or 4) // 2))
+
+    def prepare(path: Path) -> tuple[MotionHeader | None, bool | None]:
+        try:
+            if decode_all:
+                header, _cache_path, cache_hit = ensure_decoded_motion_cache(path)
+                return header, cache_hit
+            header = read_motion_header(path)
+            return (header, False) if header.version == 0 else (None, None)
+        except (OSError, MotionFormatError):
+            return None, None
+
+    headers: list[MotionHeader] = []
+    reused = decoded = failed = 0
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        for index, (header, cache_hit) in enumerate(executor.map(prepare, paths), 1):
+            if header is None:
+                failed += 1
+            else:
+                headers.append(header)
+                if not decode_all:
+                    pass
+                elif cache_hit:
+                    reused += 1
+                else:
+                    decoded += 1
+            if progress is not None and (
+                index == total or index % 20 == 0
+            ):
+                progress(
+                    "解析并缓存动作" if decode_all else "建立动作目录",
+                    index, total, reused, decoded, failed,
+                )
+    headers.sort(
+        key=lambda header: (
+            header.skeleton_name.lower(),
+            header.action.lower(),
+            str(header.path).lower(),
+        )
+    )
+    save_motion_catalog(root, headers)
+    return headers, reused, decoded, failed
+
+
 def normalized_bone_name(name: str) -> str:
     return "".join(ch for ch in name.strip().replace(" ", "_").lower() if ch not in "-_.")
 
@@ -314,26 +487,113 @@ def _xml_animation_candidate(path: Path, header: MotionHeader) -> AnimationMetad
         return None
 
 
-def _animation_xml_index(root: Path) -> dict[str, tuple[Path, ...]]:
-    """Index XMLs once by the logical action embedded in their export name."""
+def _animation_signature_key(action: str, bone_names: tuple[str, ...]) -> str:
+    bones = sorted(normalized_bone_name(value) for value in bone_names)
+    digest = hashlib.sha1("\0".join(bones).encode("utf-8")).hexdigest()[:20]
+    return f"{normalized_bone_name(action)}:{len(bones)}:{digest}"
+
+
+def _xml_animation_identity(path: Path) -> tuple[str, tuple[str, ...]] | None:
+    """Read only the two fields needed to index an Animation XML exactly."""
+    try:
+        # CachedPoseTrack can contain megabytes of base64.  The identity fields
+        # are before it, so avoid constructing a full XML tree for every file.
+        with path.open("rb") as stream:
+            prefix = stream.read(64 * 1024)
+        name_match = re.search(
+            rb"<Name\b[^>]*\bName\s*=\s*['\"]([^'\"]+)['\"]", prefix
+        )
+        joint_match = re.search(
+            rb"<JointNames\b[^>]*\bValue\s*=\s*['\"]([^'\"]+)['\"]",
+            prefix,
+        )
+        if name_match is None or joint_match is None:
+            return None
+
+        def decode(value: bytes) -> str:
+            for encoding in ("utf-8", "gb18030"):
+                try:
+                    return value.decode(encoding)
+                except UnicodeDecodeError:
+                    continue
+            return value.decode("utf-8", errors="replace")
+
+        action = decode(name_match.group(1))
+        joint_text = decode(joint_match.group(1))
+        joints = tuple(
+            value.strip() for value in joint_text.split(",") if value.strip()
+        )
+        if not action.strip() or not joints:
+            return None
+        return action.strip(), joints
+    except (ElementTree.ParseError, OSError, TypeError, ValueError):
+        return None
+
+
+def build_animation_xml_index(
+    root: Path, force: bool = False
+) -> dict[str, tuple[Path, ...]]:
+    """Build or load the persistent action-name to Animation XML index."""
     root = root.resolve()
     with _ANIMATION_XML_INDEX_LOCK:
-        cached = _ANIMATION_XML_INDEX.get(root)
-        if cached is not None:
-            return cached
+        memory_cached = _ANIMATION_XML_INDEX.get(root)
+        if memory_cached is not None and not force:
+            return memory_cached
+        cache_path = _motion_asset_cache_path(root, "animation_xml_index_v1")
+        fingerprint = _motion_asset_fingerprint(root)
+        if not force:
+            try:
+                payload = json.loads(cache_path.read_text(encoding="utf-8"))
+                if (
+                    payload.get("schema") == ANIMATION_XML_INDEX_SCHEMA
+                    and payload.get("root") == str(root)
+                    and payload.get("fingerprint") == fingerprint
+                ):
+                    cached = {
+                        str(key): tuple(root / str(value) for value in values)
+                        for key, values in payload["actions"].items()
+                    }
+                    _ANIMATION_XML_INDEX[root] = cached
+                    return cached
+            except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+                pass
         grouped: dict[str, list[Path]] = {}
-        for path in root.rglob("*_Animation_*.xml"):
-            marker = path.name.lower().find("_animation_")
-            if marker < 0:
-                continue
-            prefix = path.name[:marker]
-            action = prefix.split("_", 1)[1] if "_" in prefix else prefix
-            key = normalized_bone_name(action)
-            if key:
-                grouped.setdefault(key, []).append(path)
+        xml_paths = list(root.rglob("*_Animation_*.xml"))
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            identities = executor.map(_xml_animation_identity, xml_paths)
+            for path, identity in zip(xml_paths, identities):
+                if identity is None:
+                    continue
+                action, joints = identity
+                grouped.setdefault(
+                    _animation_signature_key(action, joints), []
+                ).append(path)
         cached = {key: tuple(value) for key, value in grouped.items()}
+        try:
+            _write_json_atomic(
+                cache_path,
+                {
+                    "schema": ANIMATION_XML_INDEX_SCHEMA,
+                    "root": str(root),
+                    "fingerprint": fingerprint,
+                    "actions": {
+                        key: [
+                            str(path.relative_to(root)).replace("\\", "/")
+                            for path in values
+                        ]
+                        for key, values in cached.items()
+                    },
+                },
+            )
+        except OSError:
+            pass
         _ANIMATION_XML_INDEX[root] = cached
         return cached
+
+
+def _animation_xml_index(root: Path) -> dict[str, tuple[Path, ...]]:
+    """Index XMLs once by action, preferring the unpack-time persistent cache."""
+    return build_animation_xml_index(root)
 
 
 def find_animation_metadata(root: Path, header: MotionHeader) -> AnimationMetadata | None:
@@ -346,7 +606,8 @@ def find_animation_metadata(root: Path, header: MotionHeader) -> AnimationMetada
     if not root.is_dir():
         return None
     candidates: list[AnimationMetadata] = []
-    for path in _animation_xml_index(root).get(normalized_bone_name(header.action), ()):
+    signature = _animation_signature_key(header.action, header.bone_names)
+    for path in _animation_xml_index(root).get(signature, ()):
         metadata = _xml_animation_candidate(path, header)
         if metadata is not None:
             candidates.append(metadata)
@@ -501,28 +762,40 @@ def neox_to_pmx_matrix4(matrix: np.ndarray) -> np.ndarray:
 
 def trs_row_matrix4(transform: np.ndarray) -> np.ndarray:
     """Build a NeoX row-vector local matrix from tx/quat/scale ACL channels."""
-    tx, ty, tz, x, y, z, w, sx, sy, sz = np.asarray(transform, dtype=np.float32)
-    length = float(np.sqrt(x * x + y * y + z * z + w * w))
-    if length <= 1.0e-8:
-        x = y = z = 0.0
-        w = 1.0
-    else:
-        x, y, z, w = x / length, y / length, z / length, w / length
-    # Transpose of the usual column-vector quaternion matrix.  Translation is
-    # in the final row because NeoX evaluates vertices as row vectors.
-    rotation = np.asarray(
-        (
-            (1 - 2 * (y * y + z * z), 2 * (x * y + z * w), 2 * (x * z - y * w), 0),
-            (2 * (x * y - z * w), 1 - 2 * (x * x + z * z), 2 * (y * z + x * w), 0),
-            (2 * (x * z + y * w), 2 * (y * z - x * w), 1 - 2 * (x * x + y * y), 0),
-            (tx, ty, tz, 1),
-        ),
-        dtype=np.float32,
+    return trs_row_matrices(np.asarray(transform, dtype=np.float32)[None, :])[0]
+
+
+def trs_row_matrices(transforms: np.ndarray) -> np.ndarray:
+    """Vectorized NeoX local TRS conversion for one or many animation bones."""
+    values = np.asarray(transforms, dtype=np.float32)
+    if values.ndim < 2 or values.shape[-1] != 10:
+        raise ValueError("TRS 数据必须以 10 个浮点数结尾")
+    translation = values[..., :3]
+    quaternion = values[..., 3:7].copy()
+    scale = values[..., 7:10]
+    lengths = np.linalg.norm(quaternion, axis=-1, keepdims=True)
+    identity = np.zeros_like(quaternion)
+    identity[..., 3] = 1.0
+    quaternion = np.where(
+        lengths > 1.0e-8,
+        quaternion / np.maximum(lengths, 1.0e-8),
+        identity,
     )
-    rotation[0, :3] *= sx
-    rotation[1, :3] *= sy
-    rotation[2, :3] *= sz
-    return rotation
+    x, y, z, w = np.moveaxis(quaternion, -1, 0)
+    result = np.zeros(values.shape[:-1] + (4, 4), dtype=np.float32)
+    result[..., 0, 0] = 1 - 2 * (y * y + z * z)
+    result[..., 0, 1] = 2 * (x * y + z * w)
+    result[..., 0, 2] = 2 * (x * z - y * w)
+    result[..., 1, 0] = 2 * (x * y - z * w)
+    result[..., 1, 1] = 1 - 2 * (x * x + z * z)
+    result[..., 1, 2] = 2 * (y * z + x * w)
+    result[..., 2, 0] = 2 * (x * z + y * w)
+    result[..., 2, 1] = 2 * (y * z - x * w)
+    result[..., 2, 2] = 1 - 2 * (x * x + y * y)
+    result[..., :3, :3] *= scale[..., :, None]
+    result[..., 3, :3] = translation
+    result[..., 3, 3] = 1.0
+    return result
 
 
 def compose_global_row_matrices(
@@ -614,6 +887,7 @@ def export_vmd(
     vmd_path: Path,
     output_fps: float = 30.0,
     reference_transforms: np.ndarray | None = None,
+    compatible_path: Path | None = None,
 ) -> tuple[Path, Path, int, int, bool]:
     """Export VMD and a name-compatible PMX copy.
 
@@ -646,13 +920,22 @@ def export_vmd(
             f"{reference_transforms.shape} != {motion.frames.shape[1:]}"
         )
 
-    compatible = copy.deepcopy(model)
-    for bone, alias, original in zip(compatible.bones, aliases, pmx_names):
-        bone.name = alias
-        bone.english_name = original
-    compatible.comment = (compatible.comment or "") + "\nVMD-compatible bone aliases; originals are in English names."
-    compatible_path = pmx_path.with_name(pmx_path.stem + "_动作兼容.pmx")
-    pymeshio.pmx.writer.write_to_file(compatible, str(compatible_path))
+    explicit_compatible_path = compatible_path is not None
+    compatible_path = (
+        Path(compatible_path).resolve()
+        if explicit_compatible_path
+        else pmx_path.with_name(pmx_path.stem + "_动作兼容.pmx")
+    )
+    # A batch uses one PMX-compatible copy for every VMD.  Its aliases depend
+    # only on the PMX bones, so avoid rewriting the same large file per action.
+    if not (explicit_compatible_path and compatible_path.is_file()):
+        compatible = copy.deepcopy(model)
+        for bone, alias, original in zip(compatible.bones, aliases, pmx_names):
+            bone.name = alias
+            bone.english_name = original
+        compatible.comment = (compatible.comment or "") + "\nVMD-compatible bone aliases; originals are in English names."
+        compatible_path.parent.mkdir(parents=True, exist_ok=True)
+        pymeshio.pmx.writer.write_to_file(compatible, str(compatible_path))
 
     frame_count = max(1, int(round(motion.duration * output_fps)) + 1)
     source_indices = np.clip(

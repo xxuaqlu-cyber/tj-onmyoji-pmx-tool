@@ -126,6 +126,34 @@ class PreviewSourceMetadataTests(unittest.TestCase):
             self.assertEqual(by_name["b.pmx"].source_size, 8192)
 
 
+class PreviewFolderExportTests(unittest.TestCase):
+    def test_copy_model_folder_uses_edited_name(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source_model"
+            destination = root / "exports"
+            source.mkdir()
+            (source / "model.pmx").write_bytes(b"pmx")
+
+            target, dds_count = preview.copy_model_folder(
+                source, destination, folder_name="自定义导出名"
+            )
+
+            self.assertEqual(target.name, "自定义导出名")
+            self.assertTrue((target / "model.pmx").is_file())
+            self.assertEqual(dds_count, 0)
+
+    def test_copy_model_folder_rejects_path_in_folder_name(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source_model"
+            source.mkdir()
+            with self.assertRaises(ValueError):
+                preview.copy_model_folder(
+                    source, root / "exports", folder_name="角色/错误"
+                )
+
+
 class NpkMaterialEvidenceTests(unittest.TestCase):
     @staticmethod
     def _mesh(positions: list[tuple[float, float, float]]) -> rigged.ParsedMesh:
