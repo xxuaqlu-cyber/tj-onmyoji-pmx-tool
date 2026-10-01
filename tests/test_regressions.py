@@ -92,6 +92,34 @@ class SupplementalMaterialCacheTests(unittest.TestCase):
 
 
 class PreviewSourceMetadataTests(unittest.TestCase):
+    def test_role_catalog_skin_name_is_available_to_preview_items(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            pmx_path = root / "带贴图" / "model" / "model.pmx"
+            pmx_path.parent.mkdir(parents=True)
+            pmx_path.touch()
+            with (root / "角色分类清单.csv").open(
+                "w", newline="", encoding="utf-8-sig"
+            ) as stream:
+                writer = csv.DictWriter(
+                    stream,
+                    fieldnames=("稀有度", "角色分类", "皮肤名称", "PMX"),
+                )
+                writer.writeheader()
+                writer.writerow({
+                    "稀有度": "SSR",
+                    "角色分类": "测试式神",
+                    "皮肤名称": "测试皮肤",
+                    "PMX": str(pmx_path),
+                })
+
+            items = preview.discover_items(root, "全部 PMX")
+
+            self.assertEqual(len(items), 1)
+            self.assertEqual(items[0].rarity, "SSR")
+            self.assertEqual(items[0].role, "测试式神")
+            self.assertEqual(items[0].skin_name, "测试皮肤")
+
     def test_directory_discovery_restores_source_size_from_report(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -127,6 +155,19 @@ class PreviewSourceMetadataTests(unittest.TestCase):
 
 
 class PreviewFolderExportTests(unittest.TestCase):
+    def test_default_export_folder_name_uses_role_and_skin(self) -> None:
+        item = preview.PreviewItem(
+            path=Path("model.pmx"),
+            category="带贴图",
+            role="待宵姑获鸟",
+            skin_name="栖羽待月",
+        )
+
+        self.assertEqual(
+            preview.default_export_folder_name(item),
+            "待宵姑获鸟_栖羽待月",
+        )
+
     def test_copy_model_folder_uses_edited_name(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -308,6 +349,55 @@ class NpkMaterialEvidenceTests(unittest.TestCase):
 
             self.assertEqual(renamed, 0)
             self.assertEqual(package.package_name, "sp_mianlingqi_show")
+
+
+class FinishedModelReportTests(unittest.TestCase):
+    def test_stale_composite_report_cannot_replace_current_single_mesh_build(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            model_dir = root / "model"
+            model_dir.mkdir()
+            pmx_path = model_dir / "s2_sp_mianlingqi.pmx"
+            pmx_path.touch()
+            (model_dir / ".build.json").write_text(
+                json.dumps({"source_mesh": "base.mesh"}), encoding="utf-8"
+            )
+            with (root / "纹理恢复报告.csv").open(
+                "w", newline="", encoding="utf-8-sig"
+            ) as stream:
+                writer = csv.DictWriter(
+                    stream,
+                    fieldnames=("源Mesh", "模型名", "PMX", "源Mesh大小", "结果"),
+                )
+                writer.writeheader()
+                writer.writerow({
+                    "源Mesh": "base.mesh",
+                    "模型名": "s2_sp_mianlingqi",
+                    "PMX": str(pmx_path),
+                    "源Mesh大小": "100",
+                    "结果": "已绑定主贴图",
+                })
+            with (root / "共享贴图组合报告.csv").open(
+                "w", newline="", encoding="utf-8-sig"
+            ) as stream:
+                writer = csv.DictWriter(
+                    stream, fieldnames=("PMX", "组件列表", "模型名")
+                )
+                writer.writeheader()
+                writer.writerow({
+                    "PMX": str(pmx_path),
+                    "组件列表": "base.mesh|show.mesh",
+                    "模型名": "s2_sp_mianlingqi",
+                })
+
+            total, direct, hidden = rigged.write_finished_model_report(root)
+
+            self.assertEqual((total, direct, hidden), (1, 0, 0))
+            with (root / "成品模型报告.csv").open(
+                "r", newline="", encoding="utf-8-sig"
+            ) as stream:
+                rows = list(csv.DictReader(stream))
+            self.assertEqual(rows[0]["成品类型"], "独立成品")
 
 
 if __name__ == "__main__":

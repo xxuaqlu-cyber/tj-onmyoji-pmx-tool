@@ -744,9 +744,18 @@ def matrix4_multiply(left: np.ndarray, right: np.ndarray) -> np.ndarray:
 
 
 def inverse_affine_row_matrix4(matrix: np.ndarray) -> np.ndarray:
-    """Invert row-vector affine 4x4 matrices without changing coordinates."""
+    """Invert row-vector affine 4x4 matrices, tolerating zero-scale bones.
+
+    Animation data can contain a zero scale on a bone.  Such an affine matrix
+    has no exact inverse, but a Moore-Penrose inverse still gives a stable
+    least-squares transform for the surviving axes and lets FBX export continue.
+    """
     value = np.asarray(matrix, dtype=np.float32)
-    linear_inverse = np.linalg.inv(value[..., :3, :3])
+    linear = value[..., :3, :3]
+    try:
+        linear_inverse = np.linalg.inv(linear)
+    except np.linalg.LinAlgError:
+        linear_inverse = np.linalg.pinv(linear)
     result = np.zeros_like(value)
     result[..., :3, :3] = linear_inverse
     result[..., 3, :3] = -np.matmul(value[..., 3:4, :3], linear_inverse)[..., 0, :]
@@ -803,6 +812,7 @@ def compose_global_row_matrices(
 ) -> np.ndarray:
     """Compose ACL local TRS in NeoX's row-vector parent order."""
     count = len(local_transforms)
+    local_matrices = trs_row_matrices(local_transforms)
     result = np.zeros((count, 4, 4), dtype=np.float32)
     visiting = np.zeros(count, dtype=np.uint8)
 
@@ -810,7 +820,7 @@ def compose_global_row_matrices(
         if visiting[index] == 2:
             return
         visiting[index] = 1
-        local = trs_row_matrix4(local_transforms[index])
+        local = local_matrices[index]
         parent = int(parents[index]) if index < len(parents) else -1
         if 0 <= parent < count and parent != index and visiting[parent] != 1:
             visit(parent)
@@ -881,6 +891,112 @@ def quaternion_delta(current: np.ndarray, reference: np.ndarray) -> np.ndarray:
     return np.where(length > 1.0e-8, result / np.maximum(length, 1.0e-8), identity)
 
 
+def _pmx_vertex_skinning(model) -> tuple[np.ndarray, np.ndarray]:
+    joints = np.zeros((len(model.vertices), 4), dtype=np.int32)
+    weights = np.zeros((len(model.vertices), 4), dtype=np.float32)
+    for index, vertex in enumerate(model.vertices):
+        deform = vertex.deform
+        kind = type(deform).__name__
+        if kind == "Bdef4":
+            joints[index] = (
+                deform.index0, deform.index1, deform.index2, deform.index3
+            )
+            weights[index] = (
+                deform.weight0, deform.weight1, deform.weight2, deform.weight3
+            )
+        elif kind in {"Bdef2", "Sdef"}:
+            weight0 = float(deform.weight0)
+            joints[index, :2] = (deform.index0, deform.index1)
+            weights[index, :2] = (weight0, 1.0 - weight0)
+        else:
+            joints[index, 0] = int(getattr(deform, "index0", 0))
+            weights[index, 0] = 1.0
+    valid = (joints >= 0) & (joints < len(model.bones))
+    joints = np.where(valid, joints, 0)
+    weights = np.where(valid, weights, 0.0)
+    totals = weights.sum(axis=1, keepdims=True)
+    weights = np.divide(
+        weights,
+        totals,
+        out=np.column_stack(
+            (np.ones(len(weights), dtype=np.float32), np.zeros((len(weights), 3), dtype=np.float32))
+        ),
+        where=totals > 1.0e-8,
+    )
+    return joints, weights
+
+
+def _bake_pmx_to_motion_reference_pose(
+    model,
+    pmx_names: list[str],
+    mapping: list[int],
+    target_bind_matrices: np.ndarray,
+    reference_transforms: np.ndarray,
+    reference_parents: tuple[int, ...] | list[int],
+) -> bool:
+    """Bake an A-pose PMX copy into the animation Skeleton's bind pose.
+
+    VMD stores only deltas. If a Mesh uses an A-pose while the game's Skeleton
+    bind is an action pose, applying those deltas directly starts at A/T-pose
+    and rotates around the wrong reference. The original PMX remains untouched;
+    only its generated ``_动作兼容`` copy is baked.
+    """
+    target_bind = np.asarray(target_bind_matrices, dtype=np.float32)
+    reference = np.asarray(reference_transforms, dtype=np.float32)
+    if len(pmx_names) != len(model.bones) or len(mapping) != len(model.bones):
+        return False
+    if target_bind.shape != (len(model.bones), 4, 4):
+        return False
+    if reference.ndim != 2 or reference.shape[1] != 10:
+        return False
+    source_globals = compose_global_row_matrices(reference, reference_parents)
+    source_globals = neox_to_pmx_matrix4(source_globals)
+    target_bind = neox_to_pmx_matrix4(target_bind)
+    desired = target_bind.copy()
+    for pmx_index, raw_index in enumerate(mapping):
+        if 0 <= raw_index < len(source_globals):
+            desired[pmx_index] = source_globals[raw_index]
+    skin = matrix4_multiply(inverse_affine_row_matrix4(target_bind), desired)
+    if float(np.max(np.abs(skin - np.eye(4, dtype=np.float32)))) <= 1.0e-5:
+        return False
+
+    joints, weights = _pmx_vertex_skinning(model)
+    weighted = np.sum(skin[joints] * weights[:, :, None, None], axis=1)
+    positions = np.asarray(
+        [(v.position.x, v.position.y, v.position.z, 1.0) for v in model.vertices],
+        dtype=np.float32,
+    )
+    transformed_positions = np.einsum("ni,nij->nj", positions, weighted)[:, :3]
+    normals = np.asarray(
+        [(v.normal.x, v.normal.y, v.normal.z) for v in model.vertices],
+        dtype=np.float32,
+    )
+    linear = weighted[:, :3, :3]
+    try:
+        normal_matrices = np.linalg.inv(linear).transpose(0, 2, 1)
+    except np.linalg.LinAlgError:
+        normal_matrices = np.linalg.pinv(linear).transpose(0, 2, 1)
+    transformed_normals = np.einsum("ni,nij->nj", normals, normal_matrices)
+    lengths = np.linalg.norm(transformed_normals, axis=1, keepdims=True)
+    transformed_normals = np.divide(
+        transformed_normals,
+        lengths,
+        out=normals.copy(),
+        where=lengths > 1.0e-8,
+    )
+
+    import pymeshio.common as common
+
+    for vertex, position, normal in zip(
+        model.vertices, transformed_positions, transformed_normals
+    ):
+        vertex.position = common.Vector3(*map(float, position))
+        vertex.normal = common.Vector3(*map(float, normal))
+    for index, bone in enumerate(model.bones):
+        bone.position = common.Vector3(*map(float, desired[index, 3, :3]))
+    return True
+
+
 def export_vmd(
     motion: DecodedMotion,
     pmx_path: Path,
@@ -888,6 +1004,8 @@ def export_vmd(
     output_fps: float = 30.0,
     reference_transforms: np.ndarray | None = None,
     compatible_path: Path | None = None,
+    target_bind_matrices: np.ndarray | None = None,
+    reference_parents: tuple[int, ...] | list[int] | None = None,
 ) -> tuple[Path, Path, int, int, bool]:
     """Export VMD and a name-compatible PMX copy.
 
@@ -930,6 +1048,15 @@ def export_vmd(
     # only on the PMX bones, so avoid rewriting the same large file per action.
     if not (explicit_compatible_path and compatible_path.is_file()):
         compatible = copy.deepcopy(model)
+        if target_bind_matrices is not None and reference_parents is not None:
+            _bake_pmx_to_motion_reference_pose(
+                compatible,
+                pmx_names,
+                mapping,
+                target_bind_matrices,
+                reference_transforms,
+                reference_parents,
+            )
         for bone, alias, original in zip(compatible.bones, aliases, pmx_names):
             bone.name = alias
             bone.english_name = original

@@ -14,7 +14,7 @@ Mesh 类型：
 索引为 uint16；旧版转换器常按 uint8 读取，因此会错位。
 
 用法：
-    双击“启动带骨模型工具.bat”
+    双击“阴阳师\启动带骨模型工具.bat”
     或 python onmyoji_rigged_mesh_gui.py
     自检 python onmyoji_rigged_mesh_gui.py --self-test
 """
@@ -60,12 +60,17 @@ DEFAULT_RIGGED_OUTPUT_DIR_NAME = GAME_PROFILE.rigged_output_dir
 ENABLE_ROLE_CLASSIFICATION = GAME_PROFILE.enable_role_classification
 # 这里只表示 PMX 文件本身的输出兼容版本。材质匹配规则、报告格式或 GUI
 # 调整不应修改它，否则所有 .build.json 会同时失效并触发一次全量重写。
-PMX_OUTPUT_FORMAT_VERSION = 35
+PMX_OUTPUT_FORMAT_VERSION = 36  # Q 版 biaoqing 脸部默认映射透明第四格
 # 材质 resolver 的输入/规则兼容版本。只在匹配逻辑会改变最终材质包时递增；
 # GUI、报告和预览器调整不得递增。
 MATERIAL_RESOLVER_VERSION = 43
 # 主体/附件组合发现规则版本；只影响“完整组合”，不抬高 PMX 文件格式版本。
 COMPOSITE_RESOLVER_VERSION = 7
+# 独立 Mesh 使用同一官方 THP 包内唯一 Skeleton 扩展完整骨表。单独计入
+# PMX 指纹，避免因此让没有官方 Skeleton 关系的模型全部重建。
+OFFICIAL_SKELETON_BIND_VERSION = 2
+# 多套 biped 共存时，辅助/特效 rig 不再参与主体 A-pose 判定。
+MULTI_BIPED_POSE_VERSION = 1
 # Skeleton 的面部控制器参考布局不一定是 Mesh 的闭嘴中性表情。这个版本只
 # 写入实际带面部根骨且显式使用 Skeleton 的组合模型指纹，避免小范围姿态
 # 修正抬高 PMX_OUTPUT_FORMAT_VERSION 后让所有角色和场景一起全量重建。
@@ -105,6 +110,7 @@ SUPPLEMENTAL_MATERIAL_SYNC_VERSION = 1
 # 场景 PMX 的布局烘焙版本。只在 SCN 层级、坐标变换、分块或场景材质
 # 规则变化时递增；普通角色模型规则变化不应让场景缓存全部失效。
 SCENE_PMX_PIPELINE_VERSION = 3
+SCENE_OBJ_PIPELINE_VERSION = 1
 SCENE_PMX_VERTEX_LIMIT = 500_000
 _RES_ASSET_PATHS_MEMORY_CACHE: dict[tuple[object, ...], list[str]] = {}
 _SCRIPT3_GIM_PATHS_MEMORY_CACHE: dict[tuple[object, ...], list[str]] = {}
@@ -116,6 +122,7 @@ _ORPHAN_MANIFEST_CACHE: dict[
     str, tuple[tuple[object, ...], dict[str, Path], dict[Path, str]]
 ] = {}
 _PMX_BUILD_OUTPUT_CACHE: dict[str, dict[str, list[Path]]] = {}
+_MULTI_BIPED_MESH_CACHE: dict[Path, bool] = {}
 TRUSTED_MATERIAL_CONFIDENCE = frozenset({
     "平安京EXPK几何语义精确",
     "平安京展示高模几何精确",
@@ -13557,6 +13564,86 @@ def _parse_must_show_identity_socket_bindings(
     return result
 
 
+def build_official_mesh_skeleton_bindings(
+    model_folder: Path,
+    thd_dir: Path | None,
+    eligible_meshes: Iterable[Path] | None = None,
+) -> dict[Path, Path]:
+    """Find unambiguous Mesh -> Skeleton edges from official THP packages.
+
+    A NeoX Mesh stores only the bones referenced by its vertices. Animation
+    and effect bones live in the package Skeleton, so comparing their raw bone
+    counts makes a valid character look incompatible. Only packages containing
+    one physical Mesh and one physical Skeleton are accepted; a Mesh referenced
+    by different Skeleton payloads remains unresolved instead of being guessed.
+    """
+    if thd_dir is None:
+        return {}
+    thx_path = thd_dir / "model.thx"
+    thp_path = thd_dir / "model.thp"
+    if not (thx_path.is_file() and thp_path.is_file()):
+        return {}
+
+    from thd_resource_index import read_model_thp, read_model_thx
+
+    allowed = (
+        {path.resolve() for path in eligible_meshes}
+        if eligible_meshes is not None
+        else None
+    )
+    by_md5, _ = _manifest_hash_maps(model_folder)
+    record_by_hash = {
+        record.name_hash: record for record in read_model_thx(thx_path)
+    }
+    candidates: dict[Path, set[Path]] = defaultdict(set)
+    mesh_bones: dict[Path, frozenset[str]] = {}
+    skeleton_bones: dict[Path, frozenset[str]] = {}
+
+    for dependency_hashes in read_model_thp(thp_path).values():
+        package_meshes: set[Path] = set()
+        package_skeletons: set[Path] = set()
+        for dependency_hash in dependency_hashes:
+            record = record_by_hash.get(dependency_hash)
+            path = by_md5.get(record.content_md5) if record is not None else None
+            if path is None:
+                continue
+            resolved = path.resolve()
+            if resolved.suffix.lower() == ".mesh":
+                package_meshes.add(resolved)
+            elif resolved.suffix.lower() == ".skeleton":
+                package_skeletons.add(resolved)
+        if len(package_meshes) != 1 or len(package_skeletons) != 1:
+            continue
+        mesh_path = next(iter(package_meshes))
+        if allowed is not None and mesh_path not in allowed:
+            continue
+        skeleton_path = next(iter(package_skeletons))
+        try:
+            local_keys = mesh_bones.get(mesh_path)
+            if local_keys is None:
+                names, _parents, _vertex_count = read_mesh_bone_layout(mesh_path)
+                local_keys = frozenset(_normalized_bone_key(name) for name in names)
+                mesh_bones[mesh_path] = local_keys
+            full_keys = skeleton_bones.get(skeleton_path)
+            if full_keys is None:
+                hierarchy = read_skeleton_hierarchy(skeleton_path)
+                full_keys = (
+                    frozenset(hierarchy.bone_keys)
+                    if hierarchy is not None else frozenset()
+                )
+                skeleton_bones[skeleton_path] = full_keys
+        except Exception:
+            continue
+        if local_keys and local_keys.issubset(full_keys):
+            candidates[mesh_path].add(skeleton_path)
+
+    return {
+        mesh_path: next(iter(paths))
+        for mesh_path, paths in candidates.items()
+        if len(paths) == 1
+    }
+
+
 def build_composite_models(
     model_folder: Path,
     by_mesh: dict[Path, MaterialPackage],
@@ -14323,6 +14410,28 @@ def build_composite_models(
         r"(?:^|[_\-])(?:lod\d*|low|shadow|collision|collider)(?:$|[_\-])",
         re.IGNORECASE,
     )
+    alternate_form_suffix = re.compile(
+        r"(?:[_\-](?:show|battle|display|preview|mirror))+$",
+        re.IGNORECASE,
+    )
+
+    def is_alternate_form_pair(
+        left_package: MaterialPackage, left_path: Path,
+        right_package: MaterialPackage, right_path: Path,
+    ) -> bool:
+        """Keep complete display/battle variants out of attachment merging."""
+        left = safe_model_name(left_package, left_path).strip().lower()
+        right = safe_model_name(right_package, right_path).strip().lower()
+        if left == right:
+            return False
+        return (
+            alternate_form_suffix.sub("", left)
+            == alternate_form_suffix.sub("", right)
+            and (
+                alternate_form_suffix.search(left) is not None
+                or alternate_form_suffix.search(right) is not None
+            )
+        )
 
     texture_member_items = list(texture_members.items())
     for texture_number, (texture_path, members) in enumerate(
@@ -14361,6 +14470,10 @@ def build_composite_models(
             ] = []
             for main_vertices, main_path, main_package, main_bind in infos:
                 if main_path == child_path or main_vertices < 8_000:
+                    continue
+                if is_alternate_form_pair(
+                    child_package, child_path, main_package, main_path
+                ):
                     continue
                 # 只吸收明显的小组件；接近主体大小的模型可能是换装/状态/LOD。
                 if child_vertices * 2.2 > main_vertices:
@@ -14803,7 +14916,7 @@ def _bilateral_pose_asymmetry(
         if index in eligible_indices and index < len(matrices)
     }
     pairs: list[
-        tuple[tuple[float, float, float], tuple[float, float, float]]
+        tuple[str, tuple[float, float, float], tuple[float, float, float]]
     ] = []
     for key, (_left_index, left) in by_key.items():
         if not any(term in key for term in POSE_SYMMETRY_BONE_TERMS):
@@ -14820,14 +14933,21 @@ def _bilateral_pose_asymmetry(
         )
         if not all(math.isfinite(value) for point in positions for value in point):
             continue
-        pairs.append(positions)
+        pairs.append((key, positions[0], positions[1]))
+    # Some character packages embed a second biped (bip02/bip03) for a prop,
+    # summon or effect. Those auxiliary rigs are often intentionally offset and
+    # are not bilateral body-pose evidence. Prefer the primary bip01 chain when
+    # it has enough canonical limb pairs; s2_sp_mianlingqi depends on this.
+    primary_pairs = [pair for pair in pairs if pair[0].startswith("bip01_")]
+    if len(primary_pairs) >= POSE_SYMMETRY_MIN_PAIRS:
+        pairs = primary_pairs
     if len(pairs) < POSE_SYMMETRY_MIN_PAIRS:
         return None
 
     center_x = median(
-        (left[0] + right[0]) * 0.5 for left, right in pairs
+        (left[0] + right[0]) * 0.5 for _, left, right in pairs
     )
-    points = [point for pair in pairs for point in pair]
+    points = [point for _, left, right in pairs for point in (left, right)]
     scale = max(
         max(point[1] for point in points) - min(point[1] for point in points),
         max(abs(point[0] - center_x) for point in points),
@@ -14839,7 +14959,7 @@ def _bilateral_pose_asymmetry(
             + (left[1] - right[1]) ** 2
             + (left[2] - right[2]) ** 2
         ) / scale
-        for left, right in pairs
+        for _, left, right in pairs
     ]
     return sum(errors) / len(errors)
 
@@ -15761,6 +15881,8 @@ def one_click_source_fingerprint(
         "material_resolver": MATERIAL_RESOLVER_VERSION,
         "composite_resolver": COMPOSITE_RESOLVER_VERSION,
         "facial_neutral_pose": FACIAL_NEUTRAL_POSE_VERSION,
+        "official_skeleton_bind": OFFICIAL_SKELETON_BIND_VERSION,
+        "multi_biped_pose": MULTI_BIPED_POSE_VERSION,
         "pmx_output": PMX_OUTPUT_FORMAT_VERSION,
         "inputs": inputs,
     }
@@ -15798,6 +15920,8 @@ def write_one_click_state(output_root: Path, fingerprint: str) -> None:
                 "material_resolver": MATERIAL_RESOLVER_VERSION,
                 "composite_resolver": COMPOSITE_RESOLVER_VERSION,
                 "facial_neutral_pose": FACIAL_NEUTRAL_POSE_VERSION,
+                "official_skeleton_bind": OFFICIAL_SKELETON_BIND_VERSION,
+                "multi_biped_pose": MULTI_BIPED_POSE_VERSION,
                 "pmx_output": PMX_OUTPUT_FORMAT_VERSION,
             },
             ensure_ascii=False,
@@ -15808,15 +15932,41 @@ def write_one_click_state(output_root: Path, fingerprint: str) -> None:
     temporary.replace(state_path)
 
 
+def _mesh_has_auxiliary_biped(mesh_path: Path) -> bool:
+    """Whether pose inference must ignore a secondary embedded biped rig."""
+    resolved = mesh_path.resolve()
+    cached = _MULTI_BIPED_MESH_CACHE.get(resolved)
+    if cached is not None:
+        return cached
+    try:
+        bone_names, _parents, _vertex_count = read_mesh_bone_layout(resolved)
+        prefixes = {
+            match.group(1)
+            for name in bone_names
+            if (match := re.match(r"^(bip\d+)_", _normalized_bone_key(name)))
+        }
+        cached = "bip01" in prefixes and len(prefixes) > 1
+    except Exception:
+        cached = False
+    _MULTI_BIPED_MESH_CACHE[resolved] = cached
+    return cached
+
+
 def pmx_build_fingerprint(
     mesh_path: Path,
     package: MaterialPackage | None,
+    skeleton_path: Path | None = None,
 ) -> str:
     """PMX 增量构建键：Mesh、材质、纹理或管线版本任一变化才重建。"""
     payload: dict[str, object] = {
         "pipeline": PMX_OUTPUT_FORMAT_VERSION,
         "mesh": _file_build_stamp(mesh_path),
     }
+    if skeleton_path is not None:
+        payload["official_skeleton_bind"] = OFFICIAL_SKELETON_BIND_VERSION
+        payload["skeleton"] = _file_build_stamp(skeleton_path)
+    if _mesh_has_auxiliary_biped(mesh_path):
+        payload["multi_biped_pose"] = MULTI_BIPED_POSE_VERSION
     if package is not None:
         payload["confidence"] = package.confidence
         payload["material_xml"] = _file_build_stamp(package.xml_path)
@@ -15961,6 +16111,72 @@ def write_texture_slot_report(
                 )
 
 
+def _q_expression_material_uses_transparent_fourth_tile(
+    material: MaterialDefinition,
+    texture_files: dict[str, Path],
+) -> bool:
+    """Return whether a Q-model face atlas has a transparent fourth tile."""
+    from q_face_atlas import has_transparent_fourth_tile, is_q_face_material
+
+    primary = material_primary_texture(material)
+    if not primary:
+        return False
+    if not is_q_face_material(material.name, primary):
+        return False
+    texture_path = texture_files.get(primary)
+    if texture_path is None:
+        normalized = primary.replace("\\", "/").lower()
+        texture_path = next(
+            (
+                path
+                for original, path in texture_files.items()
+                if original.replace("\\", "/").lower() == normalized
+            ),
+            None,
+        )
+    if texture_path is None or not texture_path.is_file():
+        return False
+    return has_transparent_fourth_tile(texture_path)
+
+
+def _default_q_expression_uvs(
+    mesh: ParsedMesh,
+    materials: list[MaterialDefinition] | None,
+    texture_files: dict[str, Path] | None,
+) -> list[tuple[float, float]]:
+    """Map Q face atlas UVs to the transparent fourth tile by default."""
+    uvs = list(mesh.uvs)
+    if not materials or not texture_files or not uvs:
+        return uvs
+
+    face_materials = {
+        index
+        for index, material in enumerate(materials)
+        if _q_expression_material_uses_transparent_fourth_tile(
+            material, texture_files
+        )
+    }
+    if not face_materials:
+        return uvs
+
+    from q_face_atlas import remap_uv_to_transparent_fourth
+
+    vertex_offset = 0
+    for material_index, (
+        vertex_count,
+        _face_count,
+        _uv_layers,
+        _color_layers,
+    ) in enumerate(mesh.submeshes):
+        end = min(vertex_offset + max(0, int(vertex_count)), len(uvs))
+        if material_index in face_materials:
+            for vertex_index in range(vertex_offset, end):
+                u, v = uvs[vertex_index]
+                uvs[vertex_index] = remap_uv_to_transparent_fourth(u, v)
+        vertex_offset += max(0, int(vertex_count))
+    return uvs
+
+
 def package_texture_summary(
     package: MaterialPackage | None,
 ) -> str:
@@ -16095,6 +16311,7 @@ def export_mesh_variant(
     output_root: Path,
     texture_cache: DecodedTextureCache,
     folder_suffix: str = "",
+    skeleton_path: Path | None = None,
 ) -> tuple[Path, Path, str, bool, bool, bool, str]:
     """导出一个物理 Mesh 的单套材质变体。
 
@@ -16163,7 +16380,7 @@ def export_mesh_variant(
             # if a hand-edited rule file is temporarily invalid.
             pass
     fingerprint = pmx_build_fingerprint(
-        mesh_path, package if trusted_package else None
+        mesh_path, package if trusted_package else None, skeleton_path
     )
     pmx_path = model_output / f"{model_name}.pmx"
     build_meta_path = model_output / ".build.json"
@@ -16206,7 +16423,11 @@ def export_mesh_variant(
             "",
         )
 
-    mesh = parse_mesh_for_pmx(mesh_path)
+    mesh = parse_mesh_for_pmx(
+        mesh_path,
+        skeleton_path,
+        expand_skeleton=skeleton_path is not None,
+    )
     texture_files: dict[str, Path] = {}
     texture_error = ""
     if trusted_package and package:
@@ -16299,6 +16520,8 @@ def export_mesh_variant(
                 "has_diffuse": has_diffuse,
                 "has_color": has_color,
                 "source_mesh": mesh_path.name,
+                "source_skeleton": skeleton_path.name if skeleton_path else "",
+                "source_skeleton_path": str(skeleton_path) if skeleton_path else "",
                 "material_variant": package.package_name if package else "",
             },
             ensure_ascii=False,
@@ -16402,8 +16625,9 @@ def save_pmx(
             )
 
     sentinel = 0xFFFF if mesh.version >= 4 else 0xFF
+    output_uvs = _default_q_expression_uvs(mesh, materials, texture_files)
     for position, normal, uv, joints, weights in zip(
-        mesh.positions, mesh.normals, mesh.uvs, mesh.joints, mesh.weights
+        mesh.positions, mesh.normals, output_uvs, mesh.joints, mesh.weights
     ):
         joint_values = [
             old_to_new_bone_index[
@@ -16498,6 +16722,85 @@ def save_pmx(
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     pymeshio.pmx.writer.write_to_file(model, str(output_path))
+
+
+def save_obj(
+    mesh: ParsedMesh,
+    output_path: Path,
+    model_name: str,
+    materials: list[MaterialDefinition] | None = None,
+    texture_files: dict[str, Path] | None = None,
+) -> None:
+    """Write a static OBJ/MTL pair using the same coordinate system as PMX."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    mtl_path = output_path.with_suffix(".mtl")
+    output_lines = [f"# {model_name}", f"mtllib {mtl_path.name}", ""]
+
+    # PMX applies (-x, y, -z) at write time.  Use that same conversion so the
+    # scene OBJ and PMX occupy the same world space when opened together.
+    for x, y, z in mesh.positions:
+        output_lines.append(f"v {-x:.9g} {y:.9g} {-z:.9g}")
+    uv_values = _default_q_expression_uvs(mesh, materials, texture_files)
+    if len(uv_values) < len(mesh.positions):
+        uv_values.extend((0.0, 0.0) for _ in range(len(mesh.positions) - len(uv_values)))
+    for u, v in uv_values[: len(mesh.positions)]:
+        output_lines.append(f"vt {u:.9g} {v:.9g}")
+    normal_values = list(mesh.normals)
+    if len(normal_values) < len(mesh.positions):
+        normal_values.extend(
+            (0.0, 1.0, 0.0)
+            for _ in range(len(mesh.positions) - len(normal_values))
+        )
+    for nx, ny, nz in normal_values[: len(mesh.positions)]:
+        output_lines.append(f"vn {-nx:.9g} {ny:.9g} {-nz:.9g}")
+
+    material_defs = list(materials or [])
+    texture_files = texture_files or {}
+    material_names: list[str] = []
+    mtl_lines = [f"# Materials for {model_name}", ""]
+    for index, material in enumerate(material_defs):
+        safe_name = re.sub(
+            r"[^0-9A-Za-z_\-\u4e00-\u9fff]+", "_", material.name
+        ).strip("_") or f"material_{index + 1}"
+        if safe_name in material_names:
+            safe_name = f"{safe_name}_{index + 1}"
+        material_names.append(safe_name)
+        color = material.diffuse_color or (1.0, 1.0, 1.0, 1.0)
+        mtl_lines.extend(
+            [
+                f"newmtl {safe_name}",
+                f"Kd {float(color[0]):.6g} {float(color[1]):.6g} {float(color[2]):.6g}",
+                f"d {max(0.0, min(1.0, float(color[3]))):.6g}",
+                "Ka 0 0 0",
+                "Ks 0 0 0",
+            ]
+        )
+        primary = material_primary_texture(material)
+        texture = texture_files.get(primary) if primary else None
+        if texture is not None and texture.is_file():
+            relative = os.path.relpath(texture, mtl_path.parent).replace("\\", "/")
+            mtl_lines.append(f"map_Kd {relative}")
+        mtl_lines.append("")
+
+    face_offset = 0
+    for index, (_vertex_offset, face_count, _material_index, _flags) in enumerate(mesh.submeshes):
+        if index < len(material_names):
+            output_lines.extend([f"usemtl {material_names[index]}", ""])
+        for face in mesh.faces[face_offset : face_offset + face_count]:
+            a, b, c = (value + 1 for value in face)
+            output_lines.append(f"f {a}/{a}/{a} {b}/{b}/{b} {c}/{c}/{c}")
+        face_offset += face_count
+    if face_offset < len(mesh.faces):
+        if not material_names:
+            material_names.append("material_1")
+            mtl_lines.extend(["newmtl material_1", "Kd 1 1 1", "d 1", ""])
+        output_lines.append(f"usemtl {material_names[0]}")
+        for face in mesh.faces[face_offset:]:
+            a, b, c = (value + 1 for value in face)
+            output_lines.append(f"f {a}/{a}/{a} {b}/{b}/{b} {c}/{c}/{c}")
+
+    output_path.write_text("\n".join(output_lines) + "\n", encoding="utf-8")
+    mtl_path.write_text("\n".join(mtl_lines) + "\n", encoding="utf-8")
 
 
 def save_composite_pmx(
@@ -16745,6 +17048,26 @@ def write_finished_model_report(output_root: Path) -> tuple[int, int, int]:
                     value for value in row.get("组件列表", "").split("|") if value
                 )
                 if len(components) < 2 or not pmx_path.is_file():
+                    continue
+                # Historical reports can outlive a rebuilt directory. Never let
+                # such a stale CSV turn a current one-Mesh PMX into a fake
+                # composite (this previously affected s2_sp_mianlingqi).
+                try:
+                    build_payload = json.loads(
+                        (pmx_path.parent / ".build.json").read_text(
+                            encoding="utf-8"
+                        )
+                    )
+                    built_components = frozenset(
+                        str(value).lower()
+                        for value in build_payload.get("components", ())
+                        if isinstance(value, str) and value
+                    )
+                except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                if built_components != frozenset(
+                    value.lower() for value in components
+                ):
                     continue
                 direct_candidates.append((priority, row, components))
 
@@ -17633,20 +17956,33 @@ def _optimize_scene_material_batches(chunk: dict[str, object]) -> None:
     chunk["materials"] = optimized_materials
 
 
-def _scene_export_fingerprint(entry: SceneCatalogEntry, thd_dir: Path) -> str:
+def _scene_export_fingerprint(
+    entry: SceneCatalogEntry,
+    thd_dir: Path,
+    format_key: str = "pmx",
+) -> str:
     source_digest = hashlib.md5(entry.source_path.read_bytes()).hexdigest()
     thx_stamps = [
         _file_build_stamp(path)
         for path in sorted(thd_dir.glob("*.thx"), key=lambda item: item.name.lower())
     ]
+    fingerprint_payload: dict[str, object] = {
+        "pipeline": (
+            SCENE_PMX_PIPELINE_VERSION
+            if format_key == "pmx"
+            else SCENE_OBJ_PIPELINE_VERSION
+        ),
+        "pmx": PMX_OUTPUT_FORMAT_VERSION,
+        "scene": source_digest,
+        "thx": thx_stamps,
+        "vertex_limit": SCENE_PMX_VERTEX_LIMIT,
+    }
+    # Keep the historical PMX fingerprint stable so adding OBJ support does
+    # not force existing PMX scene exports to rebuild.
+    if format_key != "pmx":
+        fingerprint_payload["format"] = format_key
     payload = json.dumps(
-        {
-            "pipeline": SCENE_PMX_PIPELINE_VERSION,
-            "pmx": PMX_OUTPUT_FORMAT_VERSION,
-            "scene": source_digest,
-            "thx": thx_stamps,
-            "vertex_limit": SCENE_PMX_VERTEX_LIMIT,
-        },
+        fingerprint_payload,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
@@ -17662,8 +17998,12 @@ def export_scene_pmx(
     texture_cache: DecodedTextureCache,
     fast_reuse: bool = True,
     progress: Callable[[str, int, int], None] | None = None,
+    format_key: str = "pmx",
 ) -> tuple[Path, int, int, int, bool]:
-    """导出一个摆放完成的静态场景；返回目录/分块/成功实例/失败实例/复用。"""
+    """导出一个摆放完成的静态场景；支持 PMX 或静态 OBJ。"""
+    format_key = format_key.lower().strip()
+    if format_key not in {"pmx", "obj"}:
+        raise ValueError(f"不支持的场景导出格式：{format_key}")
     clean_name = re.sub(
         r"[^0-9A-Za-z_\-\u4e00-\u9fff]+", "_", entry.display_name
     ).strip("_") or "scene"
@@ -17672,7 +18012,7 @@ def export_scene_pmx(
     ).hexdigest()[:8]
     scene_output = output_root / f"{clean_name}_{scene_key}"
     meta_path = scene_output / ".build.json"
-    fingerprint = _scene_export_fingerprint(entry, thd_dir)
+    fingerprint = _scene_export_fingerprint(entry, thd_dir, format_key)
     old_metadata: dict[str, object] = {}
     if meta_path.is_file():
         try:
@@ -17684,13 +18024,18 @@ def export_scene_pmx(
         for value in old_metadata.get("outputs", [])
         if isinstance(value, str)
     ]
+    old_artifacts = [
+        scene_output / str(value)
+        for value in old_metadata.get("artifacts", old_metadata.get("outputs", []))
+        if isinstance(value, str)
+    ]
     if (
         fast_reuse
         and old_metadata.get("fingerprint") == fingerprint
         and int(old_metadata.get("failed_instances", 0)) == 0
         and int(old_metadata.get("resource_warnings", 0)) == 0
         and old_outputs
-        and all(path.is_file() for path in old_outputs)
+        and all(path.is_file() for path in old_artifacts)
     ):
         return (
             scene_output,
@@ -17867,21 +18212,34 @@ def export_scene_pmx(
                     progress("解码场景贴图", texture_done, texture_total)
             texture_files[original] = png_path
 
-        pmx_name = (
-            f"{clean_name}.pmx" if len(chunks) == 1
-            else f"{clean_name}_分块{index:03d}.pmx"
+        extension = ".obj" if format_key == "obj" else ".pmx"
+        model_name = (
+            clean_name if len(chunks) == 1 else f"{clean_name}_分块{index:03d}"
         )
-        pmx_path = scene_output / pmx_name
-        save_pmx(
-            _scene_chunk_mesh(current),
-            pmx_path,
-            clean_name if len(chunks) == 1 else f"{clean_name}_分块{index:03d}",
-            list(current["materials"]),
-            texture_files,
-        )
-        output_paths.append(pmx_path)
+        model_path = scene_output / f"{model_name}{extension}"
+        if format_key == "obj":
+            save_obj(
+                _scene_chunk_mesh(current),
+                model_path,
+                model_name,
+                list(current["materials"]),
+                texture_files,
+            )
+        else:
+            save_pmx(
+                _scene_chunk_mesh(current),
+                model_path,
+                model_name,
+                list(current["materials"]),
+                texture_files,
+            )
+        output_paths.append(model_path)
         if progress:
-            progress("写入 PMX 分块", index, len(chunks))
+            progress(
+                f"写入 {'OBJ' if format_key == 'obj' else 'PMX'} 分块",
+                index,
+                len(chunks),
+            )
 
     layout_path = scene_output / "场景布局.json"
     layout_path.write_text(
@@ -17892,6 +18250,8 @@ def export_scene_pmx(
                 "source_xml": str(entry.source_path),
                 "source_coordinate": "NeoX row-vector",
                 "pmx_coordinate_rule": "(-x, y, -z)",
+                "coordinate_rule": "(-x, y, -z)",
+                "format": format_key,
                 "vertex_limit_per_chunk": SCENE_PMX_VERTEX_LIMIT,
                 "instances": layout_rows,
             },
@@ -17906,8 +18266,11 @@ def export_scene_pmx(
         writer.writerow(["类型", "实例名", "UUID", "GIM", "材质覆盖", "原因"])
         writer.writerows(missing_rows)
 
-    current_set = {path.resolve() for path in output_paths}
-    for old_path in old_outputs:
+    current_artifacts = set(output_paths)
+    if format_key == "obj":
+        current_artifacts.update(path.with_suffix(".mtl") for path in output_paths)
+    current_set = {path.resolve() for path in current_artifacts}
+    for old_path in old_artifacts:
         try:
             if old_path.resolve() not in current_set and old_path.is_file():
                 old_path.unlink()
@@ -17917,8 +18280,14 @@ def export_scene_pmx(
         json.dumps(
             {
                 "fingerprint": fingerprint,
-                "pipeline": SCENE_PMX_PIPELINE_VERSION,
+                "pipeline": (
+                    SCENE_PMX_PIPELINE_VERSION
+                    if format_key == "pmx"
+                    else SCENE_OBJ_PIPELINE_VERSION
+                ),
+                "format": format_key,
                 "outputs": [path.name for path in output_paths],
+                "artifacts": sorted(path.name for path in current_artifacts),
                 "resolved_instances": resolved_count,
                 "failed_instances": failed_instance_count,
                 "resource_warnings": resource_warning_count,
@@ -17931,6 +18300,28 @@ def export_scene_pmx(
     )
     return (
         scene_output, len(output_paths), resolved_count, len(missing_rows), False
+    )
+
+
+def export_scene_obj(
+    entry: SceneCatalogEntry,
+    output_root: Path,
+    resolver: SceneResourceResolver,
+    thd_dir: Path,
+    texture_cache: DecodedTextureCache,
+    fast_reuse: bool = True,
+    progress: Callable[[str, int, int], None] | None = None,
+) -> tuple[Path, int, int, int, bool]:
+    """导出一个摆放完成的静态场景 OBJ/MTL。"""
+    return export_scene_pmx(
+        entry,
+        output_root,
+        resolver,
+        thd_dir,
+        texture_cache,
+        fast_reuse=fast_reuse,
+        progress=progress,
+        format_key="obj",
     )
 
 
@@ -17955,13 +18346,19 @@ def human_size(value: int) -> str:
 
 
 class SceneSelectionDialog(tk.Toplevel):
-    def __init__(self, parent: tk.Misc, entries: list[SceneCatalogEntry]):
+    def __init__(
+        self,
+        parent: tk.Misc,
+        entries: list[SceneCatalogEntry],
+        format_key: str = "pmx",
+    ):
         super().__init__(parent)
         self.title("选择要导出的场景")
         self.geometry("960x620")
         self.minsize(720, 420)
         self.transient(parent)
         self.entries = entries
+        self.format_key = format_key
         self.visible_entries: list[SceneCatalogEntry] = []
         self.result: list[SceneCatalogEntry] = []
         self.search_var = tk.StringVar()
@@ -18000,7 +18397,10 @@ class SceneSelectionDialog(tk.Toplevel):
         bottom.pack(fill="x", padx=10, pady=10)
         ttk.Label(
             bottom,
-            text="可按 Ctrl/Shift 多选；大场景会自动拆成保持同一坐标原点的 PMX。",
+            text=(
+                "可按 Ctrl/Shift 多选；大场景会自动拆成保持同一坐标原点的 "
+                f"{'OBJ' if format_key == 'obj' else 'PMX'}。"
+            ),
         ).pack(side="left")
         ttk.Button(bottom, text="取消", command=self.destroy).pack(side="right")
         ttk.Button(bottom, text="导出所选", command=self._accept).pack(
@@ -18146,12 +18546,22 @@ class RiggedMeshApp(tk.Tk):
             actions, text="解包带贴图场景 PMX", command=self.start_scene_pmx
         )
         scene_button.pack(side="left", fill="x", expand=True, padx=8, pady=10)
+        scene_obj_button = ttk.Button(
+            actions,
+            text="导出带贴图场景 OBJ",
+            command=lambda: self.start_scene_pmx("obj"),
+        )
+        scene_obj_button.pack(side="left", fill="x", expand=True, padx=8, pady=10)
         install_button = ttk.Button(
             actions, text="安装依赖", command=self.start_install
         )
         install_button.pack(side="left", padx=8, pady=10)
         self.action_buttons = [
-            white_button, textured_button, scene_button, install_button
+            white_button,
+            textured_button,
+            scene_button,
+            scene_obj_button,
+            install_button,
         ]
 
         status = ttk.Frame(self)
@@ -18448,7 +18858,11 @@ class RiggedMeshApp(tk.Tk):
                 rows.append(self.visible_rows[index])
         return rows
 
-    def start_scene_pmx(self):
+    def start_scene_pmx(self, format_key: str = "pmx"):
+        format_key = format_key.lower().strip()
+        if format_key not in {"pmx", "obj"}:
+            raise ValueError(f"不支持的场景导出格式：{format_key}")
+        format_label = "OBJ" if format_key == "obj" else "PMX"
         if GAME_PROFILE.key == "moba":
             messagebox.showinfo(
                 APP_TITLE,
@@ -18480,7 +18894,7 @@ class RiggedMeshApp(tk.Tk):
                     import astc_encoder.pil_codec  # noqa: F401
                     from PIL import Image  # noqa: F401
                 except ImportError:
-                    self.events.put(("log", "首次运行：正在安装场景 PMX 与贴图依赖……"))
+                    self.events.put(("log", f"首次运行：正在安装场景 {format_label} 与贴图依赖……"))
                     self.events.put(("status", "正在安装依赖"))
                     install_pmx_dependency()
 
@@ -18528,7 +18942,7 @@ class RiggedMeshApp(tk.Tk):
                     "log",
                     f"场景清单完成：{len(entries):,} 个可导出场景。",
                 ))
-                payload = (entries, source_root, thd_dir.resolve())
+                payload = (entries, source_root, thd_dir.resolve(), format_key)
             except Exception:
                 self.events.put(("error", traceback.format_exc()))
             finally:
@@ -18543,17 +18957,19 @@ class RiggedMeshApp(tk.Tk):
         entries: list[SceneCatalogEntry],
         source_root: Path | None,
         thd_dir: Path,
+        format_key: str = "pmx",
     ) -> None:
-        dialog = SceneSelectionDialog(self, entries)
+        dialog = SceneSelectionDialog(self, entries, format_key)
         self.wait_window(dialog)
         if dialog.result:
-            self._start_scene_export(dialog.result, source_root, thd_dir)
+            self._start_scene_export(dialog.result, source_root, thd_dir, format_key)
 
     def _start_scene_export(
         self,
         entries: list[SceneCatalogEntry],
         source_root: Path | None,
         thd_dir: Path,
+        format_key: str = "pmx",
     ) -> None:
         selected_output = Path(self.output_var.get()).resolve()
         fast_reuse = bool(self.fast_reuse_var.get())
@@ -18561,7 +18977,8 @@ class RiggedMeshApp(tk.Tk):
 
         def worker():
             try:
-                output_root = selected_output / "场景PMX"
+                format_label = "OBJ" if format_key == "obj" else "PMX"
+                output_root = selected_output / f"场景{format_label}"
                 output_root.mkdir(parents=True, exist_ok=True)
                 texture_cache = DecodedTextureCache(
                     unpacked_root / "decoded_png_cache"
@@ -18600,15 +19017,25 @@ class RiggedMeshApp(tk.Tk):
                             ))
 
                         try:
+                            exporter = (
+                                export_scene_obj
+                                if format_key == "obj"
+                                else export_scene_pmx
+                            )
+                            export_kwargs = {
+                                "fast_reuse": fast_reuse,
+                                "progress": report_stage,
+                            }
+                            if format_key != "obj":
+                                export_kwargs["format_key"] = format_key
                             folder, chunks, resolved, missing, was_reused = (
-                                export_scene_pmx(
+                                exporter(
                                     entry,
                                     output_root,
                                     resolver,
                                     thd_dir,
                                     texture_cache,
-                                    fast_reuse=fast_reuse,
-                                    progress=report_stage,
+                                    **export_kwargs,
                                 )
                             )
                             total_chunks += chunks
@@ -18637,13 +19064,13 @@ class RiggedMeshApp(tk.Tk):
                     targeted = resolver.extracted_count
 
                 summary = (
-                    f"场景 PMX 完成：新生成 {generated}，增量复用 {reused}，"
-                    f"失败场景 {failed_scenes}；共 {total_chunks} 个 PMX 分块，"
+                    f"场景 {format_label} 完成：新生成 {generated}，增量复用 {reused}，"
+                    f"失败场景 {failed_scenes}；共 {total_chunks} 个 {format_label} 分块，"
                     f"成功摆放 {total_instances:,} 个实例，缺失 {missing_instances:,} 个。\n"
                     f"按需补取资源 {targeted:,} 个。\n输出：{output_root}"
                 )
                 self.events.put(("progress", 100))
-                self.events.put(("status", "场景 PMX 导出完成"))
+                self.events.put(("status", f"场景 {format_label} 导出完成"))
                 self.events.put(("log", summary.replace("\n", "；")))
                 self.events.put(("done_message", summary))
             except Exception:
@@ -19114,6 +19541,8 @@ class RiggedMeshApp(tk.Tk):
                             f"{MATERIAL_RESOLVER_VERSION}:"
                             f"{COMPOSITE_RESOLVER_VERSION}:"
                             f"{FACIAL_NEUTRAL_POSE_VERSION}:"
+                            f"{OFFICIAL_SKELETON_BIND_VERSION}:"
+                            f"{MULTI_BIPED_POSE_VERSION}:"
                             f"{PMX_OUTPUT_FORMAT_VERSION}"
                         ).encode("utf-8")
                     ).hexdigest()
@@ -19141,6 +19570,8 @@ class RiggedMeshApp(tk.Tk):
                             f"{MATERIAL_RESOLVER_VERSION}:"
                             f"{COMPOSITE_RESOLVER_VERSION}:"
                             f"{FACIAL_NEUTRAL_POSE_VERSION}:"
+                            f"{OFFICIAL_SKELETON_BIND_VERSION}:"
+                            f"{MULTI_BIPED_POSE_VERSION}:"
                             f"{PMX_OUTPUT_FORMAT_VERSION}"
                         ).encode("utf-8")
                     ).hexdigest()
@@ -19677,11 +20108,22 @@ class RiggedMeshApp(tk.Tk):
                         progress=report_composite_analysis,
                     )
                 )
+                official_skeletons = (
+                    {}
+                    if moba_mode else
+                    build_official_mesh_skeleton_bindings(
+                        model_folder,
+                        thd_dir,
+                        (row.path for row in rows),
+                    )
+                )
                 self.events.put(
                     (
                         "log",
                         f"发现可安全组装的主体+附件模型 {len(composite_models)} 组；"
-                        "确定关系直接并入普通成品，可选 Socket 变体单独保留审计。",
+                        "确定关系直接并入普通成品，可选 Socket 变体单独保留审计。"
+                        f"另有 {len(official_skeletons)} 个独立 Mesh 已确认官方完整 Skeleton，"
+                        "导出时会补齐动作/特效骨而不拼入其他形态的网格。",
                     )
                 )
 
@@ -19913,6 +20355,9 @@ class RiggedMeshApp(tk.Tk):
                                     output_root,
                                     texture_cache,
                                     folder_suffix=folder_suffix,
+                                    skeleton_path=official_skeletons.get(
+                                        row.path.resolve()
+                                    ),
                                 )
                                 desired_outputs.add(model_output)
                                 ok += 1
@@ -20679,8 +21124,10 @@ class RiggedMeshApp(tk.Tk):
                 elif kind == "done_message":
                     messagebox.showinfo(APP_TITLE, str(payload))
                 elif kind == "scene_catalog_ready":
-                    entries, source_root, thd_dir = payload
-                    self._choose_scene_entries(entries, source_root, thd_dir)
+                    entries, source_root, thd_dir, format_key = payload
+                    self._choose_scene_entries(
+                        entries, source_root, thd_dir, format_key
+                    )
                 elif kind == "error":
                     self._log(str(payload))
                     messagebox.showerror(APP_TITLE, "任务失败，详情见日志。")

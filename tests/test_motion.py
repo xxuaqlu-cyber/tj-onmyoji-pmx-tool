@@ -6,6 +6,7 @@ import unittest
 import base64
 import gc
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -13,6 +14,7 @@ from onmyoji_motion import (
     AnimationMetadata,
     DecodedMotion,
     _linear_interpolation,
+    _bake_pmx_to_motion_reference_pose,
     compose_global_positions,
     compose_global_row_matrices,
     cp932_field,
@@ -35,6 +37,31 @@ from onmyoji_rigged_mesh_gui import read_skeleton_hierarchy
 
 
 class MotionHeaderTests(unittest.TestCase):
+    def test_action_compatible_pmx_is_baked_to_motion_reference_pose(self) -> None:
+        vertex = SimpleNamespace(
+            position=SimpleNamespace(x=0.0, y=0.0, z=0.0),
+            normal=SimpleNamespace(x=0.0, y=1.0, z=0.0),
+            deform=type("Bdef1", (), {"index0": 0})(),
+        )
+        model = SimpleNamespace(
+            vertices=[vertex],
+            bones=[SimpleNamespace(position=None)],
+        )
+        target_bind = np.eye(4, dtype=np.float32)[None, :, :]
+        reference = np.zeros((1, 10), dtype=np.float32)
+        reference[0, 0] = 2.0
+        reference[0, 6] = 1.0
+        reference[0, 7:10] = 1.0
+
+        baked = _bake_pmx_to_motion_reference_pose(
+            model, ["root"], [0], target_bind, reference, (-1,)
+        )
+
+        self.assertTrue(baked)
+        self.assertAlmostEqual(model.vertices[0].position.x, -2.0)
+        self.assertAlmostEqual(model.bones[0].position.x, -2.0)
+        self.assertAlmostEqual(model.vertices[0].normal.y, 1.0)
+
     def test_unpack_time_motion_catalog_round_trip_and_invalidation(self) -> None:
         from onmyoji_motion import MotionHeader
 

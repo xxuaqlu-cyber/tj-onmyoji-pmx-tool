@@ -15,12 +15,15 @@
 __pycache__/
 *.py[cod]
 *.log
+*.tmp
 *.obj
 /.motion_cache/
 /.tmp_*/
 /resdb_decomp.bin
 tools/*.nanim
 tools/test_*.vmd
+/tools/vgmstream-win/
+/tests/_diag_*.py
 /.resource_pull_settings.json
 /.resource_pull_settings_moba.json
 /.agents/

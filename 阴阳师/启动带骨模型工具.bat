@@ -1,7 +1,8 @@
 @echo off
 chcp 65001 >nul
 title Onmyoji Rigged Mesh Tool
-cd /d "%~dp0"
+set "ROOT=%~dp0.."
+cd /d "%ROOT%"
 
 set "PY_EXE="
 set "PY_ARGS="
@@ -22,9 +23,9 @@ if not defined PY_EXE (
 )
 
 echo Python: %PY_EXE%
-echo Script: %~dp0onmyoji_rigged_mesh_gui.py
+echo Script: %ROOT%\onmyoji_rigged_mesh_gui.py
 echo.
-"%PY_EXE%" %PY_ARGS% -X utf8 "%~dp0onmyoji_rigged_mesh_gui.py"
+"%PY_EXE%" %PY_ARGS% -X utf8 "%ROOT%\onmyoji_rigged_mesh_gui.py"
 set "EXIT_CODE=%ERRORLEVEL%"
 
 echo.

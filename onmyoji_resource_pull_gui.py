@@ -6,10 +6,12 @@ import queue
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import tarfile
 import threading
+import time
 import tkinter as tk
 from pathlib import Path, PurePosixPath
 from tkinter import filedialog, messagebox, ttk
@@ -34,6 +36,7 @@ MOBA_ROOT_ANDROID_DATA = "/data/media/0/Android/data"
 MOBA_MODEL_ASSET_RE = re.compile(r"^assets/(?:hero\d+|res)\.npk$", re.I)
 PULL_BATCH_FILES = 100
 PULL_BATCH_CHARS = 24_000
+DEVICE_COMMAND_TIMEOUT = 8
 
 
 def infer_mumu_dir(adb: str) -> str:
@@ -92,9 +95,74 @@ def parse_adb_devices(output: str) -> list[dict[str, str]]:
     return devices
 
 
+def find_mumu_manager(mumu_dir: str) -> str:
+    root = Path(os.path.expandvars(mumu_dir.strip())).expanduser()
+    if root.is_file():
+        root = Path(infer_mumu_dir(str(root)))
+    for relative in ("nx_main/MuMuManager.exe", "shell/MuMuManager.exe",
+                     "MuMuManager.exe", "nx/_main/MuMuManager.exe"):
+        candidate = root / relative
+        if candidate.is_file():
+            return str(candidate.resolve())
+    return ""
+
+
+def parse_mumu_instances(output: str) -> list[dict[str, str]]:
+    """读取管理器报告的运行实例，不把已关闭实例当作连接目标。"""
+    # 部分版本会在 JSON 前输出提示信息。
+    starts = [index for index, char in enumerate(output) if char in "{["]
+    payload = None
+    for start in starts:
+        try:
+            payload, _ = json.JSONDecoder().raw_decode(output[start:])
+            break
+        except ValueError:
+            continue
+    if payload is None:
+        raise ValueError("MuMu 管理器没有返回有效的实例信息。")
+    if isinstance(payload, dict):
+        rows = [payload] if "adb_port" in payload else list(payload.values())
+    elif isinstance(payload, list):
+        rows = payload
+    else:
+        raise ValueError("MuMu 实例信息格式不支持。")
+    instances: dict[str, dict[str, str]] = {}
+    for row in rows:
+        if (
+            not isinstance(row, dict)
+            or row.get("is_process_started") is False
+            or row.get("is_android_started") is False
+        ):
+            continue
+        try:
+            port = int(row.get("adb_port", 0))
+        except (TypeError, ValueError):
+            continue
+        if not 0 < port < 65536:
+            continue
+        host = str(row.get("adb_host_ip") or "127.0.0.1")
+        serial = f"{host}:{port}"
+        instances[serial] = {
+            "serial": serial, "name": str(row.get("name") or ""),
+            "index": str(row.get("index", "")),
+        }
+    return list(instances.values())
+
+
+def local_adb_port_open(serial: str) -> bool:
+    host, separator, port = serial.rpartition(":")
+    if not separator or host not in {"localhost", "127.0.0.1"}:
+        return False
+    try:
+        with socket.create_connection((host, int(port)), timeout=0.3):
+            return True
+    except (OSError, ValueError, OverflowError):
+        return False
+
+
 def format_device_label(device: dict[str, str]) -> str:
     serial = device.get("serial", "")
-    model = device.get("model", "")
+    model = device.get("name") or device.get("model", "")
     return f"{serial}（{model}）" if model else serial
 
 
@@ -489,6 +557,7 @@ class ResourcePullApp:
         cwd: Path | None = None,
         log_command: bool = True,
         log_output: bool = True,
+        timeout: float | None = None,
     ) -> tuple[int, str]:
         if log_command:
             self.events.put(("log", "> " + subprocess.list2cmdline(command)))
@@ -505,22 +574,57 @@ class ResourcePullApp:
         self.current_process = process
         output: list[str] = []
         assert process.stdout is not None
-        for line in process.stdout:
-            output.append(line)
-            if log_output:
-                self.events.put(("log", line))
-        code = process.wait()
+        timer = None
+        timed_out = False
+        if timeout is not None:
+            def stop_late_process() -> None:
+                nonlocal timed_out
+                if process.poll() is None:
+                    timed_out = True
+                    try:
+                        process.kill()
+                    except OSError:
+                        pass
+            timer = threading.Timer(timeout, stop_late_process)
+            timer.daemon = True
+            timer.start()
+        try:
+            for line in process.stdout:
+                output.append(line)
+                if log_output:
+                    self.events.put(("log", line))
+            code = process.wait()
+        finally:
+            if timer is not None:
+                timer.cancel()
         self.current_process = None
+        if timed_out:
+            output.append(f"命令超过 {timeout:g} 秒，已自动终止。\n")
+            code = -1
         return code, "".join(output)
 
     def ensure_device(self, adb: str, device: str) -> None:
-        if ":" in device:
-            code, output = self.run_command([adb, "connect", device])
-            if code != 0:
-                raise RuntimeError(output.strip() or "ADB 连接失败。")
-        code, output = self.run_command([adb, "-s", device, "get-state"])
-        if code != 0 or "device" not in output.lower():
-            raise RuntimeError(output.strip() or f"设备 {device} 当前不可用。")
+        last_output = ""
+        for attempt in range(3):
+            if ":" in device:
+                code, output = self.run_command(
+                    [adb, "connect", device],
+                    timeout=DEVICE_COMMAND_TIMEOUT,
+                )
+                last_output = output
+                if code != 0:
+                    time.sleep(0.5)
+                    continue
+            code, output = self.run_command(
+                [adb, "-s", device, "get-state"],
+                timeout=DEVICE_COMMAND_TIMEOUT,
+            )
+            last_output = output
+            if code == 0 and "device" in output.lower():
+                return
+            if attempt < 2:
+                time.sleep(0.7)
+        raise RuntimeError(last_output.strip() or f"设备 {device} 当前不可用。")
 
     def read_remote_manifest(
         self,
@@ -585,9 +689,33 @@ class ResourcePullApp:
                 if not candidates:
                     raise RuntimeError("找不到 MuMu 目录中的 adb.exe。请选择正确的模拟器目录，或手动指定 ADB 程序。")
                 discovered: dict[str, dict[str, str]] = {}
+                manager = find_mumu_manager(self.mumu_dir_var.get())
+                manager_instances: list[dict[str, str]] = []
+                if manager:
+                    code, output = self.run_command(
+                        [manager, "info", "-v", "all"],
+                        log_output=False,
+                        timeout=DEVICE_COMMAND_TIMEOUT,
+                    )
+                    if code == 0:
+                        try:
+                            manager_instances = parse_mumu_instances(output)
+                        except ValueError:
+                            pass
                 for adb in candidates:
                     try:
-                        code, output = self.run_command([adb, "devices", "-l"], log_output=False)
+                        # MuMu 重启 adb server 后设备不会自动回到列表；主动 connect 可恢复它。
+                        for instance in manager_instances:
+                            self.run_command(
+                                [adb, "connect", instance["serial"]],
+                                log_output=False,
+                                timeout=DEVICE_COMMAND_TIMEOUT,
+                            )
+                        code, output = self.run_command(
+                            [adb, "devices", "-l"],
+                            log_output=False,
+                            timeout=DEVICE_COMMAND_TIMEOUT,
+                        )
                     except OSError:
                         continue
                     if code != 0:
@@ -595,8 +723,25 @@ class ResourcePullApp:
                     for device in parse_adb_devices(output):
                         device["adb"] = adb
                         discovered.setdefault(device["serial"], device)
+                # 管理器能确认 Android 已启动但 adb 输出仍未刷新时，补充端口记录；
+                # 下次实际命令会再次 ensure_device，避免把停止中的实例列出来。
+                for instance in manager_instances:
+                    serial = instance["serial"]
+                    if serial in discovered or not local_adb_port_open(serial):
+                        continue
+                    adb = candidates[0]
+                    code, output = self.run_command(
+                        [adb, "connect", serial],
+                        log_output=False,
+                        timeout=DEVICE_COMMAND_TIMEOUT,
+                    )
+                    if code == 0:
+                        discovered[serial] = {**instance, "adb": adb}
                 if not discovered:
-                    raise RuntimeError("未发现正在运行的模拟器。请确认 MuMu 已启动，并检查目录是否正确。")
+                    raise RuntimeError(
+                        "未发现正在运行的模拟器。MuMu 可能刚重启 ADB，请稍后重试；"
+                        "也可以先点击‘连接并检测’。"
+                    )
                 self.events.put(("devices", list(discovered.values())))
                 self.events.put(("done", f"检测完成，共发现 {len(discovered)} 台可用模拟器。"))
             except Exception as exc:

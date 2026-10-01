@@ -1,5 +1,7 @@
 import unittest
 from unittest import mock
+import tempfile
+from types import SimpleNamespace
 
 from pathlib import Path
 
@@ -70,6 +72,99 @@ def body_mesh(positions):
 
 
 class MeshBindPoseTests(unittest.TestCase):
+    def test_pose_symmetry_ignores_offset_auxiliary_biped(self):
+        names = []
+        matrices = []
+        for rig in ("bip01", "bip02"):
+            for bone_number, bone in enumerate(
+                ("clavicle", "upperarm", "forearm", "hand")
+            ):
+                for side in ("l", "r"):
+                    names.append(f"{rig}_{side}_{bone}")
+                    if rig == "bip01":
+                        x = -float(bone_number + 1) if side == "l" else float(bone_number + 1)
+                    else:
+                        # An offset prop/effect rig is not a mirrored character body.
+                        x = 10.0 + bone_number
+                    matrices.append(translation_matrix(x, 5.0, 0.0))
+
+        score = mesh_gui._bilateral_pose_asymmetry(
+            names, matrices, set(range(len(names)))
+        )
+
+        self.assertIsNotNone(score)
+        self.assertLess(score, 1.0e-6)
+
+    def test_multi_biped_mesh_gets_targeted_pose_cache_revision(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            mesh_path = Path(temporary) / "show.mesh"
+            mesh_path.touch()
+            mesh_gui._MULTI_BIPED_MESH_CACHE.clear()
+            with mock.patch.object(
+                mesh_gui,
+                "read_mesh_bone_layout",
+                return_value=(
+                    ("bip01_l_hand", "bip01_r_hand", "bip02_l_hand"),
+                    (-1, -1, -1),
+                    10,
+                ),
+            ):
+                self.assertTrue(mesh_gui._mesh_has_auxiliary_biped(mesh_path))
+
+    def test_official_single_mesh_package_recovers_full_skeleton(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            model_root = root / "model"
+            thd_root = root / "thd"
+            model_root.mkdir()
+            thd_root.mkdir()
+            (thd_root / "model.thx").touch()
+            (thd_root / "model.thp").touch()
+            mesh_path = model_root / "hero.mesh"
+            skeleton_path = model_root / "hero.skeleton"
+            mesh_path.touch()
+            skeleton_path.touch()
+            records = [
+                SimpleNamespace(name_hash=11, content_md5="a" * 32),
+                SimpleNamespace(name_hash=12, content_md5="b" * 32),
+            ]
+            hierarchy = mesh_gui.SkeletonHierarchy(
+                source=skeleton_path,
+                name="s3_sp_mianlingqi",
+                bone_names=("root", "body", "fx"),
+                bone_keys=("root", "body", "fx"),
+                bone_parents=(-1, 0, 1),
+                bone_bind_transforms=(),
+            )
+            with (
+                mock.patch.object(
+                    mesh_gui,
+                    "_manifest_hash_maps",
+                    return_value=(
+                        {"a" * 32: mesh_path, "b" * 32: skeleton_path},
+                        {},
+                    ),
+                ),
+                mock.patch("thd_resource_index.read_model_thx", return_value=records),
+                mock.patch(
+                    "thd_resource_index.read_model_thp",
+                    return_value={99: [11, 12]},
+                ),
+                mock.patch.object(
+                    mesh_gui,
+                    "read_mesh_bone_layout",
+                    return_value=(("root", "body"), (-1, 0), 100),
+                ),
+                mock.patch.object(
+                    mesh_gui, "read_skeleton_hierarchy", return_value=hierarchy
+                ),
+            ):
+                bindings = mesh_gui.build_official_mesh_skeleton_bindings(
+                    model_root, thd_root, [mesh_path]
+                )
+
+            self.assertEqual(bindings, {mesh_path.resolve(): skeleton_path.resolve()})
+
     def test_face_pose_revision_only_invalidates_matching_skeleton_composites(self):
         package = mesh_gui.MaterialPackage(
             xml_path=Path("material.xml"),

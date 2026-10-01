@@ -1,8 +1,9 @@
 @echo off
 chcp 65001 >nul
 setlocal
-title Onmyoji Arena Resource Pull Tool
-cd /d "%~dp0"
+title Onmyoji Arena PMX Tool
+set "ROOT=%~dp0.."
+cd /d "%ROOT%"
 set "NEOX_GAME_PROFILE=moba"
 
 set "PY_EXE="
@@ -20,7 +21,9 @@ if not defined PY_EXE (
     exit /b 1
 )
 
-"%PY_EXE%" %PY_ARGS% -X utf8 "%~dp0onmyoji_resource_pull_gui.py"
+"%PY_EXE%" %PY_ARGS% -X utf8 "%ROOT%\onmyoji_rigged_mesh_gui.py"
 set "EXIT_CODE=%ERRORLEVEL%"
+echo.
+echo The GUI process has exited. Exit code: %EXIT_CODE%
 if not "%EXIT_CODE%"=="0" pause
 exit /b %EXIT_CODE%

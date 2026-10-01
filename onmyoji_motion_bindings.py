@@ -16,7 +16,7 @@ from pathlib import Path
 from thd_resource_index import read_model_thp, read_model_thx
 
 
-CACHE_SCHEMA = 5
+CACHE_SCHEMA = 7
 CACHE_FILENAME = "official_motion_bindings_v1.json"
 
 
@@ -36,6 +36,7 @@ class OfficialMotionBindings:
     mesh_paths: dict[str, tuple[Path, ...]]
     package_count: int
     mesh_bone_names: dict[str, frozenset[str]] = field(default_factory=dict)
+    mesh_skeleton_paths: dict[str, tuple[Path, ...]] = field(default_factory=dict)
 
     @classmethod
     def load_or_build(cls, workspace: Path) -> "OfficialMotionBindings":
@@ -94,7 +95,17 @@ class OfficialMotionBindings:
                 str(name): frozenset(str(value) for value in values)
                 for name, values in payload.get("mesh_bone_names", {}).items()
             }
-            return cls(motions, meshes, int(payload["package_count"]), mesh_bones)
+            mesh_skeletons = {
+                str(name): tuple(Path(value) for value in values)
+                for name, values in payload.get("mesh_skeleton_paths", {}).items()
+            }
+            return cls(
+                motions,
+                meshes,
+                int(payload["package_count"]),
+                mesh_bones,
+                mesh_skeletons,
+            )
         except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
             return None
 
@@ -121,6 +132,10 @@ class OfficialMotionBindings:
                     key: sorted(values)
                     for key, values in result.mesh_bone_names.items()
                 },
+                "mesh_skeleton_paths": {
+                    key: [str(value) for value in values]
+                    for key, values in result.mesh_skeleton_paths.items()
+                },
                 "package_count": result.package_count,
             }
             temporary = path.with_suffix(".tmp")
@@ -135,7 +150,10 @@ class OfficialMotionBindings:
     @classmethod
     def _build(cls, model_root: Path, thd_root: Path) -> "OfficialMotionBindings":
         from onmyoji_motion import normalized_bone_name, read_motion_header
-        from onmyoji_rigged_mesh_gui import read_mesh_bone_layout
+        from onmyoji_rigged_mesh_gui import (
+            read_mesh_bone_layout,
+            read_skeleton_hierarchy,
+        )
 
         manifest = model_root / "manifest.csv"
         thx_path = thd_root / "model.thx"
@@ -145,6 +163,7 @@ class OfficialMotionBindings:
 
         paths_by_md5: dict[str, list[str]] = {}
         mesh_paths: dict[str, list[Path]] = {}
+        skeleton_paths: dict[str, Path] = {}
         with manifest.open("r", newline="", encoding="utf-8-sig") as stream:
             for row in csv.DictReader(stream):
                 if row.get("status") not in {"ok", "exists"}:
@@ -163,6 +182,8 @@ class OfficialMotionBindings:
                 if relative.lower().endswith(".mesh"):
                     name = _resource_name(relative)
                     mesh_paths.setdefault(name, []).append((model_root / relative).resolve())
+                elif relative.lower().endswith(".skeleton"):
+                    skeleton_paths[relative] = (model_root / relative).resolve()
 
         # THX identifies dependencies by logical name hash.  The extraction
         # manifest only exposes content MD5, so a reused payload cannot prove
@@ -179,6 +200,8 @@ class OfficialMotionBindings:
         motion_to_meshes: dict[str, set[str]] = {}
         motion_bones: dict[str, frozenset[str]] = {}
         mesh_bones: dict[str, frozenset[str]] = {}
+        skeleton_bones: dict[str, frozenset[str]] = {}
+        mesh_skeleton_candidates: dict[str, set[Path]] = {}
 
         def motion_signature(relative: str) -> frozenset[str]:
             cached = motion_bones.get(relative)
@@ -213,11 +236,30 @@ class OfficialMotionBindings:
             mesh_bones[name] = cached
             return cached
 
+        def skeleton_signature(relative: str) -> frozenset[str]:
+            cached = skeleton_bones.get(relative)
+            if cached is not None:
+                return cached
+            try:
+                hierarchy = read_skeleton_hierarchy(skeleton_paths[relative])
+                cached = (
+                    frozenset(
+                        normalized_bone_name(name)
+                        for name in hierarchy.bone_names
+                    )
+                    if hierarchy is not None else frozenset()
+                )
+            except Exception:
+                cached = frozenset()
+            skeleton_bones[relative] = cached
+            return cached
+
         # A parent is the game's own package-level dependency list.  Mapping an
         # animation to its mesh children preserves exactly that relation.
         for children in dependencies.values():
             motions: set[str] = set()
             meshes: set[str] = set()
+            skeletons: set[str] = set()
             for child_hash in children:
                 record = record_by_hash.get(child_hash)
                 if record is None:
@@ -228,17 +270,34 @@ class OfficialMotionBindings:
                         motions.add(normalized)
                     elif normalized.endswith(".mesh"):
                         meshes.add(_resource_name(relative))
+                    elif normalized.endswith(".skeleton"):
+                        skeletons.add(normalized)
             if not motions or not meshes:
                 continue
             for motion in motions:
                 animation_bones = motion_signature(motion)
                 if len(animation_bones) < 4:
                     continue
-                compatible = {
-                    mesh
-                    for mesh in meshes
-                    if animation_bones.issubset(mesh_signature(mesh))
-                }
+                compatible: set[str] = set()
+                for mesh in meshes:
+                    local_bones = mesh_signature(mesh)
+                    if animation_bones.issubset(local_bones):
+                        compatible.add(mesh)
+                        continue
+                    package_skeletons = {
+                        skeleton
+                        for skeleton in skeletons
+                        if local_bones
+                        and local_bones.issubset(skeleton_signature(skeleton))
+                        and animation_bones.issubset(skeleton_signature(skeleton))
+                    }
+                    if len(package_skeletons) != 1:
+                        continue
+                    skeleton = next(iter(package_skeletons))
+                    compatible.add(mesh)
+                    mesh_skeleton_candidates.setdefault(mesh, set()).add(
+                        skeleton_paths[skeleton]
+                    )
                 if compatible:
                     motion_to_meshes.setdefault(motion, set()).update(compatible)
 
@@ -247,6 +306,11 @@ class OfficialMotionBindings:
             {key: tuple(value) for key, value in mesh_paths.items()},
             len(dependencies),
             {key: value for key, value in mesh_bones.items() if value},
+            {
+                key: tuple(paths)
+                for key, paths in mesh_skeleton_candidates.items()
+                if len(paths) == 1
+            },
         )
 
     def candidate_meshes_for_motion(self, motion_path: Path, model_root: Path) -> frozenset[str]:
@@ -276,3 +340,7 @@ class OfficialMotionBindings:
     def bone_names_for_mesh(self, source_mesh: str) -> frozenset[str]:
         """Return the unpack-time bone signature for a logical source Mesh."""
         return self.mesh_bone_names.get(_resource_name(source_mesh), frozenset())
+
+    def source_skeleton_paths(self, source_mesh: str) -> tuple[Path, ...]:
+        """Return the unique official full Skeleton associated with a Mesh."""
+        return self.mesh_skeleton_paths.get(_resource_name(source_mesh), ())

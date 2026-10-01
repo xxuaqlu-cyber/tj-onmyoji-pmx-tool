@@ -1,9 +1,9 @@
 @echo off
 chcp 65001 >nul
 setlocal
-title Onmyoji Arena PMX Preview
-cd /d "%~dp0"
-set "NEOX_GAME_PROFILE=moba"
+title Onmyoji Motion Preview and VMD Export
+set "ROOT=%~dp0.."
+cd /d "%ROOT%"
 
 set "PY_EXE="
 set "PY_ARGS="
@@ -16,16 +16,24 @@ if not defined PY_EXE (
 )
 if not defined PY_EXE (
     echo [ERROR] Python was not found.
+    echo Install 64-bit Python 3.10 or newer and try again.
     pause
     exit /b 1
 )
 
-set "LOG_FILE=%~dp0pmx_preview_moba_error.log"
-"%PY_EXE%" %PY_ARGS% -X utf8 "%~dp0pmx_preview_gui.py" "%~dp0rigged_models_moba\展示高模PMX" >"%LOG_FILE%" 2>&1
+if not exist "%ROOT%\onmyoji_motion_gui.py" (
+    echo [ERROR] onmyoji_motion_gui.py was not found beside this BAT file.
+    pause
+    exit /b 1
+)
+
+set "LOG_FILE=%ROOT%\motion_preview_error.log"
+echo Starting motion preview with: %PY_EXE%
+"%PY_EXE%" %PY_ARGS% -X utf8 "%ROOT%\onmyoji_motion_gui.py" >"%LOG_FILE%" 2>&1
 set "EXIT_CODE=%ERRORLEVEL%"
 if not "%EXIT_CODE%"=="0" (
     echo.
-    echo [ERROR] PMX preview exited with code %EXIT_CODE%.
+    echo [ERROR] Motion preview exited with code %EXIT_CODE%.
     echo Details were saved to: %LOG_FILE%
     type "%LOG_FILE%"
     pause

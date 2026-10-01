@@ -37,8 +37,6 @@ except ImportError:  # pragma: no cover - software fallback remains available
 
 GAME_PROFILE = get_game_profile()
 APP_TITLE = f"{GAME_PROFILE.display_name} PMX 批量预览器"
-MAX_GPU_PREVIEW_FACES = 200_000
-MAX_SOFTWARE_PREVIEW_FACES = 4_000
 MAX_TEXTURE_EDGE = 1024
 GPU_TEXTURE_CACHE_BYTES = 384 * 1024 * 1024
 REPORT_MODES = {
@@ -58,6 +56,7 @@ class PreviewItem:
     category: str
     rarity: str = "未分类"
     role: str = "未分类"
+    skin_name: str = ""
     display_name: str = ""
     source_size: int = 0
     source_mesh: str = ""
@@ -81,6 +80,19 @@ class PreviewData:
     vertex_count: int
     face_count: int
     material_count: int
+    face_materials: np.ndarray | None = None
+    material_names: tuple[str, ...] = ()
+    material_batch_indices: tuple[int, ...] = ()
+    material_texture_indices: tuple[int, ...] = ()
+
+
+def default_export_folder_name(item: PreviewItem) -> str:
+    """Build the editable export default from the resolved hero and skin labels."""
+    role = item.role.strip()
+    skin = item.skin_name.strip()
+    if role and role not in {"未分类", "未匹配"} and skin:
+        return f"{role}_{skin}"
+    return item.path.parent.name
 
 
 def _category_for(path: Path, root: Path) -> str:
@@ -125,8 +137,8 @@ def _role_from_classified_path(path: Path) -> str:
 
 def _attach_role_metadata(root: Path, items: list[PreviewItem]) -> list[PreviewItem]:
     """用分类清单、源 Mesh 和目录结构给预览项补充稀有度与角色。"""
-    by_path: dict[str, tuple[str, str]] = {}
-    classifications_by_mesh: dict[str, set[tuple[str, str]]] = {}
+    by_path: dict[str, tuple[str, str, str]] = {}
+    classifications_by_mesh: dict[str, set[tuple[str, str, str]]] = {}
     catalog = root / "角色分类清单.csv"
     if catalog.is_file():
         with catalog.open("r", newline="", encoding="utf-8-sig") as stream:
@@ -135,7 +147,7 @@ def _attach_role_metadata(root: Path, items: list[PreviewItem]) -> list[PreviewI
                 role = row.get("角色分类", "").strip()
                 if not role:
                     continue
-                classification = (rarity, role)
+                classification = (rarity, role, row.get("皮肤名称", "").strip())
                 raw_path = row.get("PMX", "").strip()
                 if raw_path:
                     catalog_path = Path(raw_path)
@@ -161,9 +173,11 @@ def _attach_role_metadata(root: Path, items: list[PreviewItem]) -> list[PreviewI
             if len(candidates) == 1:
                 classification = next(iter(candidates))
         if classification is None:
-            classification = _classification_from_path(item.path)
+            fallback_rarity, fallback_role = _classification_from_path(item.path)
+            classification = (fallback_rarity, fallback_role, "")
         item.rarity = classification[0] or "未分类"
         item.role = classification[1] or "未分类"
+        item.skin_name = classification[2]
     return items
 
 
@@ -359,8 +373,9 @@ def copy_model_folder(
     destination_root: Path,
     texture_format: str = "default",
     folder_name: str | None = None,
+    mmd_compatible: bool = False,
 ) -> tuple[Path, int]:
-    """Copy a model folder and optionally add exact DDS texture companions."""
+    """Copy a model folder and optionally standardize its PMX skeleton for MMD."""
     source = source.resolve()
     destination_root = destination_root.resolve()
     if not source.is_dir():
@@ -375,7 +390,17 @@ def copy_model_folder(
         target = destination_root / f"{export_name}_{suffix}"
         suffix += 1
     shutil.copytree(source, target)
-    dds_count = _add_dds_copies(target) if texture_format == "dds" else 0
+    try:
+        dds_count = _add_dds_copies(target) if texture_format == "dds" else 0
+        if mmd_compatible:
+            from mmd_pmx_compat import convert_model_folder
+
+            convert_model_folder(target)
+    except Exception:
+        # ``target`` was chosen as a brand-new numbered directory above.  Do not
+        # leave a partial export behind when PMX validation or conversion fails.
+        shutil.rmtree(target, ignore_errors=True)
+        raise
     return target, dds_count
 
 
@@ -582,6 +607,7 @@ def load_preview(path: Path, model=None) -> PreviewData:
 
     material_colors: list[tuple[int, int, int]] = []
     material_texture_indices: list[int] = []
+    material_names: list[str] = []
     face_materials: list[int] = []
     remaining_faces = len(triangles)
     for material_index, material in enumerate(model.materials):
@@ -589,22 +615,49 @@ def load_preview(path: Path, model=None) -> PreviewData:
         texture_index = int(getattr(material, "texture_index", -1))
         material_colors.append(color)
         material_texture_indices.append(texture_index)
+        material_names.append(str(getattr(material, "name", "") or f"材质_{material_index + 1:03d}"))
         count = min(remaining_faces, max(0, int(material.vertex_count) // 3))
         face_materials.extend([material_index] * count)
         remaining_faces -= count
     if not material_colors:
         material_colors.append((150, 165, 190))
         material_texture_indices.append(-1)
+        material_names.append("默认材质")
     if remaining_faces > 0:
         face_materials.extend([0] * remaining_faces)
     face_material_array = np.asarray(face_materials[: len(triangles)], dtype=np.int32)
 
-    if len(triangles) > MAX_GPU_PREVIEW_FACES:
-        selected = np.linspace(
-            0, len(triangles) - 1, MAX_GPU_PREVIEW_FACES, dtype=np.int64
+    # Q models keep several facial expressions in one 2x2 atlas.  Select the
+    # transparent fourth tile for previews as well, including older PMX files
+    # that were generated before the exporter applied this remap.
+    q_face_materials: set[int] = set()
+    if len(triangles):
+        from q_face_atlas import (
+            has_transparent_fourth_tile,
+            is_q_face_material,
+            remap_uv_to_transparent_fourth,
         )
-        triangles = triangles[selected]
-        face_material_array = face_material_array[selected]
+
+        for material_index, material in enumerate(model.materials):
+            texture_index = int(getattr(material, "texture_index", -1))
+            if not (0 <= texture_index < len(texture_paths)):
+                continue
+            texture_reference = str(model.textures[texture_index])
+            if is_q_face_material(str(material.name), texture_reference) and has_transparent_fourth_tile(
+                texture_paths[texture_index]
+            ):
+                q_face_materials.add(material_index)
+        if q_face_materials:
+            q_mask = np.isin(face_material_array, tuple(q_face_materials))
+            q_vertices = set(triangles[q_mask].reshape(-1).tolist())
+            other_vertices = set(triangles[~q_mask].reshape(-1).tolist())
+            for vertex_index in q_vertices - other_vertices:
+                uvs[vertex_index] = remap_uv_to_transparent_fourth(
+                    uvs[vertex_index, 0], uvs[vertex_index, 1]
+                )
+
+    # Keep the complete surface. Uniformly dropping faces is not mesh
+    # simplification: it cuts holes into every object in large scenes.
 
     # Keep faces grouped by material so the GPU can draw each primary texture in
     # one call instead of changing texture for every triangle.
@@ -637,6 +690,7 @@ def load_preview(path: Path, model=None) -> PreviewData:
     palette = np.asarray(material_colors, dtype=np.uint8)
     face_colors = palette[np.clip(face_material_array, 0, len(palette) - 1)]
     material_batches: list[tuple[int, int, int, tuple[int, int, int]]] = []
+    material_batch_indices: list[int] = []
     start = 0
     while start < len(face_material_array):
         material_index = int(face_material_array[start])
@@ -652,6 +706,7 @@ def load_preview(path: Path, model=None) -> PreviewData:
                 gpu_material_colors[safe_index],
             )
         )
+        material_batch_indices.append(material_index)
         start = end
 
     if len(positions):
@@ -676,6 +731,10 @@ def load_preview(path: Path, model=None) -> PreviewData:
         vertex_count=len(model.vertices),
         face_count=usable // 3,
         material_count=len(model.materials),
+        face_materials=face_material_array,
+        material_names=tuple(material_names),
+        material_batch_indices=tuple(material_batch_indices),
+        material_texture_indices=tuple(material_texture_indices),
     )
 
 
@@ -971,6 +1030,9 @@ class GpuPreviewRenderer:
     def render(
         self, width: int, height: int, yaw: float, pitch: float, zoom: float,
         pan_x: float, pan_y: float, wireframe: bool,
+        visible_materials: set[int] | None = None,
+        camera_center: np.ndarray | None = None,
+        camera_radius: float | None = None,
     ) -> Image.Image:
         data = self.data
         vao = self.skin_vao or self.vao
@@ -985,8 +1047,10 @@ class GpuPreviewRenderer:
         self.ctx.wireframe = wireframe
         aspect = width / max(1, height)
         fit = (1.0 / max(1.0, aspect), min(1.0, aspect))
-        program["u_center"].value = tuple(float(value) for value in data.center)
-        program["u_radius"].value = data.radius
+        center = data.center if camera_center is None else camera_center
+        radius = data.radius if camera_radius is None else camera_radius
+        program["u_center"].value = tuple(float(value) for value in center)
+        program["u_radius"].value = radius
         program["u_yaw"].value = yaw
         program["u_pitch"].value = pitch
         program["u_zoom"].value = zoom
@@ -999,7 +1063,15 @@ class GpuPreviewRenderer:
         if self.skin_vao is not None and self.bone_texture is not None:
             program["u_bone_matrices"].value = 1
             self.bone_texture.use(location=1)
-        for first, count, texture_index, color in data.material_batches:
+        for batch_index, (first, count, texture_index, color) in enumerate(data.material_batches):
+            if visible_materials is not None:
+                material_index = (
+                    data.material_batch_indices[batch_index]
+                    if batch_index < len(data.material_batch_indices)
+                    else batch_index
+                )
+                if material_index not in visible_materials:
+                    continue
             texture = self.active_textures.get(texture_index)
             program["u_has_texture"].value = int(texture is not None)
             program["u_base_color"].value = tuple(channel / 255.0 for channel in color)
@@ -1110,6 +1182,9 @@ class PmxPreviewApp(tk.Tk):
         self.preview: PreviewData | None = None
         self.preview_image = None
         self.texture_image = None
+        self.visible_materials: set[int] = set()
+        self.visible_camera_center = np.zeros(3, dtype=np.float32)
+        self.visible_camera_radius = 1.0
         self.load_token = 0
         self.yaw = -0.55
         self.pitch = -0.20
@@ -1124,6 +1199,7 @@ class PmxPreviewApp(tk.Tk):
         self.gpu_error = ""
         self.last_export_dir: Path | None = None
         self.last_export_texture_format = "default"
+        self.last_export_mmd_compatible = False
         self.last_export_folder_name = ""
         self.last_export_source: Path | None = None
         self.classification_refreshing = False
@@ -1226,7 +1302,7 @@ class PmxPreviewApp(tk.Tk):
 
         self.tree = ttk.Treeview(
             left,
-            columns=("order", "rarity", "role", "category", "size"),
+            columns=("order", "rarity", "role", "skin", "category", "size"),
             show="tree headings",
             selectmode="browse",
         )
@@ -1234,18 +1310,22 @@ class PmxPreviewApp(tk.Tk):
         self.tree.heading("order", text="资源序")
         self.tree.heading("rarity", text="稀有度")
         self.tree.heading("role", text="角色")
+        self.tree.heading("skin", text="皮肤")
         self.tree.heading("category", text="范围")
         self.tree.heading("size", text="源大小")
         self.tree.column("#0", width=230)
         self.tree.column("order", width=58, anchor="e")
         self.tree.column("rarity", width=58, anchor="center")
         self.tree.column("role", width=130)
+        self.tree.column("skin", width=150)
         self.tree.column("category", width=90)
         self.tree.column("size", width=70, anchor="e")
         scroll = ttk.Scrollbar(left, command=self.tree.yview)
-        self.tree.configure(yscrollcommand=scroll.set)
+        hscroll = ttk.Scrollbar(left, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=scroll.set, xscrollcommand=hscroll.set)
         self.tree.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
+        hscroll.pack(side="bottom", fill="x")
         self.tree.bind("<<TreeviewSelect>>", self.on_select)
         self.tree.bind("<Double-1>", lambda _event: self.open_external())
         self.tree.bind("<Button-3>", self.show_item_menu)
@@ -1258,7 +1338,10 @@ class PmxPreviewApp(tk.Tk):
             label="导出本模型文件夹…", command=self.choose_export_folder
         )
         self.item_menu.add_command(
-            label="导出到上次选择目录", command=self.export_to_last_folder,
+            label="导出为通用型 PMX…", command=self.choose_mmd_export_folder
+        )
+        self.item_menu.add_command(
+            label="按上次设置导出到上次目录", command=self.export_to_last_folder,
             state="disabled",
         )
         self.item_menu.add_separator()
@@ -1285,6 +1368,23 @@ class PmxPreviewApp(tk.Tk):
         self.canvas.bind("<Double-Button-1>", self.reset_view)
         self.canvas.bind("<MouseWheel>", self.mouse_wheel)
         self.canvas.bind("<Configure>", lambda _event: self.schedule_render())
+
+        material_header = ttk.Frame(right)
+        material_header.pack(fill="x", pady=(4, 2))
+        ttk.Label(
+            material_header,
+            text="材质部位",
+            font=("Microsoft YaHei UI", 11, "bold"),
+        ).pack(side="left")
+        ttk.Button(
+            material_header, text="全选", width=5, command=self.show_all_materials
+        ).pack(side="right")
+        ttk.Button(
+            material_header, text="全不选", width=6, command=self.hide_all_materials
+        ).pack(side="right", padx=(0, 4))
+        self.material_list = tk.Listbox(right, height=8, exportselection=False)
+        self.material_list.pack(fill="x", pady=(0, 6))
+        self.material_list.bind("<Button-1>", self.toggle_material)
 
         ttk.Label(right, text="贴图", font=("Microsoft YaHei UI", 11, "bold")).pack(
             anchor="w", pady=(4, 6)
@@ -1499,6 +1599,7 @@ class PmxPreviewApp(tk.Tk):
                 or term in item.path.name.lower()
                 or term in item.rarity.lower()
                 or term in item.role.lower()
+                or term in item.skin_name.lower()
                 or term in item.source_mesh.lower()
                 or term in str(item.path.parent).lower()
             )
@@ -1543,6 +1644,7 @@ class PmxPreviewApp(tk.Tk):
                     item.source_order if item.source_order >= 0 else "—",
                     item.rarity,
                     item.role,
+                    item.skin_name,
                     item.category,
                     size,
                 ),
@@ -1581,12 +1683,15 @@ class PmxPreviewApp(tk.Tk):
         if token != self.load_token:
             return
         self.preview = data
+        self.visible_materials = self._default_visible_materials(data)
+        self._update_visible_camera()
         if self.gpu_renderer is not None:
             try:
                 self.gpu_renderer.prepare(data)
             except Exception as exc:
                 self.gpu_error = f"{type(exc).__name__}: {exc}"
                 self.gpu_renderer = None
+        self._refresh_material_list()
         self.yaw = -0.55
         self.pitch = -0.20
         self.zoom = 1.0
@@ -1612,6 +1717,7 @@ class PmxPreviewApp(tk.Tk):
             text=(
                 f"分类：{(self.current_item().rarity if self.current_item() else '未分类')} / "
                 f"{(self.current_item().role if self.current_item() else '未分类')}\n"
+                f"皮肤：{(self.current_item().skin_name if self.current_item() and self.current_item().skin_name else '未匹配')}\n"
                 f"顶点：{data.vertex_count:,}\n"
                 f"三角面：{data.face_count:,}\n"
                 f"材质：{data.material_count}\n"
@@ -1622,8 +1728,14 @@ class PmxPreviewApp(tk.Tk):
         backend = "显卡 UV 贴图（黑底/无光照）"
         if self.gpu_renderer is None:
             backend = f"软件简化预览（黑底/无光照；显卡不可用：{self.gpu_error}）"
+        hidden_materials = len(data.material_names) - len(self.visible_materials)
+        scene_note = (
+            f"；场景背景材质已自动隐藏 {hidden_materials} 项，可在右侧重新勾选"
+            if self._is_scene_preview(data) and hidden_materials
+            else ""
+        )
         self.status_var.set(
-            f"{data.path.name} — {backend}；左拖旋转，右/中拖或 Shift+左拖平移，滚轮缩放，双击重置"
+            f"{data.path.name} — {backend}{scene_note}；左拖旋转，右/中拖或 Shift+左拖平移，滚轮缩放，双击重置"
         )
         self.schedule_render()
 
@@ -1638,6 +1750,114 @@ class PmxPreviewApp(tk.Tk):
                 fill="#f08a8a", justify="center",
             )
             self.status_var.set(f"读取失败：{path.name}")
+
+    @staticmethod
+    def _is_scene_preview(data: PreviewData) -> bool:
+        return SCENE_FOLDER_NAME.lower() in {
+            part.lower() for part in data.path.parts
+        }
+
+    @classmethod
+    def _default_visible_materials(cls, data: PreviewData) -> set[int]:
+        """Hide scene-scale backdrop meshes while keeping ordinary materials visible."""
+        visible = set(range(len(data.material_names)))
+        if not cls._is_scene_preview(data) or data.face_materials is None:
+            return visible
+        material_count = len(data.material_names)
+        if material_count == 0 or not len(data.triangles):
+            return visible
+        hidden: set[int] = set()
+        for material_index in range(material_count):
+            face_mask = data.face_materials == material_index
+            if not np.any(face_mask):
+                continue
+            material_name = data.material_names[material_index].lower()
+            texture_index = (
+                data.material_texture_indices[material_index]
+                if material_index < len(data.material_texture_indices)
+                else -1
+            )
+            texture_name = (
+                data.texture_paths[texture_index].name.lower()
+                if 0 <= texture_index < len(data.texture_paths)
+                else ""
+            )
+            backdrop_name = any(
+                word in material_name
+                for word in (
+                    "beijing", "background", "sky", "天空", "背景", "default",
+                    "mountain", "shanshi", "山",
+                )
+            )
+            backdrop_texture = any(
+                word in texture_name
+                for word in ("beijing", "background", "sky", "天空", "背景", "mountain")
+            )
+            scene_layer = re.search(r"shejiaoguangchang02_0[123]", material_name)
+            if backdrop_name or backdrop_texture or scene_layer:
+                hidden.add(material_index)
+        if hidden and len(hidden) < len(visible):
+            visible.difference_update(hidden)
+        return visible
+
+    def _update_visible_camera(self) -> None:
+        data = self.preview
+        if data is None or data.face_materials is None:
+            return
+        face_mask = np.isin(data.face_materials, tuple(self.visible_materials))
+        if not np.any(face_mask):
+            self.visible_camera_center = np.asarray(data.center, dtype=np.float32)
+            self.visible_camera_radius = float(data.radius)
+            return
+        vertex_indices = np.unique(data.triangles[face_mask].reshape(-1))
+        points = data.positions[vertex_indices]
+        center = (points.min(axis=0) + points.max(axis=0)) * 0.5
+        radius = max(float(np.linalg.norm(points - center, axis=1).max()), 1e-6)
+        self.visible_camera_center = np.asarray(center, dtype=np.float32)
+        self.visible_camera_radius = radius
+
+    def _refresh_material_list(self) -> None:
+        material_list = self.__dict__.get("material_list")
+        if material_list is None:
+            return
+        material_list.delete(0, "end")
+        data = self.preview
+        if data is None:
+            return
+        for index, name in enumerate(data.material_names):
+            marker = "☑" if index in self.visible_materials else "☐"
+            material_list.insert("end", f"{marker} {index + 1:03d}  {name}")
+
+    def toggle_material(self, event) -> str:
+        data = self.preview
+        if data is None:
+            return "break"
+        index = int(self.material_list.nearest(event.y))
+        if 0 <= index < len(data.material_names):
+            if index in self.visible_materials:
+                self.visible_materials.remove(index)
+            else:
+                self.visible_materials.add(index)
+            self._update_visible_camera()
+            self._refresh_material_list()
+            self.schedule_render()
+        return "break"
+
+    def show_all_materials(self) -> None:
+        if self.preview is None:
+            return
+        self.visible_materials = set(range(len(self.preview.material_names)))
+        self._update_visible_camera()
+        self._refresh_material_list()
+        self.schedule_render()
+
+    def hide_all_materials(self) -> None:
+        if self.preview is None:
+            return
+        self.visible_materials.clear()
+        self._update_visible_camera()
+        self._refresh_material_list()
+        self.schedule_render()
 
     def schedule_render(self) -> None:
         if self.render_after_id is not None:
@@ -1656,6 +1876,9 @@ class PmxPreviewApp(tk.Tk):
                 image = self.gpu_renderer.render(
                     width, height, self.yaw, self.pitch, self.zoom,
                     self.pan_x, self.pan_y, self.wireframe_var.get(),
+                    self.visible_materials,
+                    self.visible_camera_center,
+                    self.visible_camera_radius,
                 )
                 self.preview_image = ImageTk.PhotoImage(image)
                 self.canvas.delete("all")
@@ -1668,8 +1891,19 @@ class PmxPreviewApp(tk.Tk):
                     f"显卡预览异常，已切换软件简化预览：{self.gpu_error}"
                 )
 
+        triangles = data.triangles
+        face_colors = data.face_colors
+        face_materials = data.face_materials
+        visible_mask = None
+        if face_materials is not None:
+            visible_mask = np.isin(
+                face_materials,
+                tuple(self.visible_materials),
+            )
+            triangles = triangles[visible_mask]
+            face_colors = face_colors[visible_mask]
         points = data.positions.astype(np.float64, copy=True)
-        center = (points.min(axis=0) + points.max(axis=0)) * 0.5
+        center = np.asarray(self.visible_camera_center, dtype=np.float64)
         points -= center
 
         cy, sy = np.cos(self.yaw), np.sin(self.yaw)
@@ -1678,7 +1912,15 @@ class PmxPreviewApp(tk.Tk):
         z = -sy * points[:, 0] + cy * points[:, 2]
         y = cp * points[:, 1] - sp * z
         depth = sp * points[:, 1] + cp * z
-        extent = max(float(np.ptp(x)), float(np.ptp(y)), 1e-6)
+        if len(triangles):
+            camera_vertices = np.unique(triangles.reshape(-1))
+            extent = max(
+                float(np.ptp(x[camera_vertices])),
+                float(np.ptp(y[camera_vertices])),
+                1e-6,
+            )
+        else:
+            extent = max(float(np.ptp(x)), float(np.ptp(y)), 1e-6)
         scale = min(width, height) * 0.82 * self.zoom / extent
         screen = np.column_stack(
             (
@@ -1686,14 +1928,6 @@ class PmxPreviewApp(tk.Tk):
                 height * 0.52 + self.pan_y - y * scale,
             )
         )
-        triangles = data.triangles
-        face_colors = data.face_colors
-        if len(triangles) > MAX_SOFTWARE_PREVIEW_FACES:
-            selected = np.linspace(
-                0, len(triangles) - 1, MAX_SOFTWARE_PREVIEW_FACES, dtype=np.int64
-            )
-            triangles = triangles[selected]
-            face_colors = face_colors[selected]
         order = np.argsort(depth[triangles].mean(axis=1))
 
         image = Image.new("RGB", (width, height), (0, 0, 0))
@@ -1797,6 +2031,10 @@ class PmxPreviewApp(tk.Tk):
             "移动到其他角色分类…",
             state="normal" if can_move else "disabled",
         )
+        self.item_menu.entryconfigure(
+            "导出为通用型 PMX…",
+            state="normal" if item is not None and item.category != "场景" else "disabled",
+        )
         try:
             self.item_menu.tk_popup(event.x_root, event.y_root)
         finally:
@@ -1865,6 +2103,12 @@ class PmxPreviewApp(tk.Tk):
         messagebox.showerror(APP_TITLE, message, parent=self)
 
     def choose_export_folder(self) -> None:
+        self._choose_export_folder(mmd_compatible=False)
+
+    def choose_mmd_export_folder(self) -> None:
+        self._choose_export_folder(mmd_compatible=True)
+
+    def _choose_export_folder(self, *, mmd_compatible: bool) -> None:
         item = self.current_item()
         if item is None:
             return
@@ -1878,7 +2122,7 @@ class PmxPreviewApp(tk.Tk):
         if not value:
             return
         self.last_export_dir = Path(value).resolve()
-        folder_name = self._ask_export_folder_name(item.path.parent)
+        folder_name = self._ask_export_folder_name(item)
         if folder_name is None:
             return
         use_dds = messagebox.askyesno(
@@ -1887,22 +2131,32 @@ class PmxPreviewApp(tk.Tk):
             parent=self,
         )
         self.last_export_texture_format = "dds" if use_dds else "default"
-        self.item_menu.entryconfigure("导出到上次选择目录", state="normal")
-        self._export_current_model_folder(self.last_export_dir, folder_name)
+        self.last_export_mmd_compatible = mmd_compatible
+        self.item_menu.entryconfigure("按上次设置导出到上次目录", state="normal")
+        self._export_current_model_folder(
+            self.last_export_dir,
+            folder_name,
+            mmd_compatible=mmd_compatible,
+        )
 
     def export_to_last_folder(self) -> None:
         item = self.current_item()
         if self.last_export_dir is not None and item is not None:
-            folder_name = self._ask_export_folder_name(item.path.parent)
+            folder_name = self._ask_export_folder_name(item)
             if folder_name is not None:
-                self._export_current_model_folder(self.last_export_dir, folder_name)
+                self._export_current_model_folder(
+                    self.last_export_dir,
+                    folder_name,
+                    mmd_compatible=self.last_export_mmd_compatible,
+                )
 
-    def _ask_export_folder_name(self, source: Path) -> str | None:
+    def _ask_export_folder_name(self, item: PreviewItem) -> str | None:
+        source = item.path.parent
         initial = (
             self.last_export_folder_name
             if self.last_export_source == source.resolve()
             and self.last_export_folder_name
-            else source.name
+            else default_export_folder_name(item)
         )
         value = simpledialog.askstring(
             APP_TITLE,
@@ -1922,7 +2176,11 @@ class PmxPreviewApp(tk.Tk):
         return value
 
     def _export_current_model_folder(
-        self, destination_root: Path, folder_name: str | None = None
+        self,
+        destination_root: Path,
+        folder_name: str | None = None,
+        *,
+        mmd_compatible: bool = False,
     ) -> None:
         item = self.current_item()
         if item is None:
@@ -1941,7 +2199,8 @@ class PmxPreviewApp(tk.Tk):
             return
 
         export_name = folder_name or source.name
-        self.status_var.set(f"正在导出模型文件夹：{export_name}……")
+        export_kind = "通用型 PMX" if mmd_compatible else "模型文件夹"
+        self.status_var.set(f"正在导出{export_kind}：{export_name}……")
 
         def worker() -> None:
             try:
@@ -1950,8 +2209,14 @@ class PmxPreviewApp(tk.Tk):
                     destination_root,
                     self.last_export_texture_format,
                     folder_name=folder_name,
+                    mmd_compatible=mmd_compatible,
                 )
-                self.after(0, lambda: self._finish_folder_export(target, dds_count))
+                self.after(
+                    0,
+                    lambda: self._finish_folder_export(
+                        target, dds_count, mmd_compatible=mmd_compatible
+                    ),
+                )
             except Exception as exc:
                 error_message = f"导出模型文件夹失败：\n{type(exc).__name__}: {exc}"
                 self.after(
@@ -1961,16 +2226,48 @@ class PmxPreviewApp(tk.Tk):
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _finish_folder_export(self, target: Path, dds_count: int = 0) -> None:
-        self.status_var.set(f"已导出模型文件夹：{target}")
+    def _finish_folder_export(
+        self,
+        target: Path,
+        dds_count: int = 0,
+        *,
+        mmd_compatible: bool = False,
+    ) -> None:
+        export_kind = "通用型 PMX" if mmd_compatible else "模型文件夹"
+        self.status_var.set(f"已导出{export_kind}：{target}")
         detail = (
             f"\n\n已生成无压缩 DDS：{dds_count} 张（原 PNG 已保留，PMX 仍引用 PNG）。"
             if dds_count
             else ""
         )
+        if mmd_compatible:
+            missing: list[str] = []
+            try:
+                payload = json.loads(
+                    (target / "MMD骨架兼容报告.json").read_text(encoding="utf-8")
+                )
+                missing = sorted({
+                    name
+                    for model in payload.get("models", [])
+                    for name in model.get("missing_standard_bones", [])
+                })
+            except (OSError, UnicodeError, json.JSONDecodeError, AttributeError):
+                pass
+            if missing:
+                detail += (
+                    "\n\n已完成 MMD 骨架兼容化，但源模型缺少："
+                    + "、".join(missing)
+                    + "。对应动作轨道不会生效。"
+                )
+            else:
+                detail += (
+                    "\n\n已完成 MMD 标准骨架兼容化：标准日文骨名、中心层级、"
+                    "双足/脚尖 IK、标准显示框。"
+                )
+            detail += "\n详细结果见 MMD骨架兼容报告.json。"
         messagebox.showinfo(
             APP_TITLE,
-            f"已复制整个模型文件夹：\n{target}{detail}",
+            f"已导出{export_kind}：\n{target}{detail}",
             parent=self,
         )
 

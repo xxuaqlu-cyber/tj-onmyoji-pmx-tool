@@ -23,6 +23,7 @@ class OfficialMotionBindingsTests(unittest.TestCase):
                 {},
                 1,
                 {"010000_hero.mesh": frozenset({"root", "spine", "head"})},
+                {"010000_hero.mesh": (root / "hero.skeleton",)},
             )
             model_root = root / "unpacked" / "model"
             self.assertTrue(
@@ -37,6 +38,10 @@ class OfficialMotionBindingsTests(unittest.TestCase):
             self.assertEqual(
                 bindings.bone_names_for_mesh("folder/010000_HERO.mesh"),
                 frozenset({"root", "spine", "head"}),
+            )
+            self.assertEqual(
+                bindings.source_skeleton_paths("folder/010000_HERO.mesh"),
+                (root / "hero.skeleton",),
             )
 
 

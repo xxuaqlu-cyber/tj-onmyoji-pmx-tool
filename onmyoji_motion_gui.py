@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Onmyoji RAWANIMA browser with PMX skin preview and VMD export."""
+"""Onmyoji RAWANIMA browser with PMX preview and multi-format export."""
 
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageTk
 
 import pmx_preview_gui as pmx_browser
+from onmyoji_audio import export_motion_audio
 
 from onmyoji_motion_bindings import OfficialMotionBindings
 
@@ -31,6 +32,7 @@ from onmyoji_motion import (
     MotionFormatError,
     MotionHeader,
     compose_global_positions,
+    compose_global_row_matrices,
     compose_global_transforms,
     decode_motion_with_cache_info,
     ensure_decoded_motion_cache,
@@ -54,7 +56,41 @@ from onmyoji_motion import (
 )
 
 
-APP_TITLE = "式神动作预览与 VMD 导出"
+_FACIAL_BONE_ROOT_KEYS = frozenset(
+    normalized_bone_name(value)
+    for value in (
+        "facial_master",
+        "facial_master_skinjnt",
+        "face_master",
+        "face_master_skinjnt",
+        "facial_root",
+        "face_root",
+        "kk_face",
+    )
+)
+
+
+def _facial_bone_indices(
+    names: tuple[str, ...] | list[str], parents: tuple[int, ...] | list[int]
+) -> set[int]:
+    """Return the face-control subtree used by a PMX/NeoX rig."""
+    roots = {
+        index
+        for index, name in enumerate(names)
+        if normalized_bone_name(str(name)) in _FACIAL_BONE_ROOT_KEYS
+    }
+    result = set(roots)
+    changed = True
+    while changed:
+        changed = False
+        for index, parent in enumerate(parents):
+            if index not in result and parent in result:
+                result.add(index)
+                changed = True
+    return result
+
+
+APP_TITLE = "式神动作预览与导出"
 DISPLAY_LIMIT = 5000
 
 
@@ -112,6 +148,7 @@ class MotionPreviewApp(tk.Tk):
         self.root_var = tk.StringVar(value=str(default_root if default_root.is_dir() else base))
         self.pmx_var = tk.StringVar()
         self.search_var = tk.StringVar()
+        self.matching_only_var = tk.BooleanVar(value=True)
         self.pmx_root_var = tk.StringVar(
             value=str(default_pmx_root if default_pmx_root.is_dir() else base / "rigged_models")
         )
@@ -120,13 +157,14 @@ class MotionPreviewApp(tk.Tk):
         self.pmx_role_var = tk.StringVar(value="全部角色")
         self.pmx_search_var = tk.StringVar()
         self.pmx_sort_var = tk.StringVar(value="新到旧")
-        self.status_var = tk.StringVar(value="请选择一个动作，或扫描资源目录。")
+        self.status_var = tk.StringVar(value="请先选择角色模型，再从关联动作中选择预览。")
         self.info_var = tk.StringVar(value="尚未载入动作")
         self.loop_var = tk.BooleanVar(value=True)
         self.speed_var = tk.DoubleVar(value=1.0)
         self.timeline_var = tk.DoubleVar(value=0.0)
 
         self.headers: list[MotionHeader] = []
+        self.model_headers: list[MotionHeader] = []
         self.visible_headers: list[MotionHeader] = []
         self.pmx_items: list[pmx_browser.PreviewItem] = []
         self.visible_pmx_items: list[pmx_browser.PreviewItem] = []
@@ -158,7 +196,6 @@ class MotionPreviewApp(tk.Tk):
         self.gpu_renderer = None
         self.preview_image = None
         self.pmx_load_generation = 0
-        self.motion_filter_active = False
         self.official_motion_bindings: OfficialMotionBindings | None = None
         self.bindings_loading = False
         self.pmx_source_meshes: dict[str, str] = {}
@@ -166,6 +203,7 @@ class MotionPreviewApp(tk.Tk):
         self.predecode_running = False
         self.record_state: dict[str, object] | None = None
         self.batch_export_state: dict[str, object] | None = None
+        self.selected_export_state: dict[str, object] | None = None
         self.fbx_exporting = False
 
         self._build_ui()
@@ -183,9 +221,10 @@ class MotionPreviewApp(tk.Tk):
         self.after(40, self._poll_workers)
         self.after(16, self._tick)
         self.after(1, self._load_cached_motion_catalog)
-        # PMX output trees can contain tens of thousands of files.  Loading
-        # that catalogue is now explicitly user-triggered by “刷新模型”, or
-        # happens after a motion is selected.
+        # The model catalogue is the first step of the workflow.  Discover it
+        # in a worker immediately so the user does not need to pick an action
+        # (or know to press “刷新模型”) before characters become available.
+        self.after(20, self._refresh_pmx_items)
 
     def _load_cached_motion_catalog(self) -> None:
         root = Path(self.root_var.get())
@@ -193,10 +232,14 @@ class MotionPreviewApp(tk.Tk):
         if cached is None:
             return
         self.headers = cached
-        self._apply_filter()
-        self.status_var.set(
-            f"已直接载入解包阶段生成的动作索引：{len(cached):,} 个动作。"
-        )
+        if self.skin is not None:
+            count = self._refresh_actions_for_current_pmx()
+            self.status_var.set(f"动作索引已载入，当前模型关联 {count:,} 个动作。")
+        else:
+            self._apply_filter()
+            self.status_var.set(
+                f"已载入动作索引：{len(cached):,} 个动作；请先选择角色模型。"
+            )
 
     def _build_ui(self) -> None:
         top = ttk.Frame(self, padding=8)
@@ -218,11 +261,24 @@ class MotionPreviewApp(tk.Tk):
         ttk.Button(pmx_row, text="选择目录", command=self._choose_pmx_root).pack(side="left")
         ttk.Button(pmx_row, text="刷新模型", command=self._refresh_pmx_items).pack(side="left", padx=(6, 0))
         ttk.Button(pmx_row, text="打开单个 PMX", command=self._choose_pmx).pack(side="left", padx=(6, 0))
-        ttk.Button(pmx_row, text="导出 VMD", command=self._export).pack(side="left", padx=(6, 0))
+        self.vmd_button = ttk.Button(pmx_row, text="导出 VMD", command=self._export)
+        self.vmd_button.pack(side="left", padx=(6, 0))
         self.fbx_button = ttk.Button(
             pmx_row, text="导出动画 FBX", command=self._export_fbx
         )
         self.fbx_button.pack(side="left", padx=(6, 0))
+        self.dae_button = ttk.Button(
+            pmx_row, text="导出动画 DAE", command=self._export_dae
+        )
+        self.dae_button.pack(side="left", padx=(6, 0))
+        self.stl_button = ttk.Button(
+            pmx_row, text="导出当前帧 STL", command=self._export_stl
+        )
+        self.stl_button.pack(side="left", padx=(6, 0))
+        self.audio_button = ttk.Button(
+            pmx_row, text="导出动作音频", command=self._export_audio
+        )
+        self.audio_button.pack(side="left", padx=(6, 0))
         self.batch_export_button = ttk.Button(
             pmx_row,
             text="一键导出模型全部动作",
@@ -235,16 +291,37 @@ class MotionPreviewApp(tk.Tk):
         left = ttk.Frame(pane, width=360)
         middle = ttk.Frame(pane, width=470)
         right = ttk.Frame(pane)
-        pane.add(left, weight=1)
         pane.add(middle, weight=1)
+        pane.add(left, weight=1)
         pane.add(right, weight=3)
+
+        action_title = ttk.Frame(left)
+        action_title.pack(fill="x", pady=(0, 4))
+        ttk.Label(
+            action_title,
+            text="动作列表",
+            font=("Microsoft YaHei UI", 10, "bold"),
+        ).pack(side="left")
+        self.action_count_label = ttk.Label(action_title, text="请先选模型")
+        self.action_count_label.pack(side="right")
 
         search_row = ttk.Frame(left)
         search_row.pack(fill="x", pady=(0, 6))
         ttk.Label(search_row, text="筛选").pack(side="left")
         ttk.Entry(search_row, textvariable=self.search_var).pack(side="left", fill="x", expand=True, padx=(6, 0))
+        ttk.Checkbutton(
+            search_row,
+            text="仅显示对应动作",
+            variable=self.matching_only_var,
+            command=self._apply_filter,
+        ).pack(side="left", padx=(8, 0))
 
-        self.tree = ttk.Treeview(left, columns=("action", "skeleton", "time"), show="headings")
+        self.tree = ttk.Treeview(
+            left,
+            columns=("action", "skeleton", "time"),
+            show="headings",
+            selectmode="extended",
+        )
         self.tree.heading("action", text="动作")
         self.tree.heading("skeleton", text="骨架")
         self.tree.heading("time", text="时长 / FPS")
@@ -260,7 +337,7 @@ class MotionPreviewApp(tk.Tk):
 
         pmx_title = ttk.Frame(middle)
         pmx_title.pack(fill="x", pady=(0, 4))
-        ttk.Label(pmx_title, text="PMX 模型", font=("Microsoft YaHei UI", 10, "bold")).pack(side="left")
+        ttk.Label(pmx_title, text="角色模型（先选择）", font=("Microsoft YaHei UI", 10, "bold")).pack(side="left")
         self.pmx_count_label = ttk.Label(pmx_title, text="正在读取……")
         self.pmx_count_label.pack(side="right")
 
@@ -318,23 +395,17 @@ class MotionPreviewApp(tk.Tk):
         ttk.Entry(pmx_search, textvariable=self.pmx_search_var).pack(
             side="left", fill="x", expand=True, padx=(5, 0)
         )
-        ttk.Button(
-            pmx_search, text="匹配当前动作", command=self._filter_pmx_for_motion
-        ).pack(side="left", padx=(5, 0))
-
         self.pmx_tree = ttk.Treeview(
             middle,
-            columns=("match", "rarity", "role", "size"),
+            columns=("rarity", "role", "size"),
             show="tree headings",
             selectmode="browse",
         )
         self.pmx_tree.heading("#0", text="模型")
-        self.pmx_tree.heading("match", text="匹配")
         self.pmx_tree.heading("rarity", text="稀有度")
         self.pmx_tree.heading("role", text="角色")
         self.pmx_tree.heading("size", text="源大小")
         self.pmx_tree.column("#0", width=190)
-        self.pmx_tree.column("match", width=45, anchor="center")
         self.pmx_tree.column("rarity", width=55, anchor="center")
         self.pmx_tree.column("role", width=105)
         self.pmx_tree.column("size", width=65, anchor="e")
@@ -401,7 +472,6 @@ class MotionPreviewApp(tk.Tk):
     def _choose_pmx(self) -> None:
         value = filedialog.askopenfilename(filetypes=(("PMX 模型", "*.pmx"),), title="选择配套 PMX")
         if value:
-            self.pmx_var.set(value)
             self._load_pmx(Path(value))
 
     def _choose_pmx_root(self) -> None:
@@ -487,8 +557,6 @@ class MotionPreviewApp(tk.Tk):
             self.pmx_rarity_var.set("全部稀有度")
         self._refresh_pmx_roles()
         self._apply_pmx_filter()
-        if self.motion_filter_active:
-            self._select_best_motion_candidate()
 
     def _pmx_rarity_changed(self) -> None:
         self._refresh_pmx_roles()
@@ -524,8 +592,6 @@ class MotionPreviewApp(tk.Tk):
         self.visible_pmx_items = [
             item
             for item in self.pmx_items
-            if not self.motion_filter_active
-            or self._pmx_match_score(item) > 0
             if (rarity == "全部稀有度" or item.rarity == rarity)
             and (
                 not role
@@ -581,13 +647,12 @@ class MotionPreviewApp(tk.Tk):
             self.pmx_tree.delete(*children)
         for index, item in enumerate(self.visible_pmx_items):
             size = f"{item.source_size / 1024:.0f} KB" if item.source_size else ""
-            match = self._pmx_match_label(item)
             self.pmx_tree.insert(
                 "",
                 "end",
                 iid=str(index),
                 text=item.display_name or item.path.stem,
-                values=(match, item.rarity, item.role, size),
+                values=(item.rarity, item.role, size),
             )
         self.pmx_count_label.configure(
             text=f"{len(self.visible_pmx_items):,}/{len(self.pmx_items):,}"
@@ -597,17 +662,24 @@ class MotionPreviewApp(tk.Tk):
         if self.motion is None:
             return ""
         score = self._pmx_match_score(item)
-        if score >= 100:
+        if score >= 120:
             return "官方+骨架"
-        if score >= 80:
+        if score >= 100:
             return "名称+骨架"
-        if score >= 70:
+        if score >= 90:
             return "名称匹配"
+        if score >= 70:
+            return "同角色候选"
         return ""
 
     @staticmethod
-    def _model_identity_keys(value: str) -> set[str]:
-        """Conservative model/skeleton identities; never use loose substrings."""
+    def _model_identity_keys(value: str, *, keep_variant: bool = False) -> set[str]:
+        """Conservative model/skeleton identities; never use loose substrings.
+
+        ``keep_variant`` retains a leading skin/version token such as ``s1``.
+        This lets callers distinguish an exact skin identity from the looser
+        character-family identity used as a fallback.
+        """
         stem = Path(str(value).replace("\\", "/")).stem.lower()
         stem = re.sub(r"^\d{6}_[0-9a-f]{8,}$", "", stem)
         stem = re.sub(r"_[0-9a-f]{8}$", "", stem)
@@ -617,22 +689,34 @@ class MotionPreviewApp(tk.Tk):
             "show", "skin", "model", "battle", "default", "mirror",
             "默认组件", "yifu", "body",
         }
+        alternate_forms = {"show", "battle", "mirror"}
         separators = {"默认组件", "component", "components"}
         for index, part in enumerate(parts):
             if part not in separators or index == 0:
                 continue
             prefix = parts[:index]
             keys.add(normalized_bone_name("_".join(prefix)))
-            if re.fullmatch(r"[sc]\d+", prefix[0]) or prefix[0] == "j":
+            if (
+                not keep_variant
+                and (re.fullmatch(r"[sc]\d+", prefix[0]) or prefix[0] == "j")
+            ):
                 keys.add(normalized_bone_name("_".join(prefix[1:])))
         trimmed = list(parts)
-        while trimmed and trimmed[-1] in removable:
+        while (
+            trimmed
+            and trimmed[-1] in removable
+            and not (keep_variant and trimmed[-1] in alternate_forms)
+        ):
             trimmed.pop()
             if trimmed:
                 keys.add(normalized_bone_name("_".join(trimmed)))
         # Exported skin/model names commonly add a leading quality or variant
         # token (s2_, s6_, c1_, j_) that is not present in Skeleton names.
-        if parts and (re.fullmatch(r"[sc]\d+", parts[0]) or parts[0] == "j"):
+        if (
+            not keep_variant
+            and parts
+            and (re.fullmatch(r"[sc]\d+", parts[0]) or parts[0] == "j")
+        ):
             without_variant = parts[1:]
             if without_variant:
                 keys.add(normalized_bone_name("_".join(without_variant)))
@@ -642,15 +726,37 @@ class MotionPreviewApp(tk.Tk):
                     keys.add(normalized_bone_name("_".join(without_variant)))
         return {key for key in keys if key}
 
+    @classmethod
+    def _model_identity_match_level(cls, left: str, right: str) -> int:
+        """Return 2 for the same skin/form, 1 for only the same role family."""
+        if cls._model_identity_keys(left, keep_variant=True) & cls._model_identity_keys(
+            right, keep_variant=True
+        ):
+            return 2
+        if cls._model_identity_keys(left) & cls._model_identity_keys(right):
+            return 1
+        return 0
+
+    @staticmethod
+    def _is_awakened_variant(value: str) -> bool:
+        """Return whether an exported model is the game's ``j_`` awakening form."""
+        stem = Path(str(value).replace("\\", "/")).stem.lower()
+        stem = re.sub(r"^\d{6}_[0-9a-f]{8,}", "", stem)
+        stem = re.sub(r"_[0-9a-f]{8}$", "", stem)
+        return bool(re.match(r"^j_[^_]+(?:_|$)", stem))
+
     def _pmx_match_score(self, item: pmx_browser.PreviewItem) -> int:
         """Rank official links and conservative name matches verified by bones."""
         if self.motion is None:
             return 0
-        skeleton_keys = self._model_identity_keys(self.motion.header.skeleton_name)
-        model_keys = set()
+        name_level = 0
         for value in (item.display_name, item.path.stem):
-            model_keys.update(self._model_identity_keys(value))
-        name_match = bool(skeleton_keys & model_keys)
+            name_level = max(
+                name_level,
+                self._model_identity_match_level(
+                    value, self.motion.header.skeleton_name
+                ),
+            )
         if self.official_motion_bindings is not None:
             model_root = Path(__file__).resolve().parent / "unpacked" / "model"
             motion_bones = {
@@ -673,37 +779,20 @@ class MotionPreviewApp(tk.Tk):
             if self.official_motion_bindings.matches_motion(
                 self.motion.header.path, model_root, item.source_mesh
             ):
-                return 120 if name_match else 100
-            if name_match and bone_match:
+                return 125 if name_level >= 2 else 120
+            if name_level >= 2 and bone_match:
+                return 100
+            if name_level >= 2:
+                return 90
+            if name_level and bone_match:
                 return 80
             # If an indexed source Mesh is known and its bones disagree, do
             # not let a similar-looking file name reintroduce a false match.
             if mesh_bones:
                 return 0
-        return 70 if name_match else 0
-
-    def _filter_pmx_for_motion(self) -> None:
-        if self.motion is None:
-            messagebox.showinfo(APP_TITLE, "请先从左侧选择一个动作。")
-            return
-        self.motion_filter_active = True
-        self.pmx_search_var.set("")
-        self._apply_pmx_filter()
-        self._select_best_motion_candidate()
-
-    def _select_best_motion_candidate(self) -> None:
-        if self.motion is None or not self.visible_pmx_items:
-            return
-        recommended = max(
-            range(len(self.visible_pmx_items)),
-            key=lambda index: self._pmx_match_score(self.visible_pmx_items[index]),
-            default=None,
-        )
-        if recommended is not None and self._pmx_match_score(self.visible_pmx_items[recommended]) > 0:
-            iid = str(recommended)
-            self.pmx_tree.selection_set(iid)
-            self.pmx_tree.see(iid)
-            self._pmx_selected()
+        if name_level >= 2:
+            return 90
+        return 70 if name_level else 0
 
     def _pmx_selected(self, _event=None) -> None:
         if (
@@ -719,54 +808,100 @@ class MotionPreviewApp(tk.Tk):
         index = int(selected[0])
         if 0 <= index < len(self.visible_pmx_items):
             item = self.visible_pmx_items[index]
-            self.pmx_var.set(str(item.path))
             self._load_pmx(item.path)
 
     def _source_mesh_layout_for_pmx(
         self,
         pmx_path: Path, pmx_bone_names: tuple[str, ...]
-    ) -> tuple[Path | None, np.ndarray | None]:
+    ) -> tuple[Path | None, np.ndarray | None, tuple[int, ...] | None]:
         """Recover the exported NeoX bind layout from the cached source index."""
-        source_name = self.pmx_source_meshes.get(str(pmx_path.resolve()).lower(), "")
-        if not source_name:
-            metadata_path = pmx_path.parent / ".build.json"
+        source_names = self._current_source_mesh_names(pmx_path)
+        if not source_names or self.official_motion_bindings is None:
+            return None, None, None
+        # Combined exports store components rather than source_mesh.  Their
+        # primary rig is the component with the most bones (the same rule as
+        # merge_parsed_meshes); do not substitute an accessory's bind layout.
+        from onmyoji_rigged_mesh_gui import read_mesh_bone_bind_layout
+        layouts = []
+        for source_name in source_names:
+            candidates = self.official_motion_bindings.source_mesh_paths(source_name)
+            if len(candidates) != 1:
+                continue
             try:
-                source_name = str(
-                    json.loads(metadata_path.read_text(encoding="utf-8")).get(
-                        "source_mesh", ""
-                    )
-                )
-            except (OSError, TypeError, ValueError, json.JSONDecodeError):
-                pass
-        if not source_name or self.official_motion_bindings is None:
-            return None, None
-        candidates = self.official_motion_bindings.source_mesh_paths(source_name)
-        if len(candidates) != 1:
-            return None, None
+                layout = read_mesh_bone_bind_layout(candidates[0])
+                layouts.append((source_name, candidates[0], layout))
+            except Exception:
+                continue
+        if not layouts:
+            return None, None, None
+        source_name, mesh_path, layout = max(layouts, key=lambda item: len(item[2][0]))
         try:
-            from onmyoji_rigged_mesh_gui import read_mesh_bone_bind_layout
+            mesh_names, mesh_parents, matrices = layout
+            # Export may restore a neutral bind pose or expand the official
+            # rig. Recover the layout through the same pipeline as PMX export.
+            skeletons = self.official_motion_bindings.source_skeleton_paths(source_name)
+            from onmyoji_rigged_mesh_gui import parse_mesh_for_pmx
 
-            mesh_names, _mesh_parents, matrices = read_mesh_bone_bind_layout(candidates[0])
+            expanded = parse_mesh_for_pmx(
+                mesh_path, skeletons[0] if len(skeletons) == 1 else None,
+                expand_skeleton=True,
+            )
+            mesh_names = expanded.bone_names
+            mesh_parents = expanded.bone_parents
+            matrices = expanded.bone_matrices
             by_name = {normalized_bone_name(name): index for index, name in enumerate(mesh_names)}
             indices = [by_name.get(normalized_bone_name(name), -1) for name in pmx_bone_names]
             if any(index < 0 for index in indices):
-                return candidates[0], None
-            return candidates[0], np.asarray([matrices[index] for index in indices], dtype=np.float32).reshape(-1, 4, 4)
+                return mesh_path, None, None
+            parent_indices = tuple(
+                int(mesh_parents[index]) if 0 <= int(mesh_parents[index]) < len(mesh_names) else -1
+                for index in indices
+            )
+            parent_by_source_index = {
+                source_index: output_index
+                for output_index, source_index in enumerate(indices)
+            }
+            parents = tuple(
+                parent_by_source_index.get(parent_index, -1)
+                for parent_index in parent_indices
+            )
+            return (
+                mesh_path,
+                np.asarray([matrices[index] for index in indices], dtype=np.float32).reshape(-1, 4, 4),
+                parents,
+            )
         except Exception:
-            return candidates[0], None
+            return mesh_path, None, None
 
-    def _load_pmx(self, path: Path) -> None:
+    def _load_pmx(self, path: Path, *, preserve_motion: bool = False) -> None:
         self.pmx_load_generation += 1
         generation = self.pmx_load_generation
+        if not preserve_motion:
+            self.playing = False
+            self.motion = None
+            self.parents = ()
+            self.motion_bind_transforms = None
+            self.animation_metadata = None
+            self.motion_clip_alignment = None
+            self.skin = None
+            self.model_headers = []
+            self.visible_headers = []
+            self._apply_filter()
+            self.info_var.set("尚未载入动作")
+            self.play_button.configure(text="播放")
+            self.timeline_var.set(0.0)
+            self.timeline.configure(to=1.0)
+            self.time_label.configure(text="0.00 / 0.00 秒")
+            self.canvas.delete("all")
+        self.pmx_var.set(str(path))
+        if self.official_motion_bindings is None:
+            self._load_official_motion_bindings()
         if self.gpu_renderer is None:
             try:
                 from pmx_preview_gui import GpuPreviewRenderer
                 self.gpu_renderer = GpuPreviewRenderer()
             except Exception:
                 self.gpu_renderer = None
-        if self.gpu_renderer is None:
-            self.status_var.set("当前显卡/OpenGL 无法载入模型预览；骨架预览和 VMD 导出仍可使用。")
-            return
         self.status_var.set(f"正在载入 PMX 模型：{path.name}")
 
         def worker() -> None:
@@ -777,7 +912,9 @@ class MotionPreviewApp(tk.Tk):
                 model = pymeshio.pmx.reader.read_from_file(str(path))
                 preview = load_preview(path, model=model)
                 bone_names = tuple(str(bone.name) for bone in model.bones)
-                mesh_path, mesh_bind_matrices = self._source_mesh_layout_for_pmx(path, bone_names)
+                mesh_path, mesh_bind_matrices, mesh_parents = self._source_mesh_layout_for_pmx(
+                    path, bone_names
+                )
                 joints, weights = _extract_pmx_skinning(
                     model.vertices, len(model.bones)
                 )
@@ -797,6 +934,7 @@ class MotionPreviewApp(tk.Tk):
                     "reference_pose": None,
                     "mesh_path": mesh_path,
                     "mesh_bind_matrices": mesh_bind_matrices,
+                    "mesh_parents": mesh_parents,
                 }
                 self.worker_queue.put(("pmx_done", (generation, path, payload)))
             except Exception as exc:
@@ -820,6 +958,7 @@ class MotionPreviewApp(tk.Tk):
         self.scan_generation += 1
         generation = self.scan_generation
         self.headers.clear()
+        self.model_headers.clear()
         self._apply_filter()
         self.status_var.set("正在扫描动作元数据……")
 
@@ -891,8 +1030,13 @@ class MotionPreviewApp(tk.Tk):
 
     def _apply_filter(self) -> None:
         query = self.search_var.get().strip().lower()
+        matching_only_var = self.__dict__.get("matching_only_var")
+        matching_only = (
+            True if matching_only_var is None else bool(matching_only_var.get())
+        )
+        source_headers = self.model_headers if matching_only else self.headers
         self.visible_headers = [
-            header for header in self.headers
+            header for header in source_headers
             if not query or query in f"{header.action} {header.skeleton_name} {header.path}".lower()
         ]
         children = self.tree.get_children()
@@ -903,15 +1047,29 @@ class MotionPreviewApp(tk.Tk):
                 "", "end", iid=str(index),
                 values=(header.action, header.skeleton_name, f"{header.duration:.2f}s / {header.sample_rate:g}"),
             )
+        action_count_label = self.__dict__.get("action_count_label")
+        if action_count_label is not None:
+            if matching_only and self.skin is None:
+                text = "请先选模型"
+            else:
+                text = f"{len(self.visible_headers):,}/{len(source_headers):,}"
+            action_count_label.configure(text=text)
 
     def _tree_selected(self, _event=None) -> None:
-        if self.batch_export_state is not None:
+        if self.batch_export_state is not None or self.selected_export_state is not None:
             return
         selected = self.tree.selection()
-        if selected:
-            index = int(selected[0])
-            if 0 <= index < len(self.visible_headers):
-                self._load_path(self.visible_headers[index].path)
+        # Ctrl/Shift multi-select is used for batch export.  Do not keep
+        # reloading motions while the user is building a selection set.
+        if len(selected) != 1:
+            if selected:
+                self.status_var.set(
+                    f"已选择 {len(selected)} 个动作；点击录制视频或 VMD / FBX / DAE / STL / 动作音频可批量导出。"
+                )
+            return
+        index = int(selected[0])
+        if 0 <= index < len(self.visible_headers):
+            self._load_path(self.visible_headers[index].path)
 
     def _load_path(self, path: Path) -> None:
         if self.record_state is not None or self.fbx_exporting:
@@ -929,8 +1087,6 @@ class MotionPreviewApp(tk.Tk):
         )
         if self.official_motion_bindings is None:
             self._load_official_motion_bindings()
-        if not self.pmx_items:
-            self._refresh_pmx_items()
 
         def worker() -> None:
             try:
@@ -1065,7 +1221,10 @@ class MotionPreviewApp(tk.Tk):
                     generation, headers, failed = payload
                     if generation == self.scan_generation:
                         self.headers = headers
-                        self._apply_filter()
+                        if self.skin is not None:
+                            self._refresh_actions_for_current_pmx()
+                        else:
+                            self._apply_filter()
                         display_note = (
                             f"；列表最多显示 {DISPLAY_LIMIT:,} 条，请用筛选缩小范围"
                             if len(headers) > DISPLAY_LIMIT else ""
@@ -1083,7 +1242,10 @@ class MotionPreviewApp(tk.Tk):
                 elif kind == "predecode_done":
                     headers, reused, decoded, failed = payload
                     self.headers = headers
-                    self._apply_filter()
+                    if self.skin is not None:
+                        self._refresh_actions_for_current_pmx()
+                    else:
+                        self._apply_filter()
                     self.predecode_running = False
                     self.predecode_button.configure(state="normal")
                     cache_root = Path(__file__).resolve().parent / ".motion_cache"
@@ -1121,10 +1283,6 @@ class MotionPreviewApp(tk.Tk):
                         if cache_hit else "首次解码结果已保存"
                     )
                     self.status_var.set(f"动作载入完成（{cache_note}）{suffix}")
-                    if self.batch_export_state is None:
-                        self.motion_filter_active = True
-                        self._apply_pmx_filter()
-                        self._select_best_motion_candidate()
                     self._connect_skin()
                     self._render(0.0)
                     batch_state = self.batch_export_state
@@ -1134,6 +1292,13 @@ class MotionPreviewApp(tk.Tk):
                         == str(motion.header.path.resolve()).lower()
                     ):
                         self.after(1, self._batch_export_current_files)
+                    selected_state = self.selected_export_state
+                    if (
+                        selected_state is not None
+                        and selected_state.get("expected_motion")
+                        == str(motion.header.path.resolve()).lower()
+                    ):
+                        self.after(1, self._export_selected_batch_current)
                 elif kind == "pmx_list_done":
                     items, classifications = payload
                     self.pmx_catalog_loading = False
@@ -1142,13 +1307,11 @@ class MotionPreviewApp(tk.Tk):
                     self.bindings_loading = False
                     self.official_motion_bindings = payload
                     self._apply_pmx_filter()
-                    if self.motion_filter_active:
-                        self._select_best_motion_candidate()
                     # A PMX selected while the index was loading can now get
                     # its exact NeoX bind matrices without a new user action.
                     loaded = Path(self.pmx_var.get())
-                    if loaded.is_file() and self.skin is not None:
-                        self._load_pmx(loaded)
+                    if loaded.is_file():
+                        self._load_pmx(loaded, preserve_motion=True)
                 elif kind == "bindings_error":
                     self.bindings_loading = False
                     self.status_var.set(f"官方资源关联索引不可用：{payload}")
@@ -1159,11 +1322,22 @@ class MotionPreviewApp(tk.Tk):
                     self.skin = skin
                     self.pmx_var.set(str(path))
                     try:
-                        self.gpu_renderer.prepare(self.skin["preview"])
+                        if self.gpu_renderer is not None:
+                            self.gpu_renderer.prepare(self.skin["preview"])
                         self._connect_skin()
+                        match_count = self._refresh_actions_for_current_pmx()
                         if self.motion is None:
-                            self.status_var.set("PMX 模型载入完成；选择动作后将自动套入预览。")
-                        self._render(self.timeline_var.get())
+                            renderer_note = (
+                                ""
+                                if self.gpu_renderer is not None
+                                else "；当前显卡/OpenGL 仅支持骨架预览和导出"
+                            )
+                            self.status_var.set(
+                                f"模型载入完成，找到 {match_count:,} 个关联动作；"
+                                f"请从关联动作列表选择{renderer_note}。"
+                            )
+                        else:
+                            self._render(self.timeline_var.get())
                     except Exception as exc:
                         self.skin = None
                         messagebox.showerror(APP_TITLE, f"PMX 模型预览准备失败：\n{exc}")
@@ -1195,6 +1369,17 @@ class MotionPreviewApp(tk.Tk):
                             )
                 elif kind == "batch_item_error":
                     self._batch_item_finished(str(payload))
+                elif kind == "selected_batch_progress":
+                    current, total_actions, format_name, label, done, total = payload
+                    percent = done * 100.0 / max(1, total)
+                    self.status_var.set(
+                        f"批量导出 {current}/{total_actions} 个已选动作 · {format_name}："
+                        f"{label} {done:,}/{total:,}（{percent:.1f}%）"
+                    )
+                elif kind == "selected_batch_item_done":
+                    self._selected_batch_item_finished()
+                elif kind == "selected_batch_item_error":
+                    self._selected_batch_item_finished(str(payload))
                 elif kind == "batch_error":
                     if self.batch_export_state is not None:
                         self.batch_export_state["failed"].append(str(payload))
@@ -1208,7 +1393,7 @@ class MotionPreviewApp(tk.Tk):
                 elif kind == "fbx_done":
                     path, frames, bones = payload
                     self.fbx_exporting = False
-                    self.fbx_button.configure(state="normal")
+                    self._set_model_export_buttons("normal")
                     self.status_var.set(f"动画 FBX 导出完成：{path}")
                     messagebox.showinfo(
                         APP_TITLE,
@@ -1218,9 +1403,32 @@ class MotionPreviewApp(tk.Tk):
                     )
                 elif kind == "fbx_error":
                     self.fbx_exporting = False
-                    self.fbx_button.configure(state="normal")
+                    self._set_model_export_buttons("normal")
                     self.status_var.set("动画 FBX 导出失败")
                     messagebox.showerror(APP_TITLE, f"动画 FBX 导出失败：\n{payload}")
+                elif kind == "format_progress":
+                    format_name, label, done, total = payload
+                    percent = done * 100.0 / max(1, total)
+                    self.status_var.set(
+                        f"正在导出 {format_name}：{label} "
+                        f"{done:,}/{total:,}（{percent:.1f}%）"
+                    )
+                elif kind == "format_done":
+                    format_name, path, detail = payload
+                    self.fbx_exporting = False
+                    self._set_model_export_buttons("normal")
+                    self.status_var.set(f"{format_name} 导出完成：{path}")
+                    messagebox.showinfo(
+                        APP_TITLE, f"{format_name} 导出完成：\n{path}\n\n{detail}"
+                    )
+                elif kind == "format_error":
+                    format_name, error = payload
+                    self.fbx_exporting = False
+                    self._set_model_export_buttons("normal")
+                    self.status_var.set(f"{format_name} 导出失败")
+                    messagebox.showerror(
+                        APP_TITLE, f"{format_name} 导出失败：\n{error}"
+                    )
                 elif kind == "error":
                     self.status_var.set("动作载入失败")
                     messagebox.showerror(APP_TITLE, str(payload))
@@ -1309,11 +1517,40 @@ class MotionPreviewApp(tk.Tk):
             self.skin["reference_pose"] = None
             self.status_var.set("所选 PMX 与动作没有可映射骨骼；继续显示骨架预览。")
             return
-        reference_local = (
-            self.motion_bind_transforms
-            if self.motion_bind_transforms is not None
-            else self.motion.frames[0]
+        facial_target_indices = _facial_bone_indices(
+            tuple(str(value) for value in self.skin["bone_names"]),
+            tuple(int(value) for value in self.skin.get("parents", ())),
         )
+        self.skin["facial_source_indices"] = tuple(sorted({
+            int(mapping[index])
+            for index in facial_target_indices
+            if 0 <= index < len(mapping) and int(mapping[index]) >= 0
+        }))
+        # Some official packages embed the complete bind layout in Mesh but do
+        # not expose a separately indexed Skeleton.  Recover the animation
+        # parent chain from that Mesh before falling back to an all-root pose.
+        # The source Mesh and the selected PMX use the same bone-name order at
+        # this point, so translate its parent indices through the action map.
+        mesh_parents = self.skin.get("mesh_parents")
+        if (
+            self.motion_bind_transforms is None
+            and mesh_parents is not None
+            and len(mesh_parents) == len(mapping)
+        ):
+            recovered = np.full(
+                len(self.motion.header.bone_names), -1, dtype=np.int32
+            )
+            for target_index, parent in enumerate(mesh_parents):
+                if 0 <= int(parent) < len(mapping):
+                    raw_index = int(mapping[target_index])
+                    raw_parent = int(mapping[int(parent)])
+                    if (
+                        0 <= raw_index < len(recovered)
+                        and 0 <= raw_parent < len(recovered)
+                    ):
+                        recovered[raw_index] = raw_parent
+            self.parents = tuple(int(value) for value in recovered)
+        reference_local = self._motion_reference_local()
         self.skin["reference_pose"] = compose_global_transforms(
             reference_local, self.parents
         )
@@ -1328,12 +1565,48 @@ class MotionPreviewApp(tk.Tk):
             reference_matrices
         )
         target_bind = self.skin.get("mesh_bind_matrices")
+        self.skin["absolute_source_pose"] = False
         if target_bind is not None:
             bind_pmx = neox_to_pmx_matrix4(
                 np.asarray(target_bind, dtype=np.float32)
             )
             self.skin["bind_pmx"] = bind_pmx
             self.skin["bind_pmx_inverse"] = inverse_affine_row_matrix4(bind_pmx)
+            biped_prefixes = {
+                match.group(1)
+                for name in self.skin["bone_names"]
+                if (
+                    match := re.match(
+                        r"^(bip\d+)_", str(name).strip().lower()
+                    )
+                )
+            }
+            if (
+                self.motion_bind_transforms is not None
+                and "bip01" in biped_prefixes
+                and len(biped_prefixes) > 1
+            ):
+                source_bind_global = compose_global_row_matrices(
+                    self.motion_bind_transforms, self.parents
+                )
+                shared_deltas = [
+                    float(
+                        np.max(
+                            np.abs(
+                                np.asarray(target_bind[target_index])
+                                - source_bind_global[int(raw_index)]
+                            )
+                        )
+                    )
+                    for target_index, raw_index in enumerate(mapping)
+                    if raw_index >= 0
+                    and str(self.skin["bone_names"][target_index])
+                    .strip().lower().startswith("bip01_")
+                ]
+                self.skin["absolute_source_pose"] = bool(
+                    shared_deltas and max(shared_deltas) > 1.0e-3
+                )
+            self.skin["absolute_source_pose"] |= self._uses_source_skeleton(mapping)
         gpu_note = ""
         if self.gpu_renderer is not None:
             try:
@@ -1348,10 +1621,16 @@ class MotionPreviewApp(tk.Tk):
                 gpu_note = f"；GPU 蒙皮不可用，已回退 CPU（{exc}）"
         if self.motion_bind_transforms is not None:
             note = "已使用 Skeleton 精确绑定姿势"
+        elif self.skin.get("mesh_bind_matrices") is not None:
+            note = "已使用源 Mesh 精确绑定姿势"
         else:
             note = "未找到绑定姿势，暂以动作首帧校准"
         if self.skin.get("mesh_bind_matrices") is not None:
             note += "；预览蒙皮已使用原始 Mesh bind 矩阵"
+        if self.skin.get("absolute_source_pose"):
+            note += "；动作已补偿 Mesh/Skeleton 初始姿态差"
+        if self.skin.get("facial_source_indices"):
+            note += "；面部动作按 Mesh 中性表情校准"
         self.status_var.set(
             f"PMX 动作匹配完成：{len(matched)}/{len(mapping)} 根骨骼"
             f"（其中皮肤别名映射 {relaxed}）；"
@@ -1429,6 +1708,73 @@ class MotionPreviewApp(tk.Tk):
             values.add(normalized_bone_name(parts[-1]))
         return {value for value in values if value}
 
+    def _uses_source_skeleton(self, mapping: np.ndarray) -> bool:
+        """Require an official shared rig before using absolute clip poses."""
+        if self.motion_bind_transforms is None or self.skin is None or self.motion is None:
+            return False
+        mesh_path = self.skin.get("mesh_path")
+        bindings = getattr(self, "official_motion_bindings", None)
+        if mesh_path is None or bindings is None or np.any(mapping < 0):
+            return False
+        # Alias matches are useful for retargeting but do not establish that
+        # the model and animation share the same coordinate system.
+        for index, raw_index in enumerate(mapping):
+            if normalized_bone_name(self.skin["bone_names"][index]) != normalized_bone_name(
+                self.motion.header.bone_names[int(raw_index)]
+            ):
+                return False
+        from onmyoji_rigged_mesh_gui import read_skeleton_hierarchy, _match_skeleton_hierarchy
+
+        hierarchies = [
+            read_skeleton_hierarchy(path)
+            for path in bindings.source_skeleton_paths(Path(mesh_path).name)
+        ]
+        if not hierarchies:
+            from types import SimpleNamespace
+
+            hierarchies = [_match_skeleton_hierarchy(
+                SimpleNamespace(bone_names=list(self.skin["bone_names"])), Path(mesh_path)
+            )]
+        for hierarchy in hierarchies:
+            if hierarchy is None:
+                continue
+            wanted = self.motion.header.skeleton_name.lower()
+            if hierarchy.name.lower() == wanted or hierarchy.name.lower().startswith(wanted + "_"):
+                return True
+        return bindings.matches_motion(
+            self.motion.header.path, Path(self.root_var.get()), Path(mesh_path).name
+        )
+
+    def _motion_reference_local(self) -> np.ndarray:
+        """Build the source reference pose used for motion deltas.
+
+        Some official Skeleton files keep a facial controller reference pose
+        that differs from the expression already baked into the Mesh.  Keep
+        the Mesh's facial pose as the reference and apply only facial changes
+        after the clip's first frame; body bones continue to use the exact
+        Skeleton bind pose.
+        """
+        if self.motion is None:
+            return np.empty((0, 10), dtype=np.float32)
+        reference = np.asarray(
+            self.motion_bind_transforms
+            if self.motion_bind_transforms is not None
+            else self.motion.frames[0],
+            dtype=np.float32,
+        ).copy()
+        facial_indices = tuple(
+            int(index) for index in (self.skin or {}).get("facial_source_indices", ())
+        )
+        if self.motion_bind_transforms is not None and facial_indices:
+            valid = [
+                index
+                for index in facial_indices
+                if 0 <= index < len(reference) and index < self.motion.frames.shape[1]
+            ]
+            if valid:
+                reference[valid] = np.asarray(self.motion.frames[0, valid], dtype=np.float32)
+        return reference
+
     @staticmethod
     def _rotate_vectors(quaternions: np.ndarray, values: np.ndarray) -> np.ndarray:
         vector = quaternions[:, :3]
@@ -1445,7 +1791,7 @@ class MotionPreviewApp(tk.Tk):
         orientation or non-uniform scale, which is why they cannot correctly
         drive another form of the same character.
         """
-        if self.skin is None or self.motion is None or self.motion_bind_transforms is None:
+        if self.skin is None or self.motion is None:
             return None
         target_bind = self.skin.get("mesh_bind_matrices")
         mapping = self.skin.get("mapping")
@@ -1457,7 +1803,7 @@ class MotionPreviewApp(tk.Tk):
         if target_bind.shape != (count, 4, 4) or len(mapping) != count:
             return None
         target_parents = tuple(int(value) for value in self.skin.get("parents", ()))
-        reference = np.asarray(self.motion_bind_transforms, dtype=np.float32)
+        reference = self._motion_reference_local()
         source = self.motion.frames[frame]
         if len(reference) != len(source):
             return None
@@ -1469,6 +1815,9 @@ class MotionPreviewApp(tk.Tk):
         source_delta = matrix4_multiply(
             reference_inverse, trs_row_matrices(source)
         )
+        absolute = bool(self.skin.get("absolute_source_pose"))
+        source_globals = compose_global_row_matrices(source, self.parents) if absolute else None
+        facial_sources = set(self.skin.get("facial_source_indices", ()))
         target_current = np.zeros_like(target_bind)
         visiting = np.zeros(count, dtype=np.uint8)
 
@@ -1476,6 +1825,13 @@ class MotionPreviewApp(tk.Tk):
             if visiting[index] == 2:
                 return
             visiting[index] = 1
+            raw_index = int(mapping[index])
+            if absolute and 0 <= raw_index < len(source_delta) and raw_index not in facial_sources:
+                # These globals are independent of target traversal. Avoid
+                # recomputing bind inverses for every body bone on every tick.
+                target_current[index] = source_globals[raw_index]
+                visiting[index] = 2
+                return
             parent = target_parents[index] if index < len(target_parents) else -1
             if not (0 <= parent < count) or parent == index or visiting[parent] == 1:
                 parent = -1
@@ -1486,7 +1842,6 @@ class MotionPreviewApp(tk.Tk):
                 )
             else:
                 bind_local = target_bind[index]
-            raw_index = int(mapping[index])
             current_local = bind_local
             if 0 <= raw_index < len(source_delta):
                 current_local = matrix4_multiply(bind_local, source_delta[raw_index])
@@ -1899,8 +2254,155 @@ class MotionPreviewApp(tk.Tk):
         )
         return frame_count, bone_count
 
+    def _set_model_export_buttons(self, state: str) -> None:
+        for name in (
+            "vmd_button",
+            "fbx_button",
+            "dae_button",
+            "stl_button",
+            "audio_button",
+        ):
+            button = self.__dict__.get(name)
+            if button is not None:
+                button.configure(state=state)
+
+    def _write_dae_file(
+        self,
+        output_path: Path,
+        pmx_path: Path,
+        motion: DecodedMotion,
+        skin: dict[str, object],
+        report,
+    ) -> tuple[int, int]:
+        """Write one animated COLLADA file using the preview's exact poses."""
+        import pymeshio.pmx.reader
+        from onmyoji_exchange import write_animated_dae
+
+        model = pymeshio.pmx.reader.read_from_file(str(pmx_path))
+        bone_names = list(skin["bone_names"])
+        parents = tuple(int(value) for value in skin["parents"])
+        frame_count = motion.sample_count
+        bone_count = len(bone_names)
+        bind_globals, _ = self._fbx_global_poses(0)
+        bind_locals = self._global_to_local_matrices(bind_globals, parents)
+        frame_locals = np.empty(
+            (frame_count, bone_count, 4, 4), dtype=np.float32
+        )
+        for frame in range(frame_count):
+            _bind, current_globals = self._fbx_global_poses(frame)
+            frame_locals[frame] = self._global_to_local_matrices(
+                current_globals, parents
+            )
+            if frame % 5 == 0 or frame + 1 == frame_count:
+                report("烘焙骨骼矩阵", frame + 1, frame_count)
+
+        positions = np.asarray(
+            [(v.position.x, v.position.y, v.position.z) for v in model.vertices],
+            dtype=np.float32,
+        )
+        normals = np.asarray(
+            [(v.normal.x, v.normal.y, v.normal.z) for v in model.vertices],
+            dtype=np.float32,
+        )
+        uvs = np.asarray(
+            [(v.uv.x, v.uv.y) for v in model.vertices], dtype=np.float32
+        )
+        raw_indices = np.asarray(model.indices, dtype=np.int32)
+        triangles = raw_indices[
+            : len(raw_indices) - len(raw_indices) % 3
+        ].reshape(-1, 3)
+        face_materials: list[int] = []
+        remaining = len(triangles)
+        for material_index, material in enumerate(model.materials):
+            count = min(remaining, max(0, int(material.vertex_count) // 3))
+            face_materials.extend([material_index] * count)
+            remaining -= count
+        if remaining:
+            face_materials.extend([0] * remaining)
+
+        texture_dir = output_path.parent / f"{output_path.stem}_textures"
+        copied_textures: dict[int, Path] = {}
+        material_defs: list[dict[str, object]] = []
+        for index, material in enumerate(model.materials):
+            texture_index = int(getattr(material, "texture_index", -1))
+            texture_target = None
+            if 0 <= texture_index < len(model.textures):
+                source = pmx_path.parent / str(
+                    model.textures[texture_index]
+                ).replace("\\", os.sep).replace("/", os.sep)
+                if source.is_file():
+                    texture_target = copied_textures.get(texture_index)
+                    if texture_target is None:
+                        texture_dir.mkdir(parents=True, exist_ok=True)
+                        texture_target = (
+                            texture_dir / f"{texture_index:03d}_{source.name}"
+                        )
+                        if (
+                            not texture_target.is_file()
+                            or texture_target.stat().st_size != source.stat().st_size
+                        ):
+                            temporary = texture_target.with_suffix(
+                                texture_target.suffix + ".tmp"
+                            )
+                            shutil.copyfile(source, temporary)
+                            temporary.replace(texture_target)
+                        copied_textures[texture_index] = texture_target
+            color = getattr(material, "diffuse_color", None)
+            material_defs.append(
+                {
+                    "name": str(
+                        getattr(material, "name", "") or f"Material_{index:03d}"
+                    ),
+                    "diffuse": (
+                        float(getattr(color, "r", 0.8)),
+                        float(getattr(color, "g", 0.8)),
+                        float(getattr(color, "b", 0.8)),
+                        float(getattr(material, "alpha", 1.0)),
+                    ),
+                    "texture": texture_target,
+                    "relative_texture": (
+                        str(texture_target.relative_to(output_path.parent)).replace(
+                            "\\", "/"
+                        )
+                        if texture_target is not None
+                        else ""
+                    ),
+                }
+            )
+        if len(positions) != len(skin["joints"]):
+            raise MotionFormatError(
+                "当前 PMX 已变化，请重新载入模型后再导出 DAE。"
+            )
+        write_animated_dae(
+            output_path,
+            model_name=pmx_path.stem,
+            positions=positions,
+            normals=normals,
+            uvs=uvs,
+            triangles=triangles,
+            face_materials=np.asarray(face_materials, dtype=np.int32),
+            material_defs=material_defs,
+            joints=np.asarray(skin["joints"], dtype=np.int32),
+            weights=np.asarray(skin["weights"], dtype=np.float32),
+            bone_names=bone_names,
+            parents=parents,
+            bind_globals=bind_globals,
+            bind_locals=bind_locals,
+            frame_locals=frame_locals,
+            fps=motion.sample_rate,
+            progress=report,
+        )
+        return frame_count, bone_count
+
     def _export_fbx(self) -> None:
-        if self.record_state is not None or self.fbx_exporting:
+        if (
+            self.record_state is not None
+            or self.fbx_exporting
+            or self.batch_export_state is not None
+            or self.selected_export_state is not None
+        ):
+            return
+        if self._try_start_selected_batch_export("fbx"):
             return
         motion = self.motion
         skin = self.skin
@@ -1931,7 +2433,7 @@ class MotionPreviewApp(tk.Tk):
         self.playing = False
         self.play_button.configure(text="播放")
         self.fbx_exporting = True
-        self.fbx_button.configure(state="disabled")
+        self._set_model_export_buttons("disabled")
         self.status_var.set("正在准备动画 FBX：读取完整 PMX……")
 
         def report(label: str, done: int, total: int) -> None:
@@ -2075,6 +2577,164 @@ class MotionPreviewApp(tk.Tk):
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _export_dae(self) -> None:
+        if (
+            self.record_state is not None
+            or self.fbx_exporting
+            or self.batch_export_state is not None
+            or self.selected_export_state is not None
+        ):
+            return
+        if self._try_start_selected_batch_export("dae"):
+            return
+        motion = self.motion
+        skin = self.skin
+        pmx_path = Path(self.pmx_var.get())
+        if motion is None:
+            messagebox.showinfo(APP_TITLE, "请先载入一个动作。")
+            return
+        if skin is None or not pmx_path.is_file():
+            messagebox.showinfo(APP_TITLE, "请先选择并载入当前动作绑定的 PMX。")
+            return
+        if skin.get("mapping") is None or skin.get("reference_pose") is None:
+            messagebox.showinfo(
+                APP_TITLE, "当前 PMX 尚未完成动作骨骼绑定，不能导出动画 DAE。"
+            )
+            return
+        default = self._safe_export_name(
+            f"{pmx_path.stem}_{motion.header.action}", "动画模型"
+        )
+        value = filedialog.asksaveasfilename(
+            defaultextension=".dae",
+            initialfile=f"{default}.dae",
+            filetypes=(
+                ("COLLADA 动画模型", "*.dae"),
+                ("DEA 扩展名（COLLADA 内容）", "*.dea"),
+            ),
+            title="导出当前绑定动作的 DAE/DEA",
+        )
+        if not value:
+            return
+        output_path = Path(value).resolve()
+        self.playing = False
+        self.play_button.configure(text="播放")
+        self.fbx_exporting = True
+        self._set_model_export_buttons("disabled")
+        self.status_var.set("正在准备动画 DAE：读取完整 PMX……")
+
+        def report(label: str, done: int, total: int) -> None:
+            self.worker_queue.put(
+                ("format_progress", ("动画 DAE", label, done, total))
+            )
+
+        def worker() -> None:
+            try:
+                frames, bones = self._write_dae_file(
+                    output_path, pmx_path, motion, skin, report
+                )
+                self.worker_queue.put(
+                    (
+                        "format_done",
+                        (
+                            "动画 DAE",
+                            output_path,
+                            f"{frames:,} 帧 · {bones:,} 根骨骼\n"
+                            "已写入网格、材质贴图、蒙皮、骨架和矩阵动画。",
+                        ),
+                    )
+                )
+            except Exception as exc:
+                self.worker_queue.put(
+                    (
+                        "format_error",
+                        ("动画 DAE", f"{type(exc).__name__}: {exc}"),
+                    )
+                )
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _export_stl(self) -> None:
+        if (
+            self.record_state is not None
+            or self.fbx_exporting
+            or self.batch_export_state is not None
+            or self.selected_export_state is not None
+        ):
+            return
+        if self._try_start_selected_batch_export("stl"):
+            return
+        motion = self.motion
+        skin = self.skin
+        pmx_path = Path(self.pmx_var.get())
+        if motion is None:
+            messagebox.showinfo(APP_TITLE, "请先载入一个动作。")
+            return
+        if skin is None or not pmx_path.is_file():
+            messagebox.showinfo(APP_TITLE, "请先选择并载入当前动作绑定的 PMX。")
+            return
+        if skin.get("mapping") is None or skin.get("reference_pose") is None:
+            messagebox.showinfo(
+                APP_TITLE, "当前 PMX 尚未完成动作骨骼绑定，不能导出当前帧 STL。"
+            )
+            return
+        frame = min(
+            motion.sample_count - 1,
+            max(0, int(round(self.timeline_var.get() * motion.sample_rate))),
+        )
+        positions = self._skin_positions(frame)
+        preview = skin.get("preview")
+        if positions is None or preview is None:
+            messagebox.showerror(APP_TITLE, "当前帧无法生成已蒙皮网格。")
+            return
+        triangles = np.asarray(preview.triangles, dtype=np.int32).copy()
+        default = self._safe_export_name(
+            f"{pmx_path.stem}_{motion.header.action}_frame_{frame:04d}",
+            "动作当前帧",
+        )
+        value = filedialog.asksaveasfilename(
+            defaultextension=".stl",
+            initialfile=f"{default}.stl",
+            filetypes=(("STL 当前帧模型", "*.stl"),),
+            title="导出时间轴当前帧 STL",
+        )
+        if not value:
+            return
+        output_path = Path(value).resolve()
+        self.fbx_exporting = True
+        self._set_model_export_buttons("disabled")
+        self.status_var.set(f"正在导出当前帧 STL：第 {frame} 帧……")
+
+        def worker() -> None:
+            try:
+                from onmyoji_exchange import write_binary_stl
+
+                write_binary_stl(
+                    output_path,
+                    positions,
+                    triangles,
+                    solid_name=f"{pmx_path.stem} frame {frame}",
+                )
+                self.worker_queue.put(
+                    (
+                        "format_done",
+                        (
+                            "当前帧 STL",
+                            output_path,
+                            f"第 {frame} 帧 · {len(triangles):,} 个三角面。\n"
+                            "STL 不包含骨架、动画、材质或贴图。",
+                        ),
+                    )
+                )
+            except Exception as exc:
+                self.worker_queue.put(
+                    (
+                        "format_error",
+                        ("当前帧 STL", f"{type(exc).__name__}: {exc}"),
+                    )
+                )
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def _render_frame_image(
         self, seconds: float, width: int, height: int
     ) -> tuple[Image.Image, int]:
@@ -2194,22 +2854,21 @@ class MotionPreviewApp(tk.Tk):
         source_meshes = self._current_source_mesh_names(pmx_path)
         target_names = tuple(str(value) for value in self.skin["bone_names"])
         target_keys = {normalized_bone_name(value) for value in target_names}
-        model_keys = self._model_identity_keys(pmx_path.stem)
         model_root = Path(__file__).resolve().parent / "unpacked" / "model"
         official_source_names = {
             Path(value.replace("\\", "/")).name.lower()
             for value in source_meshes
         }
         ranked: list[tuple[int, MotionHeader]] = []
-        skeleton_match_cache: dict[str, bool] = {}
+        identity_level_cache: dict[str, int] = {}
         bone_signature_cache: dict[tuple[str, ...], set[str]] = {}
         for header in headers:
-            name_match = skeleton_match_cache.get(header.skeleton_name)
-            if name_match is None:
-                name_match = bool(
-                    model_keys & self._model_identity_keys(header.skeleton_name)
+            identity_level = identity_level_cache.get(header.skeleton_name)
+            if identity_level is None:
+                identity_level = self._model_identity_match_level(
+                    pmx_path.stem, header.skeleton_name
                 )
-                skeleton_match_cache[header.skeleton_name] = name_match
+                identity_level_cache[header.skeleton_name] = identity_level
             official = False
             if self.official_motion_bindings is not None and official_source_names:
                 try:
@@ -2226,7 +2885,7 @@ class MotionPreviewApp(tk.Tk):
             # A skeleton identity or an official package edge is required
             # before the costlier bone comparison.  Bone-count equality alone
             # is far too common across unrelated humanoid characters.
-            if not official and not name_match:
+            if not official and not identity_level:
                 continue
             motion_keys = bone_signature_cache.get(header.bone_names)
             if motion_keys is None:
@@ -2250,15 +2909,30 @@ class MotionPreviewApp(tk.Tk):
                 or motion_keys.issubset(target_keys)
                 or (overlap >= 0.95 and count_close)
             )
+            # Awakening models use a ``j_`` mesh name but the game reuses the
+            # base character's ``lixiaolang.skeleton`` and RAWANIMA clips.
+            # Their exported PMX can contain a few extra/omitted accessory
+            # bones, so the normal count gate rejects an otherwise valid
+            # shared-character clip.  Keep the relaxed path limited to the
+            # explicit awakening variant and require 90% bone coverage.
+            if (
+                not bone_compatible
+                and identity_level == 1
+                and self._is_awakened_variant(pmx_path.stem)
+                and overlap >= 0.90
+            ):
+                bone_compatible = True
             # Official package edges must still pass the actual loaded PMX rig;
             # package accessory meshes are a common source of false candidates.
             if not bone_compatible:
                 continue
             if official:
                 score = 300
-            elif name_match and exact_bones:
+            elif identity_level >= 2 and exact_bones:
+                score = 240
+            elif identity_level >= 2:
                 score = 220
-            elif name_match:
+            elif identity_level:
                 score = 180
             else:
                 continue
@@ -2284,13 +2958,317 @@ class MotionPreviewApp(tk.Tk):
             unique.setdefault(key, header)
         return list(unique.values())
 
+    def _refresh_actions_for_current_pmx(self) -> int:
+        """Populate the action pane from the currently loaded model only."""
+        self.model_headers = self._matching_headers_for_current_pmx()
+        self._apply_filter()
+        return len(self.model_headers)
+
     @staticmethod
     def _safe_export_name(value: str, fallback: str) -> str:
         return re.sub(
             r"[^0-9A-Za-z_\-\u4e00-\u9fff]+", "_", value
         ).strip("_") or fallback
 
+    def _selected_action_headers(self) -> list[MotionHeader]:
+        selected = self.tree.selection()
+        indices: list[int] = []
+        for item_id in selected:
+            try:
+                index = int(item_id)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= index < len(self.visible_headers):
+                indices.append(index)
+        return [self.visible_headers[index] for index in sorted(set(indices))]
+
+    def _try_start_selected_batch_export(self, format_key: str) -> bool:
+        headers = self._selected_action_headers()
+        if len(headers) <= 1:
+            return False
+        self._start_selected_batch_export(format_key, headers)
+        return True
+
+    def _start_selected_batch_export(
+        self, format_key: str, headers: list[MotionHeader]
+    ) -> None:
+        if (
+            self.record_state is not None
+            or self.fbx_exporting
+            or self.batch_export_state is not None
+            or self.selected_export_state is not None
+        ):
+            return
+        format_info = {
+            "vmd": ("VMD", ".vmd"),
+            "fbx": ("FBX", ".fbx"),
+            "dae": ("DAE", ".dae"),
+            "stl": ("STL", ".stl"),
+            "mp4": ("MP4 视频", ".mp4"),
+            "audio": ("动作音频", ""),
+        }.get(format_key)
+        if format_info is None:
+            return
+        format_name, extension = format_info
+        pmx_path = Path(self.pmx_var.get())
+        if format_key != "audio" and (self.skin is None or not pmx_path.is_file()):
+            messagebox.showinfo(APP_TITLE, "请先选择并载入一个 PMX 模型。")
+            return
+        destination = filedialog.askdirectory(
+            title=f"选择 {len(headers)} 个动作的 {format_name} 批量导出目录"
+        )
+        if not destination:
+            return
+        model_name = self._safe_export_name(
+            pmx_path.stem if pmx_path.stem else headers[0].skeleton_name,
+            "模型",
+        )
+        root = Path(destination).resolve() / f"{model_name}_已选动作_{format_name}"
+        suffix = 2
+        while root.exists():
+            root = Path(destination).resolve() / f"{model_name}_已选动作_{format_name}_{suffix}"
+            suffix += 1
+        root.mkdir(parents=True, exist_ok=True)
+        self.playing = False
+        self.play_button.configure(text="播放")
+        self.selected_export_state = {
+            "headers": list(headers),
+            "index": 0,
+            "root": root,
+            "format": format_key,
+            "format_name": format_name,
+            "extension": extension,
+            "model_name": model_name,
+            "pmx_path": pmx_path.resolve(),
+            "success": 0,
+            "failed": [],
+            "cancelled": False,
+            "compatible_pmx": root / f"{model_name}_动作兼容.pmx",
+            "audio_cache": Path(__file__).resolve().parent / ".motion_cache" / "audio_index_v1.json",
+        }
+        self._set_model_export_buttons("disabled")
+        self.batch_export_button.configure(state="disabled")
+        if format_key == "mp4":
+            self.record_button.configure(state="disabled", text="正在批量录制……")
+        self.status_var.set(
+            f"准备批量导出 {len(headers)} 个已选动作为 {format_name}。"
+        )
+        self.after(1, self._selected_batch_export_next)
+
+    def _selected_batch_export_next(self) -> None:
+        state = self.selected_export_state
+        if state is None:
+            return
+        if state.get("cancelled"):
+            self._finish_selected_batch_export(True)
+            return
+        index = int(state["index"])
+        headers = state["headers"]
+        if index >= len(headers):
+            self._finish_selected_batch_export()
+            return
+        header = headers[index]
+        state["expected_motion"] = str(header.path.resolve()).lower()
+        self.status_var.set(
+            f"批量导出 {index + 1}/{len(headers)}：正在载入 {header.action}"
+        )
+        self._load_path(header.path)
+
+    def _export_selected_batch_current(self) -> None:
+        state = self.selected_export_state
+        motion = self.motion
+        skin = self.skin
+        if state is None or motion is None:
+            return
+        pmx_path = Path(state["pmx_path"])
+        index = int(state["index"])
+        format_key = str(state["format"])
+        format_name = str(state["format_name"])
+        extension = str(state["extension"])
+        action_name = self._safe_export_name(motion.header.action, f"动作_{index + 1:04d}")
+        model_name = str(state.get("model_name") or self._safe_export_name(
+            pmx_path.stem if pmx_path.stem else motion.header.skeleton_name,
+            "模型",
+        ))
+        stem = f"{index + 1:04d}_{model_name}_{action_name}"
+        output_path = Path(state["root"]) / f"{stem}{extension}"
+
+        def report(label: str, done: int, total: int) -> None:
+            self.worker_queue.put(
+                (
+                    "selected_batch_progress",
+                    (index + 1, len(state["headers"]), format_name, label, done, total),
+                )
+            )
+
+        if format_key == "mp4":
+            self._start_selected_batch_video()
+            return
+
+        if format_key == "audio":
+            output_dir = Path(state["root"]) / stem
+
+            def audio_worker() -> None:
+                try:
+                    outputs = export_motion_audio(
+                        motion.header,
+                        output_dir,
+                        workspace=Path(__file__).resolve().parent,
+                        cache_path=Path(state["audio_cache"]),
+                        progress=lambda done, total, label: report(label, done, total),
+                    )
+                    self.worker_queue.put(("selected_batch_item_done", outputs))
+                except Exception as exc:
+                    self.worker_queue.put(
+                        (
+                            "selected_batch_item_error",
+                            f"{motion.header.action}: {type(exc).__name__}: {exc}",
+                        )
+                    )
+
+            threading.Thread(target=audio_worker, daemon=True).start()
+            return
+
+        def worker() -> None:
+            try:
+                if skin is None:
+                    raise MotionFormatError("当前动作尚未载入 PMX 绑定")
+                if format_key == "vmd":
+                    export_vmd(
+                        motion,
+                        pmx_path,
+                        output_path,
+                        reference_transforms=self.motion_bind_transforms,
+                        target_bind_matrices=skin.get("mesh_bind_matrices"),
+                        reference_parents=self.parents,
+                        compatible_path=Path(state["compatible_pmx"]),
+                    )
+                elif format_key == "fbx":
+                    if skin.get("mapping") is None or skin.get("reference_pose") is None:
+                        raise MotionFormatError("当前动作与 PMX 未完成骨骼绑定")
+                    self._write_fbx_file(output_path, pmx_path, motion, skin, report)
+                elif format_key == "dae":
+                    if skin.get("mapping") is None or skin.get("reference_pose") is None:
+                        raise MotionFormatError("当前动作与 PMX 未完成骨骼绑定")
+                    self._write_dae_file(output_path, pmx_path, motion, skin, report)
+                elif format_key == "stl":
+                    if skin.get("mapping") is None or skin.get("reference_pose") is None:
+                        raise MotionFormatError("当前动作与 PMX 未完成骨骼绑定")
+                    from onmyoji_exchange import write_binary_stl
+
+                    positions = self._skin_positions(0)
+                    preview = skin.get("preview")
+                    if positions is None or preview is None:
+                        raise MotionFormatError("动作首帧无法生成已蒙皮 STL 网格")
+                    write_binary_stl(
+                        output_path,
+                        positions,
+                        np.asarray(preview.triangles, dtype=np.int32),
+                        solid_name=f"{model_name} {action_name} frame 0",
+                    )
+                else:
+                    raise MotionFormatError(f"不支持的批量导出格式：{format_key}")
+                self.worker_queue.put(("selected_batch_item_done", output_path))
+            except Exception as exc:
+                self.worker_queue.put(
+                    (
+                        "selected_batch_item_error",
+                        f"{motion.header.action}: {type(exc).__name__}: {exc}",
+                    )
+                )
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _selected_batch_item_finished(self, error: str | None = None) -> None:
+        state = self.selected_export_state
+        if state is None:
+            return
+        if error:
+            state["failed"].append(error)
+        else:
+            state["success"] += 1
+        if state.get("cancelled"):
+            self._finish_selected_batch_export(True)
+            return
+        state["index"] = int(state["index"]) + 1
+        self.after(1, self._selected_batch_export_next)
+
+    def _start_selected_batch_video(self) -> None:
+        """Start recording the currently loaded action for selected export."""
+        state = self.selected_export_state
+        motion = self.motion
+        if state is None or motion is None:
+            return
+        try:
+            import imageio_ffmpeg
+        except ImportError as exc:
+            self._selected_batch_item_finished(f"视频组件缺失：{exc}")
+            return
+        width = max(320, self.canvas.winfo_width())
+        height = max(240, self.canvas.winfo_height())
+        width -= width % 2
+        height -= height % 2
+        action_name = self._safe_export_name(motion.header.action, "动作")
+        model_name = self._safe_export_name(Path(state["pmx_path"]).stem, "模型")
+        target = Path(state["root"]) / (
+            f"{int(state['index']) + 1:04d}_{model_name}_{action_name}.mp4"
+        )
+        temporary = target.with_name(f".{target.stem}.recording.mp4")
+        try:
+            writer = imageio_ffmpeg.write_frames(
+                str(temporary),
+                (width, height),
+                fps=motion.sample_rate if motion.sample_rate > 0 else 30.0,
+                codec="libx264",
+                pix_fmt_in="rgb24",
+                pix_fmt_out="yuv420p",
+                quality=7,
+                output_params=["-movflags", "+faststart"],
+            )
+            writer.send(None)
+        except Exception as exc:
+            temporary.unlink(missing_ok=True)
+            self._selected_batch_item_finished(f"视频启动失败：{exc}")
+            return
+        self.playing = False
+        self.play_button.configure(text="播放")
+        self.record_state = {
+            "writer": writer,
+            "target": target,
+            "temporary": temporary,
+            "width": width,
+            "height": height,
+            "fps": motion.sample_rate if motion.sample_rate > 0 else 30.0,
+            "frame": 0,
+            "total": motion.sample_count,
+            "old_time": float(self.timeline_var.get()),
+            "cancelled": False,
+            "selected_batch": True,
+        }
+        self.after(1, self._record_video_step)
+
+    def _finish_selected_batch_export(self, cancelled: bool = False) -> None:
+        state = self.selected_export_state
+        if state is None:
+            return
+        self.selected_export_state = None
+        self._set_model_export_buttons("normal")
+        self.batch_export_button.configure(state="normal")
+        self.record_button.configure(state="normal", text="录制视频")
+        failed = list(state["failed"])
+        summary = (
+            f"已选动作批量导出{'已停止' if cancelled else '完成'}："
+            f"成功 {state['success']}，失败 {len(failed)}。\n"
+            f"输出：{state['root']}"
+        )
+        if failed:
+            summary += "\n\n前几项失败：\n" + "\n".join(failed[:8])
+        self.status_var.set(summary.replace("\n", "；"))
+        messagebox.showinfo(APP_TITLE, summary)
+
     def _export_all_model_motions(self) -> None:
+        if self.selected_export_state is not None:
+            return
         if self.batch_export_state is not None:
             self.batch_export_state["cancelled"] = True
             if self.record_state is not None:
@@ -2406,6 +3384,8 @@ class MotionPreviewApp(tk.Tk):
                     copied_pmx,
                     folder / f"{model_name}_{action_name}.vmd",
                     reference_transforms=self.motion_bind_transforms,
+                    target_bind_matrices=skin.get("mesh_bind_matrices"),
+                    reference_parents=self.parents,
                     compatible_path=(
                         copied_pmx.parent / f"{model_name}_动作兼容.pmx"
                     ),
@@ -2416,6 +3396,25 @@ class MotionPreviewApp(tk.Tk):
                     motion,
                     skin,
                     report,
+                )
+                self._write_dae_file(
+                    folder / f"{model_name}_{action_name}.dae",
+                    copied_pmx,
+                    motion,
+                    skin,
+                    report,
+                )
+                from onmyoji_exchange import write_binary_stl
+
+                posed = self._skin_positions(0)
+                preview = skin.get("preview")
+                if posed is None or preview is None:
+                    raise MotionFormatError("动作首帧无法生成已蒙皮 STL 网格。")
+                write_binary_stl(
+                    folder / f"{model_name}_{action_name}_frame_0000.stl",
+                    posed,
+                    np.asarray(preview.triangles, dtype=np.int32),
+                    solid_name=f"{model_name} {action_name} frame 0",
                 )
                 self.worker_queue.put(("batch_files_done", folder))
             except Exception as exc:
@@ -2505,7 +3504,13 @@ class MotionPreviewApp(tk.Tk):
         """Record the complete current preview as quickly as rendering permits."""
         if self.record_state is not None:
             self.record_state["cancelled"] = True
+            if self.record_state.get("selected_batch"):
+                state = self.selected_export_state
+                if state is not None:
+                    state["cancelled"] = True
             self.record_button.configure(state="disabled", text="正在停止……")
+            return
+        if self._try_start_selected_batch_export("mp4"):
             return
         motion = self.motion
         if motion is None or motion.sample_count == 0:
@@ -2638,8 +3643,14 @@ class MotionPreviewApp(tk.Tk):
         self._render(old_time)
         failure = error or close_error
         batch_recording = bool(state.get("batch"))
+        selected_batch_recording = bool(state.get("selected_batch"))
         if cancelled or failure is not None:
             temporary.unlink(missing_ok=True)
+            if selected_batch_recording:
+                self._selected_batch_item_finished(
+                    "视频录制已停止" if cancelled else f"视频录制失败：{failure}"
+                )
+                return
             if batch_recording:
                 batch_state = self.batch_export_state
                 if batch_state is not None and batch_state.get("cancelled"):
@@ -2659,11 +3670,17 @@ class MotionPreviewApp(tk.Tk):
             temporary.replace(target)
         except OSError as exc:
             temporary.unlink(missing_ok=True)
+            if selected_batch_recording:
+                self._selected_batch_item_finished(f"视频保存失败：{exc}")
+                return
             if batch_recording:
                 self._batch_item_finished(f"视频保存失败：{exc}")
                 return
             self.status_var.set("视频保存失败")
             messagebox.showerror(APP_TITLE, f"视频保存失败：\n{exc}")
+            return
+        if selected_batch_recording:
+            self._selected_batch_item_finished()
             return
         if batch_recording:
             self._batch_item_finished()
@@ -2675,6 +3692,67 @@ class MotionPreviewApp(tk.Tk):
             f"{int(state['total']):,} 帧 · {float(state['fps']):g} FPS · "
             f"{int(state['width'])}×{int(state['height'])}",
         )
+
+    def _export_audio(self) -> None:
+        """Export voice samples associated with the current motion."""
+        if (
+            self.record_state is not None
+            or self.fbx_exporting
+            or self.batch_export_state is not None
+            or self.selected_export_state is not None
+        ):
+            return
+        if self._try_start_selected_batch_export("audio"):
+            return
+        motion = self.motion
+        if motion is None:
+            messagebox.showinfo(APP_TITLE, "请先载入一个动作。")
+            return
+        destination = filedialog.askdirectory(title="选择当前动作的音频导出目录")
+        if not destination:
+            return
+        base_name = self._safe_export_name(
+            f"{motion.header.skeleton_name}_{motion.header.action}_音频", "动作音频"
+        )
+        output_dir = Path(destination).resolve() / base_name
+        suffix = 2
+        while output_dir.exists():
+            output_dir = Path(destination).resolve() / f"{base_name}_{suffix}"
+            suffix += 1
+        self.playing = False
+        self.play_button.configure(text="播放")
+        self.fbx_exporting = True
+        self._set_model_export_buttons("disabled")
+        self.status_var.set("正在建立 FSB 音频索引并解码动作语音……")
+
+        def report(done: int, total: int, label: str) -> None:
+            self.worker_queue.put(("format_progress", ("动作音频", label, done, total)))
+
+        def worker() -> None:
+            try:
+                outputs = export_motion_audio(
+                    motion.header,
+                    output_dir,
+                    workspace=Path(__file__).resolve().parent,
+                    cache_path=Path(__file__).resolve().parent / ".motion_cache" / "audio_index_v1.json",
+                    progress=report,
+                )
+                self.worker_queue.put(
+                    (
+                        "format_done",
+                        (
+                            "动作音频",
+                            output_dir,
+                            f"已解码 {len(outputs)} 个 WAV；同时写入 audio_manifest.json。",
+                        ),
+                    )
+                )
+            except Exception as exc:
+                self.worker_queue.put(
+                    ("format_error", ("动作音频", f"{type(exc).__name__}: {exc}"))
+                )
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _drag_start(self, event, mode: str = "rotate") -> None:
         if self.record_state is not None:
@@ -2705,6 +3783,15 @@ class MotionPreviewApp(tk.Tk):
         self._render(self.timeline_var.get())
 
     def _export(self) -> None:
+        if (
+            self.record_state is not None
+            or self.fbx_exporting
+            or self.batch_export_state is not None
+            or self.selected_export_state is not None
+        ):
+            return
+        if self._try_start_selected_batch_export("vmd"):
+            return
         if self.motion is None:
             messagebox.showinfo(APP_TITLE, "请先载入一个动作。")
             return
@@ -2726,6 +3813,8 @@ class MotionPreviewApp(tk.Tk):
                 pmx_path,
                 Path(value),
                 reference_transforms=self.motion_bind_transforms,
+                target_bind_matrices=self.skin.get("mesh_bind_matrices") if self.skin else None,
+                reference_parents=self.parents,
             )
         except Exception as exc:
             messagebox.showerror(APP_TITLE, f"导出失败：\n{type(exc).__name__}: {exc}")
@@ -2733,6 +3822,8 @@ class MotionPreviewApp(tk.Tk):
         note = (
             f"已导出 VMD：\n{vmd}\n\n已生成动作兼容 PMX（解决 VMD 15 字节骨名限制）：\n"
             f"{compatible}\n\n骨骼匹配：{matched}/{total}"
+            "\n\n请将 VMD 套在这个“动作兼容 PMX”上；"
+            "原始 A-pose PMX 不包含动作参考姿态补偿。"
         )
         if scale_lost:
             note += "\n\n注意：源动作包含缩放轨道；VMD 不支持骨骼缩放，已省略缩放。"
@@ -2746,8 +3837,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-    compose_global_row_matrices,
-    find_animation_metadata,
-    inverse_affine_row_matrix4,
-    matrix4_multiply,
-    neox_to_pmx_matrix4,
